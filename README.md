@@ -3,6 +3,21 @@
 A lightweight web-based management system for Ubuntu Server / Raspberry Pi OS that
 provides a GUI for ZFS storage management with NFS v4 and SMB access.
 
+## Some background
+
+This is really a learning exercise — learning about ZFS and about building a
+deployable web app.
+
+The project is entirely vibe coded, using opencode and largely with big-pickle,
+with some sanity checking from time to time with Claude.
+
+It does support some functionality absent from the TrueNAS and Ugreen UIs —
+namely the ability to use disk partitions rather than entire disks. This is to
+facilitate home use where the number of disks may be limited.
+
+I have tested this, and on a Ugreen 4800GT it will easily run a 2.5G LAN at
+over 80% utilisation using NFS given the right configuration.
+
 ## Features
 
 - **ZFS Pool Management**: Create, import, export, and monitor ZFS pools
