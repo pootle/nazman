@@ -1,0 +1,258 @@
+{% extends "base.html" %}
+
+{% block title %}SMB - NAZMan{% endblock %}
+{% block page_title %}SMB Share Management{% endblock %}
+
+{% block content %}
+<div class="smb-page">
+    <!-- Presence warning -->
+    <div class="card" id="smb-presence-card" style="display:none;">
+        <div class="card-body">
+            <p class="callout callout-warning" id="smb-presence-msg"></p>
+        </div>
+    </div>
+
+    <!-- SMB Shares (managed smb.conf) -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-share-alt"></i> SMB Shares</h2>
+            <div>
+                <button class="btn btn-secondary" onclick="loadSmbPage()">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+                <button class="btn btn-primary" onclick="showCreateShareModal()">
+                    <i class="fas fa-plus"></i> Create Share
+                </button>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="smb-shares" class="exports-table">
+                <p class="loading">Loading SMB shares...</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create/Edit Share Modal -->
+<div id="create-share-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="share-modal-title">Create SMB Share</h3>
+            <button class="close" onclick="hideCreateShareModal()">&times;</button>
+        </div>
+        <form id="create-share-form">
+            <div class="form-group">
+                <label for="share-dataset">Dataset:</label>
+                <select id="share-dataset" required>
+                    <option value="">-- Select Dataset --</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Access:</label>
+                <div class="checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="share-readonly"> Read-only share
+                    </label>
+                </div>
+                <p class="text-muted" style="margin-top:8px">
+                    All shares allow guest (anonymous) read/write access, with reads/writes
+                    forced to the shared anonymous user (<code>nfsanon</code>, UID/GID 65533)
+                    for consistent access with NFS.
+                </p>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="hideCreateShareModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Share</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let shares = [];
+let datasets = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadSmbPage();
+    document.getElementById('create-share-form').addEventListener('submit', handleCreateShare);
+});
+
+async function loadSmbPage() {
+    await Promise.all([
+        loadSmbShares(),
+        loadDatasets(),
+        checkSmbPresence()
+    ]);
+}
+
+async function checkSmbPresence() {
+    const card = document.getElementById('smb-presence-card');
+    try {
+        const p = await api.getSmbPresence();
+        if (p.installed) {
+            card.style.display = 'none';
+        } else {
+            document.getElementById('smb-presence-msg').textContent =
+                'Samba is not installed on this server. SMB sharing will not work until you install it: ' +
+                'run the NAZMan installer (build.sh, choosing to install Samba) or run ' +
+                '`sudo apt-get install -y samba` on the server.';
+            card.style.display = '';
+        }
+    } catch (e) {
+        console.error('Failed to check SMB presence:', e);
+    }
+}
+
+async function loadSmbShares() {
+    try {
+        shares = await api.getSmbShares();
+        renderSmbShares();
+    } catch (error) {
+        console.error('Failed to load SMB shares:', error);
+        showError('smb-shares', 'Failed to load SMB shares');
+    }
+}
+
+async function loadDatasets() {
+    try {
+        datasets = await api.getDatasets();
+        updateDatasetSelect();
+    } catch (error) {
+        console.error('Failed to load datasets:', error);
+    }
+}
+
+function renderSmbShares() {
+    const container = document.getElementById('smb-shares');
+
+    if (shares.length === 0) {
+        container.innerHTML = createEmptyState('No SMB shares configured.');
+        return;
+    }
+
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Path</th>
+                    <th>Share Name</th>
+                    <th>Access</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${shares.map(s => `
+                    <tr>
+                        <td><code>${s.share_path}</code></td>
+                        <td><code>${s.share_name}</code></td>
+                        <td>${s.read_only ? '<span class="status status-warning">Read-only</span>' : '<span class="status status-online">Read-write</span>'}</td>
+                        <td><span class="status status-${s.enabled ? 'online' : 'faulted'}">${s.enabled ? 'Shared' : 'Disabled'}</span></td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})">
+                                <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
+                            </button>
+                            ${s.enabled ? `<button class="btn btn-sm btn-secondary" onclick="editShare('${s.dataset_name}')">
+                                <i class="fas fa-edit"></i>
+                            </button>` : ''}
+                            <button class="btn btn-sm btn-danger" onclick="deleteShare('${s.dataset_name}')">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function updateDatasetSelect() {
+    const select = document.getElementById('share-dataset');
+    if (select) {
+        const current = select.value;
+        select.innerHTML = '<option value="">-- Select Dataset --</option>' +
+            datasets.map(d => `<option value="${d.name}" ${d.name === current ? 'selected' : ''}>${d.name}</option>`).join('');
+    }
+}
+
+function showCreateShareModal() {
+    document.getElementById('share-modal-title').textContent = 'Create SMB Share';
+    document.getElementById('share-dataset').value = '';
+    document.getElementById('share-readonly').checked = false;
+    document.getElementById('create-share-form').removeAttribute('data-edit-name');
+    updateDatasetSelect();
+    document.getElementById('create-share-modal').style.display = 'flex';
+}
+
+function editShare(datasetName) {
+    const s = shares.find(x => x.dataset_name === datasetName);
+    if (!s) return;
+    document.getElementById('share-modal-title').textContent = 'Edit SMB Share';
+    document.getElementById('share-dataset').value = s.dataset_name;
+    document.getElementById('share-readonly').checked = s.read_only;
+    document.getElementById('create-share-form').setAttribute('data-edit-name', datasetName);
+    updateDatasetSelect();
+    document.getElementById('create-share-modal').style.display = 'flex';
+}
+
+function hideCreateShareModal() {
+    document.getElementById('create-share-modal').style.display = 'none';
+}
+
+async function handleCreateShare(e) {
+    e.preventDefault();
+
+    const datasetName = document.getElementById('share-dataset').value;
+    const readOnly = document.getElementById('share-readonly').checked;
+    if (!datasetName) {
+        showAlert('Select a dataset', 'error');
+        return;
+    }
+
+    if (!confirm(`Share dataset ${datasetName} via SMB?`)) {
+        return;
+    }
+
+    try {
+        const editName = document.getElementById('create-share-form').getAttribute('data-edit-name');
+        if (editName) {
+            await api.updateSmbShare(editName, { read_only: readOnly });
+            showAlert('Share updated', 'success');
+        } else {
+            await api.createSmbShare({ dataset_name: datasetName, read_only: readOnly });
+            showAlert('Share created', 'success');
+        }
+        hideCreateShareModal();
+        await loadSmbShares();
+    } catch (error) {
+        showAlert('Failed to save share: ' + error.message, 'error');
+    }
+}
+
+async function toggleShare(datasetName, enable) {
+    try {
+        await api.updateSmbShare(datasetName, { enabled: enable });
+        await loadSmbShares();
+        showAlert(enable ? 'Share enabled' : 'Share disabled', 'success');
+    } catch (error) {
+        showAlert('Failed to update share: ' + error.message, 'error');
+    }
+}
+
+async function deleteShare(datasetName) {
+    if (!confirm('Remove this SMB share?')) {
+        return;
+    }
+
+    try {
+        await api.deleteSmbShare(datasetName);
+        await loadSmbShares();
+        showAlert('Share removed', 'success');
+    } catch (error) {
+        showAlert('Failed to remove share: ' + error.message, 'error');
+    }
+}
+</script>
+{% endblock %}

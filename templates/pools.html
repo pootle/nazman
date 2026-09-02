@@ -1,0 +1,765 @@
+{% extends "base.html" %}
+
+{% block title %}Pools - NAZMan{% endblock %}
+{% block page_title %}Pool Management{% endblock %}
+
+{% block content %}
+<div class="pools-page">
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-layer-group"></i> ZFS Pools</h2>
+            <button class="btn btn-primary" onclick="showCreatePoolModal()">
+                <i class="fas fa-plus"></i> Create Pool
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="pools-list" class="pools-grid">
+                <p class="loading">Loading pools...</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-wrench"></i> Pool Operations</h2>
+        </div>
+        <div class="card-body">
+            <div class="operations-grid">
+                <div class="operation-card">
+                    <h3><i class="fas fa-search"></i> Scrub Pool</h3>
+                    <p>Run a scrub to check and repair data integrity.</p>
+                    <select id="scrub-pool-select" class="form-control">
+                        <option value="">-- Select Pool --</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="startScrub()">Start Scrub</button>
+                </div>
+                <div class="operation-card">
+                    <h3><i class="fas fa-sign-out-alt"></i> Export Pool</h3>
+                    <p>Export a pool for later import.</p>
+                    <select id="export-pool-select" class="form-control">
+                        <option value="">-- Select Pool --</option>
+                    </select>
+                    <button class="btn btn-secondary" onclick="exportPool()">Export</button>
+                </div>
+                <div class="operation-card">
+                    <h3><i class="fas fa-sign-in-alt"></i> Import Pool</h3>
+                    <p>Import a previously exported pool.</p>
+                    <select id="import-pool-select" class="form-control">
+                        <option value="">-- Select Pool --</option>
+                    </select>
+                    <button class="btn btn-secondary" onclick="importPool()">Import</button>
+                </div>
+                <div class="operation-card">
+                    <h3><i class="fas fa-chart-line"></i> Metric Logging</h3>
+                    <p>Record this pool's disk performance to disk for later review.</p>
+                    <select id="metric-log-pool-select" class="form-control">
+                        <option value="">-- Select Pool --</option>
+                    </select>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="metric-log-check" disabled>
+                        Enable disk logging (30 day retention)
+                    </label>
+                    <button class="btn btn-secondary" onclick="toggleMetricLogging()">Save</button>
+                    <a href="/monitoring" class="btn-link">View performance &rarr;</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create Pool Modal -->
+<div id="create-pool-modal" class="modal" style="display: none;">
+    <div class="modal-content" style="max-width:800px">
+        <div class="modal-header">
+            <h3>Create ZFS Pool</h3>
+            <button class="close" onclick="hideCreatePoolModal()">&times;</button>
+        </div>
+        <form id="create-pool-form">
+            <div class="form-group">
+                <label for="pool-name">Pool Name:</label>
+                <input type="text" id="pool-name" required placeholder="e.g., tank">
+            </div>
+
+            <div class="form-group">
+                <label for="pool-ashift">Ashift:</label>
+                <select id="pool-ashift">
+                    <option value="9">9 (512B sectors)</option>
+                    <option value="10">10 (1K sectors)</option>
+                    <option value="11">11 (2K sectors)</option>
+                    <option value="12" selected>12 (4K sectors)</option>
+                    <option value="13">13 (8K sectors)</option>
+                    <option value="14">14 (16K sectors)</option>
+                    <option value="15">15 (32K sectors)</option>
+                    <option value="16">16 (64K sectors)</option>
+                </select>
+                <small class="form-hint">Physical sector size of the vdev drives. Must be set at creation and cannot be changed later.</small>
+            </div>
+
+            <hr>
+            <h4>Vdevs</h4>
+            <div id="vdev-container"></div>
+            <button type="button" class="btn btn-sm btn-secondary" onclick="addVdev()" style="margin-top:8px">
+                <i class="fas fa-plus"></i> Add Vdev
+            </button>
+
+            <div class="modal-actions" style="margin-top:16px">
+                <button type="button" class="btn btn-secondary" onclick="hideCreatePoolModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Pool</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Device Picker Modal -->
+<div id="device-picker-modal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:500px">
+        <div class="modal-header">
+            <h3 id="device-picker-title">Select Devices</h3>
+            <button class="close" onclick="hideDevicePicker()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div id="device-picker-list"></div>
+            <div class="modal-actions" style="margin-top:12px">
+                <button class="btn btn-primary" onclick="confirmDevicePicker()">Add Selected</button>
+                <button class="btn btn-secondary" onclick="hideDevicePicker()">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let pools = [];
+let allDisks = [];
+let diskPartitions = {};
+
+let pickerVdevId = null;
+let pickerAlreadyUsed = new Set();  // "disk_id" or "disk_id:slot_uuid"
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadPoolsPage();
+    document.getElementById('create-pool-form').addEventListener('submit', handleCreatePool);
+    const metricSel = document.getElementById('metric-log-pool-select');
+    if (metricSel) metricSel.addEventListener('change', updateMetricLogCheck);
+});
+
+async function loadPoolsPage() {
+    await loadPools();
+    updatePoolSelects();
+    updateMetricLogCheck();
+}
+
+async function loadPools() {
+    try {
+        pools = await api.getPools();
+        renderPools();
+    } catch (error) {
+        console.error('Failed to load pools:', error);
+    }
+}
+
+function renderPools() {
+    const container = document.getElementById('pools-list');
+    if (pools.length === 0) {
+        container.innerHTML = '<p class="empty-state">No pools configured. <a href="javascript:void(0)" onclick="showCreatePoolModal()">Create one</a></p>';
+        return;
+    }
+    container.innerHTML = pools.map(pool => {
+        const usable = pool.usable_bytes || 0;
+        const pct = pool.used_capacity_pct != null ? pool.used_capacity_pct : null;
+        const used = usable && pct != null ? usable * pct / 100 : null;
+        const free = usable && used != null ? usable - used : pool.free_bytes;
+
+        const usageHtml = usable > 0 && pct != null ? `
+            <div class="pool-usage-bar" style="background:#444;border-radius:4px;height:10px;overflow:hidden;margin:6px 0">
+                <div style="width:${Math.min(100, pct)}%;height:100%;background:${pct >= 90 ? '#e74c3c' : (pct >= 70 ? '#f39c12' : '#2ecc71')}"></div>
+            </div>
+            <span class="pool-usage-text">${pct.toFixed(1)}% used ${used != null ? `(${formatBytes(used)})` : ''}</span>
+            <span class="text-muted"> · Free: ${free != null ? formatBytes(free) : 'Unknown'}</span>
+        ` : `<span class="text-muted">Capacity unknown</span>`;
+
+        const ratioHtml = pool.compressratio != null
+            ? `<span class="pool-ratio"><i class="fas fa-compress-arrows-alt"></i> Compression x${pool.compressratio.toFixed(2)}</span>` : '';
+
+        const datasetHtml = pool.datasets && pool.datasets.length
+            ? `<div class="pool-datasets">
+                <div class="pool-datasets-title">Datasets</div>
+                <table class="data-table pool-dataset-table">
+                    <thead><tr><th>Dataset</th><th>Used</th><th>Referenced</th><th>Mountpoint</th></tr></thead>
+                    <tbody>${pool.datasets.map(d => `<tr>
+                        <td><code>${d.name}</code></td>
+                        <td>${d.used || '-'}</td>
+                        <td>${d.referenced || '-'}</td>
+                        <td><small class="text-muted">${d.mountpoint || '-'}</small></td>
+                    </tr>`).join('')}</tbody>
+                </table>
+            </div>` : '';
+
+        return `
+        <div class="pool-card">
+            <h3>${pool.name}</h3>
+            <div class="pool-info">
+                <span class="status status-${pool.status}">${pool.status}</span>
+                <span class="topology">${pool.topology}</span>
+                ${usable > 0 ? `<span>Usable: ${formatBytes(usable)}</span>` : ''}
+                ${ratioHtml}
+            </div>
+            ${usageHtml}
+            ${datasetHtml}
+            <div class="pool-actions">
+                <button class="btn btn-sm btn-secondary" onclick="viewPoolStatus('${pool.name}')">
+                    <i class="fas fa-info-circle"></i> Details
+                </button>
+                <button class="btn btn-sm btn-danger" onclick="destroyPool('${pool.name}')">
+                    <i class="fas fa-trash"></i> Destroy
+                </button>
+            </div>
+        </div>
+    `;
+    }).join('');
+}
+
+function updatePoolSelects() {
+    ['scrub-pool-select', 'export-pool-select', 'import-pool-select', 'metric-log-pool-select'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = '<option value="">-- Select Pool --</option>' +
+            pools.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+    });
+}
+
+async function updateMetricLogCheck() {
+    const sel = document.getElementById('metric-log-pool-select');
+    const check = document.getElementById('metric-log-check');
+    const pool = sel.value;
+    if (!pool) {
+        check.checked = false;
+        check.disabled = true;
+        return;
+    }
+    check.disabled = false;
+    try {
+        const state = await api.getLoggingState();
+        check.checked = !!(state.enabled && state.enabled[pool]);
+    } catch (e) {
+        console.error('Failed to load logging state:', e);
+    }
+}
+
+async function toggleMetricLogging() {
+    const sel = document.getElementById('metric-log-pool-select');
+    const check = document.getElementById('metric-log-check');
+    const pool = sel.value;
+    if (!pool) {
+        showAlert('Select a pool first', 'info');
+        return;
+    }
+    try {
+        await api.setLoggingEnabled(pool, check.checked);
+        showAlert(`Metric logging ${check.checked ? 'enabled' : 'disabled'} for ${pool}`, 'success');
+    } catch (e) {
+        console.error(e);
+        showAlert('Failed to update logging: ' + e.message, 'error');
+    }
+}
+
+function formatSize(bytes) {
+    if (!bytes) return 'Unknown';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = 0;
+    while (bytes >= 1024 && i < units.length - 1) {
+        bytes /= 1024;
+        i++;
+    }
+    return bytes.toFixed(2) + ' ' + units[i];
+}
+
+// ── Create Pool Modal ──────────────────────────────────────
+
+async function showCreatePoolModal() {
+    document.getElementById('create-pool-modal').style.display = 'flex';
+    document.getElementById('vdev-container').innerHTML = '';
+    document.getElementById('pool-name').value = '';
+
+    try {
+        allDisks = await api.getDisks();
+        diskPartitions = {};
+        for (const disk of allDisks) {
+            try {
+                const info = await api.getDiskPartitions(disk.id);
+                diskPartitions[disk.id] = info.partitions;
+            } catch (e) {
+                diskPartitions[disk.id] = [];
+            }
+        }
+        addVdev();
+    } catch (error) {
+        showAlert('Failed to load disks', 'error');
+    }
+}
+
+function hideCreatePoolModal() {
+    document.getElementById('create-pool-modal').style.display = 'none';
+}
+
+let vdevCounter = 0;
+
+function addVdev() {
+    const id = vdevCounter++;
+    const container = document.getElementById('vdev-container');
+    const div = document.createElement('div');
+    div.className = 'vdev-block';
+    div.id = `vdev-${id}`;
+    div.style.cssText = 'border:1px solid #555;border-radius:6px;padding:12px;margin-bottom:12px';
+    div.innerHTML = `
+        <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+            <select class="form-control vdev-role" style="width:120px">
+                <option value="data">Data</option>
+                <option value="log">Log (SLOG)</option>
+                <option value="cache">Cache (L2ARC)</option>
+                <option value="special">Special</option>
+            </select>
+            <select class="form-control vdev-topology" style="width:130px">
+                <option value="stripe">Stripe</option>
+                <option value="mirror">Mirror</option>
+                <option value="raidz1">RAIDZ1</option>
+                <option value="raidz2">RAIDZ2</option>
+                <option value="raidz3">RAIDZ3</option>
+            </select>
+            <select class="form-control vdev-ashift" style="width:130px" title="Vdev ashift (blank = use global)">
+                <option value="">Ashift auto</option>
+                <option value="9">9 (512B)</option>
+                <option value="12">12 (4K)</option>
+                <option value="13">13 (8K)</option>
+                <option value="14">14 (16K)</option>
+                <option value="15">15 (32K)</option>
+                <option value="16">16 (64K)</option>
+            </select>
+            <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.vdev-block').remove()">
+                <i class="fas fa-times"></i> Remove Vdev
+            </button>
+        </div>
+        <div class="vdev-devices"></div>
+        <button type="button" class="btn btn-sm btn-secondary" onclick="openDevicePicker(${id})" style="margin-top:4px">
+            <i class="fas fa-plus"></i> Add Device
+        </button>
+    `;
+    container.appendChild(div);
+}
+
+function getUsedDeviceKeys(excludeVdevId) {
+    const used = new Set();
+    document.querySelectorAll('.vdev-block').forEach(block => {
+        if (block.id === `vdev-${excludeVdevId}`) return;
+        block.querySelectorAll('.device-row').forEach(row => {
+            const key = row.dataset.deviceKey;
+            if (key) used.add(key);
+        });
+    });
+    return used;
+}
+
+// ── Device Picker ───────────────────────────────────────────
+
+function openDevicePicker(vdevId) {
+    pickerVdevId = vdevId;
+    pickerAlreadyUsed = getUsedDeviceKeys(vdevId);
+
+    const block = document.getElementById(`vdev-${vdevId}`);
+    const role = block.querySelector('.vdev-role').value;
+    document.getElementById('device-picker-title').textContent = `Select Device — ${role}`;
+
+    const container = document.getElementById('device-picker-list');
+    let html = '';
+
+    for (const disk of allDisks) {
+        if (disk.status === 'dead') continue;
+        const parts = diskPartitions[disk.id] || [];
+
+        if (disk.is_os_disk) {
+            // OS disks (e.g. they host the root raid) are only offered as
+            // individual partitions, never as a whole disk.  OS-reserved
+            // partitions (boot/EFI/md members) are disabled.
+            for (const p of parts) {
+                const key = `${disk.id}:${p.slot_uuid}`;
+                const disabled = pickerAlreadyUsed.has(key) || p.reserved;
+                const hint = p.reserved ? ' reserved (OS)' : '';
+                html += `
+                    <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
+                        <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
+                        <span style="flex:1">
+                            ${disk.device_name} <small class="text-muted">p${p.number}</small>
+                            <small class="text-muted" style="margin-left:8px">${formatSize(p.size_bytes)}</small>
+                        </span>
+                        <small class="text-muted">${p.reserved ? hint : p.slot_uuid.substring(0, 8) + '...'}</small>
+                    </label>`;
+            }
+            continue;
+        }
+
+        if (parts.length > 0) {
+            for (const p of parts) {
+                const key = `${disk.id}:${p.slot_uuid}`;
+                const disabled = pickerAlreadyUsed.has(key);
+                html += `
+                    <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
+                        <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
+                        <span style="flex:1">
+                            ${disk.device_name} <small class="text-muted">p${p.number}</small>
+                            <small class="text-muted" style="margin-left:8px">${formatSize(p.size_bytes)}</small>
+                        </span>
+                        <small class="text-muted">${p.slot_uuid.substring(0, 8)}...</small>
+                    </label>`;
+            }
+        } else {
+            const key = `${disk.id}`;
+            const disabled = pickerAlreadyUsed.has(key);
+            html += `
+                <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
+                    <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
+                    <span style="flex:1">
+                        ${disk.device_name}
+                        <small class="text-muted" style="margin-left:8px">${formatSize(disk.size_bytes)} ${disk.disk_type}</small>
+                    </span>
+                    <small class="text-muted">whole disk</small>
+                </label>`;
+        }
+    }
+
+    if (!html) {
+        html = '<p class="empty-state">No available devices. Partition disks first on the Disks page.</p>';
+    }
+
+    container.innerHTML = html;
+    document.getElementById('device-picker-modal').style.display = 'flex';
+}
+
+function hideDevicePicker() {
+    document.getElementById('device-picker-modal').style.display = 'none';
+    pickerVdevId = null;
+}
+
+function confirmDevicePicker() {
+    const checked = [...document.querySelectorAll('.device-pick-cb:checked')].map(cb => cb.value);
+    if (checked.length === 0) {
+        showAlert('Select at least one device', 'error');
+        return;
+    }
+
+    const block = document.getElementById(`vdev-${pickerVdevId}`);
+    const devicesDiv = block.querySelector('.vdev-devices');
+
+    for (const key of checked) {
+        const parts = key.split(':');
+        const diskId = parseInt(parts[0]);
+        const slotUuid = parts[1] || null;
+        const disk = allDisks.find(d => d.id === diskId);
+
+        const row = document.createElement('div');
+        row.className = 'device-row';
+        row.dataset.deviceKey = key;
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:4px;padding:4px 8px;background:#333;border-radius:4px';
+
+        let label;
+        if (slotUuid) {
+            const part = (diskPartitions[diskId] || []).find(p => p.slot_uuid === slotUuid);
+            label = `${disk.device_name} p${part?.number || '?'} `;
+            label += `<small class="text-muted">${slotUuid.substring(0, 8)}... ${part ? formatSize(part.size_bytes) : ''}</small>`;
+        } else {
+            label = `${disk.device_name} <small class="text-muted">${formatSize(disk.size_bytes)} whole disk</small>`;
+        }
+
+        row.innerHTML = `
+            <span style="flex:1">${label}</span>
+            <button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove()">
+                <i class="fas fa-times"></i>
+            </button>
+        `;
+        devicesDiv.appendChild(row);
+    }
+
+    hideDevicePicker();
+}
+
+async function handleCreatePool(e) {
+    e.preventDefault();
+    const name = document.getElementById('pool-name').value;
+    const ashift = parseInt(document.getElementById('pool-ashift').value);
+
+    const vdevBlocks = document.querySelectorAll('.vdev-block');
+    const vdevs = [];
+    for (const block of vdevBlocks) {
+        const role = block.querySelector('.vdev-role').value;
+        const topology = block.querySelector('.vdev-topology').value;
+        const ashiftInput = block.querySelector('.vdev-ashift');
+        const ashift = ashiftInput && ashiftInput.value ? parseInt(ashiftInput.value) : null;
+        const deviceRows = block.querySelectorAll('.device-row');
+        const devices = [];
+        for (const row of deviceRows) {
+            const key = row.dataset.deviceKey;
+            if (!key) continue;
+            const parts = key.split(':');
+            const diskId = parseInt(parts[0]);
+            const slotUuid = parts[1] || null;
+            devices.push({ disk_id: diskId, slot_uuid: slotUuid });
+        }
+        if (devices.length === 0) continue;
+        const vdev = { role, topology, devices };
+        if (ashift) vdev.ashift = ashift;
+        vdevs.push(vdev);
+    }
+
+    if (vdevs.length === 0) {
+        showAlert('Add at least one vdev with devices', 'error');
+        return;
+    }
+
+    const hasData = vdevs.some(v => v.role === 'data');
+    if (!hasData) {
+        showAlert('At least one data vdev is required', 'error');
+        return;
+    }
+
+    if (!confirm(`Create pool "${name}" with ${vdevs.length} vdev(s)?`)) return;
+
+    try {
+        await api.createPool({ name, vdevs, ashift });
+        hideCreatePoolModal();
+        await loadPools();
+        showAlert('Pool created successfully', 'success');
+    } catch (error) {
+        showAlert('Failed to create pool: ' + error.message, 'error');
+    }
+}
+
+// ── Pool Actions ───────────────────────────────────────────
+
+async function startScrub() {
+    const poolName = document.getElementById('scrub-pool-select').value;
+    if (!poolName) { showAlert('Please select a pool', 'error'); return; }
+    if (!confirm(`Start scrub on pool "${poolName}"?`)) return;
+    try {
+        await api.scrubPool(poolName);
+        showAlert('Scrub started', 'success');
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+async function exportPool() {
+    const poolName = document.getElementById('export-pool-select').value;
+    if (!poolName) { showAlert('Please select a pool', 'error'); return; }
+    if (!confirm(`Export pool "${poolName}"?`)) return;
+    try {
+        await api.exportPool(poolName);
+        showAlert('Pool exported', 'success');
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+async function importPool() {
+    const poolName = document.getElementById('import-pool-select').value;
+    if (!poolName) { showAlert('Please select a pool', 'error'); return; }
+    if (!confirm(`Import pool "${poolName}"?`)) return;
+    try {
+        await api.importPool(poolName);
+        showAlert('Pool imported', 'success');
+        await loadPools();
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+async function viewPoolStatus(poolName) {
+    try {
+        const status = await api.getPoolStatus(poolName);
+        showPoolDetailsModal(status);
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+function showPoolDetailsModal(status) {
+    function parseSize(str) {
+        if (!str) return 0;
+        const m = str.match(/([\d.]+)\s*([KMGTP]i?B?)/i);
+        if (!m) return parseFloat(str) || 0;
+        const val = parseFloat(m[1]);
+        const unit = m[2][0].toUpperCase();
+        const mult = {K: 1024, M: 1024**2, G: 1024**3, T: 1024**4, P: 1024**5};
+        return val * (mult[unit] || 1);
+    }
+
+    function vdevSummary(vdevs, label) {
+        if (!vdevs || vdevs.length === 0) return '';
+        const items = vdevs.map(v => {
+            const type = v.type || 'unknown';
+            const devs = (v.children || []).map(c => {
+                const state = c.state || '';
+                const size = c.size || '';
+                return `<div style="padding-left:8px">${c.name || '?'} <span style="opacity:0.6">${size}</span> <span class="status status-${state}">${state}</span></div>`;
+            }).join('');
+            return `<li><strong>${type}</strong>${devs ? '' : ': no devices'}${devs}</li>`;
+        }).join('');
+        return `<div style="margin-bottom:8px"><strong>${label}</strong><ul style="margin:4px 0 0 16px;list-style:none">${items}</ul></div>`;
+    }
+
+    function vdevSize(vdevs) {
+        if (!vdevs || vdevs.length === 0) return null;
+        let total = 0;
+        for (const v of vdevs) {
+            const kids = v.children || [];
+            const sizes = kids.map(c => parseSize(c.size)).filter(s => s > 0);
+            if (sizes.length === 0) continue;
+            const type = v.type || 'stripe';
+            if (type === 'mirror') {
+                total += Math.min(...sizes);
+            } else if (type === 'raidz1') {
+                total += sizes.reduce((a, b) => a + b, 0) - Math.min(...sizes);
+            } else if (type === 'raidz2') {
+                const sorted = [...sizes].sort((a, b) => a - b);
+                total += sizes.reduce((a, b) => a + b, 0) - sorted[0] - sorted[1];
+            } else if (type === 'raidz3') {
+                const sorted = [...sizes].sort((a, b) => a - b);
+                total += sizes.reduce((a, b) => a + b, 0) - sorted[0] - sorted[1] - sorted[2];
+            } else {
+                total += sizes.reduce((a, b) => a + b, 0);
+            }
+        }
+        return total || null;
+    }
+
+    const dataUsable = vdevSize(status.data_vdevs);
+    const rawSize = (status.data_vdevs || []).concat(status.special_vdevs || [], status.log_vdevs || [], status.cache_vdevs || [])
+        .flatMap(v => (v.children || []).map(c => parseSize(c.size)))
+        .reduce((a, b) => a + b, 0);
+
+    let html = `
+        <div style="margin-bottom:12px">
+            <span class="status status-${status.status}" style="font-size:1.1em">${status.status}</span>
+            <span class="topology" style="margin-left:8px">${status.topology}</span>
+        </div>`;
+
+    if (rawSize > 0) {
+        html += `<div style="margin-bottom:12px"><strong>Raw capacity:</strong> ${formatBytes(rawSize)}</div>`;
+    }
+    if (dataUsable && dataUsable !== rawSize) {
+        html += `<div style="margin-bottom:12px"><strong>Usable (data):</strong> ${formatBytes(dataUsable)}</div>`;
+    }
+
+    html += vdevSummary(status.data_vdevs, 'Data Vdevs');
+    html += vdevSummary(status.special_vdevs, 'Special Vdevs');
+    html += vdevSummary(status.log_vdevs, 'Log Vdevs');
+    html += vdevSummary(status.cache_vdevs, 'Cache Vdevs');
+
+    if (status.scan && status.scan.state) {
+        html += `<div style="margin-top:8px"><strong>Last scrub:</strong> ${status.scan.state} ${status.scan.end_time || ''}</div>`;
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.display = 'flex';
+    modal.style.zIndex = '2000';
+    modal.innerHTML = `
+        <div class="modal-content" style="max-width:500px">
+            <div class="modal-header">
+                <h3>Pool "${status.name}"</h3>
+                <button class="close" onclick="this.closest('.modal').remove()">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:20px">
+                ${html}
+                <div style="text-align:right;margin-top:16px">
+                    <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">Close</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+}
+
+async function destroyPool(poolName) {
+    let info = { used_bytes: null, size_bytes: null, exports: [], active_clients: [] };
+    try {
+        info = await api.getPoolDestroyInfo(poolName);
+    } catch (error) {
+        console.error('Failed to load destroy info:', error);
+    }
+    showDestroyConfirmModal(poolName, info);
+}
+
+function showDestroyConfirmModal(poolName, info) {
+    const used = info.used_bytes;
+    const size = info.size_bytes;
+    let spaceHtml;
+    if (used != null && size) {
+        const pct = Math.round((used / size) * 100);
+        spaceHtml = `
+            <strong>Space used:</strong> ${formatBytes(used)} of ${formatBytes(size)} (${pct}%)
+            <div style="background:#444;border-radius:4px;height:10px;margin-top:6px;overflow:hidden">
+              <div style="width:${Math.min(100, pct)}%;height:100%;background:#e74c3c"></div>
+            </div>
+            <div class="text-muted" style="margin-top:4px;font-size:0.85em">
+              This pool stores <strong>${formatBytes(used)}</strong> of data that will be destroyed.
+            </div>`;
+    } else {
+        spaceHtml = `<strong>Space used:</strong> <em>unknown</em>`;
+    }
+
+    const exports = info.exports || [];
+    const active = info.active_clients || [];
+    const exportHtml = exports.length > 0
+        ? `<div class="callout callout-warning"><strong>Active NFS share!</strong><ul>${exports.map(e => `<li><code>${e.export_path}</code> &mdash; <code>${e.sharenfs || 'on'}</code></li>`).join('')}</ul></div>`
+        : `<div class="text-muted">No active NFS shares.</div>`;
+    const usersHtml = active.length > 0
+        ? `<div class="callout callout-error"><strong>${active.length} active user(s)!</strong><ul>${active.map(c => `<li><code>${c.client}</code> on <code>${c.path}</code></li>`).join('')}</ul></div>`
+        : `<div class="text-muted">No active users.</div>`;
+
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.display = 'flex';
+    modal.style.zIndex = '2000';
+    modal.innerHTML = `
+        <div class="modal-content" style="max-width:560px">
+            <div class="modal-header">
+                <h3>Destroy Pool "${poolName}"</h3>
+                <button class="close" onclick="this.closest('.modal').remove()">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:20px">
+                <div class="callout callout-error"><strong>DESTRUCTIVE.</strong> This cannot be undone.</div>
+                <div style="margin-bottom:12px">${spaceHtml}</div>
+                <div style="margin-bottom:12px"><strong>NFS exports</strong><div style="margin-top:4px">${exportHtml}</div></div>
+                <div style="margin-bottom:12px"><strong>Active users</strong><div style="margin-top:4px">${usersHtml}</div></div>
+                <label style="display:flex;align-items:center;gap:8px;margin:8px 0">
+                    <input type="checkbox" id="destroy-confirm-check">
+                    I understand this is irreversible.
+                </label>
+                <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+                    <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">Cancel</button>
+                    <button class="btn btn-danger" id="confirm-destroy-btn" disabled>Destroy Pool</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+
+    const check = modal.querySelector('#destroy-confirm-check');
+    const btn = modal.querySelector('#confirm-destroy-btn');
+    check.addEventListener('change', () => { btn.disabled = !check.checked; });
+    btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+            await api.destroyPool(poolName);
+            modal.remove();
+            showAlert('Pool destroyed', 'success');
+            await loadPools();
+        } catch (error) {
+            showAlert('Failed: ' + error.message, 'error');
+            btn.disabled = false;
+        }
+    });
+}
+</script>
+{% endblock %}

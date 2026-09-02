@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - NAZMan{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+    <!-- System Status Cards -->
+    <div class="status-cards">
+        <div class="card status-card">
+            <div class="card-icon">
+                <i class="fas fa-microchip"></i>
+            </div>
+            <div class="card-content">
+                <h3>CPU Usage <span class="metric-value" id="cpu-usage">--%</span></h3>
+                <canvas id="cpu-sparkline" class="sparkline-canvas"></canvas>
+            </div>
+        </div>
+        <div class="card status-card">
+            <div class="card-icon">
+                <i class="fas fa-memory"></i>
+            </div>
+            <div class="card-content">
+                <h3>Memory <span class="metric-value" id="memory-usage">--%</span></h3>
+                <p class="memory-detail" id="memory-detail">--</p>
+                <canvas id="mem-sparkline" class="sparkline-canvas"></canvas>
+            </div>
+        </div>
+        <div class="card status-card">
+            <div class="card-icon">
+                <i class="fas fa-network-wired"></i>
+            </div>
+            <div class="card-content">
+                <h3>Network <span class="metric-value" id="net-usage">--%</span></h3>
+                <p class="memory-detail" id="net-interface">--</p>
+                <canvas id="net-sparkline" class="sparkline-canvas"></canvas>
+            </div>
+        </div>
+        <div class="card status-card">
+            <div class="card-icon">
+                <i class="fas fa-hdd"></i>
+            </div>
+            <div class="card-content">
+                <h3>Pool Disk Usage</h3>
+                <select id="pool-select" class="pool-select">
+                    <option value="">Select pool</option>
+                </select>
+                <canvas id="disk-sparkline" class="sparkline-canvas"></canvas>
+                <div id="disk-legend" class="disk-legend"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Storage Overview -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-database"></i> Storage Overview</h2>
+        </div>
+        <div class="card-body">
+            <div id="pools-overview" class="pools-grid">
+                <p class="loading">Loading pools...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-bolt"></i> Quick Actions</h2>
+        </div>
+        <div class="card-body">
+            <div class="quick-actions">
+                <button class="btn btn-primary" onclick="refreshAll()">
+                    <i class="fas fa-sync-alt"></i> Refresh All
+                </button>
+                <button class="btn btn-secondary" onclick="window.location.href='/pools'">
+                    <i class="fas fa-plus"></i> Create Pool
+                </button>
+                <button class="btn btn-secondary" onclick="window.location.href='/disks'">
+                    <i class="fas fa-hdd"></i> Manage Disks
+                </button>
+                <button class="btn btn-secondary" onclick="window.location.href='/backup'">
+                    <i class="fas fa-save"></i> Backup Now
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Events -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-clock"></i> Recent Events</h2>
+            <div class="card-header-actions">
+                <label class="read-toggle"><input type="checkbox" id="show-reads"> Show reads</label>
+                <a href="/events" class="btn btn-secondary btn-sm">View all</a>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="recent-events" class="events-list">
+                <p class="loading">Loading events...</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const POLL_INTERVAL = 5000;
+let metricsTimer = null;
+
+let selectedPool = localStorage.getItem('nazman_pool') || '';
+
+function setPoolSelect(poolsMap) {
+    const sel = document.getElementById('pool-select');
+    const names = Object.keys(poolsMap || {});
+    const current = sel.value;
+    // only rebuild if the option set changed to preserve selection
+    const existing = Array.from(sel.options).map(o => o.value);
+    const same = names.length === existing.length - 1 && names.every(n => existing.includes(n));
+    if (!same) {
+        sel.innerHTML = '<option value="">Select pool</option>';
+        names.forEach(n => {
+            const o = document.createElement('option');
+            o.value = n;
+            o.textContent = n;
+            sel.appendChild(o);
+        });
+    }
+    if (selectedPool && poolsMap[selectedPool] !== undefined) {
+        sel.value = selectedPool;
+    } else {
+        sel.value = '';
+    }
+}
+
+async function loadDashboard() {
+    await Promise.all([
+        loadPoolsOverview(),
+        pollMetrics()
+    ]);
+}
+
+async function pollMetrics() {
+    try {
+        const m = await api.request('GET', '/api/system/metrics');
+
+        const cpuSeries = (m.history.cpu || []).map(s => s.value);
+        const memSeries = (m.history.memory || []).map(s => s.value);
+        const netSeries = (m.net || []).map(s => s.value);
+        const cpuCurrent = cpuSeries.length ? cpuSeries[cpuSeries.length - 1] : 0;
+        const netCurrent = netSeries.length ? netSeries[netSeries.length - 1] : 0;
+
+        document.getElementById('cpu-usage').textContent = cpuCurrent + '%';
+        document.getElementById('memory-usage').textContent = m.memory.percent + '%';
+        document.getElementById('net-usage').textContent = Number(netCurrent).toFixed(5) + '%';
+        updateUsageColor('cpu-usage', cpuCurrent);
+        updateUsageColor('memory-usage', m.memory.percent);
+        updateUsageColor('net-usage', netCurrent);
+
+        document.getElementById('memory-detail').textContent =
+            formatBytes(m.memory.used) + ' / ' + formatBytes(m.memory.total);
+
+        const iface = m.selected_interface || 'n/a';
+        const speed = (m.interfaces || []).find(i => i.name === iface);
+        document.getElementById('net-interface').textContent =
+            iface + (speed && speed.speed_mbps ? ' (' + speed.speed_mbps + ' Mb/s)' : '');
+
+        drawSparkline('cpu-sparkline', cpuSeries, getColorForPercent(cpuCurrent));
+        drawSparkline('mem-sparkline', memSeries, getColorForPercent(m.memory.percent));
+        drawSparkline('net-sparkline', netSeries, getColorForPercent(netCurrent));
+
+        // pool selector + per-disk overlaid lines
+        setPoolSelect(m.pools || {});
+        const sel = document.getElementById('pool-select');
+        if (sel.value) selectedPool = sel.value;
+        const seriesList = [];
+        const names = sel.value ? (m.pools[sel.value] || []) : [];
+        names.forEach(base => {
+            const data = ((m.disks || {})[base] || []).map(s => s.value);
+            if (data.length) seriesList.push({ name: base, data: data });
+        });
+        const colors = seriesList.map(s => diskColor(s.name));
+        drawMultiline('disk-sparkline', seriesList, colors);
+        const legend = document.getElementById('disk-legend');
+        if (seriesList.length) {
+            legend.innerHTML = seriesList.map((s, i) =>
+                `<span class="legend-item"><span class="legend-swatch" style="background:${colors[i]}"></span>${s.name}</span>`
+            ).join('');
+        } else {
+            legend.innerHTML = '<span class="legend-item muted">No disks</span>';
+        }
+    } catch (error) {
+        console.error('Metrics poll failed:', error);
+    }
+}
+
+async function loadPoolsOverview() {
+    try {
+        const pools = await api.getPools();
+        const container = document.getElementById('pools-overview');
+        if (pools.length === 0) {
+            container.innerHTML = '<p class="empty-state">No pools configured. <a href="/pools">Create one</a></p>';
+            return;
+        }
+        container.innerHTML = pools.map(pool => {
+            const usable = pool.usable_bytes || 0;
+            const pct = pool.used_capacity_pct != null ? pool.used_capacity_pct : null;
+            const used = usable && pct != null ? usable * pct / 100 : null;
+            const free = usable && used != null ? usable - used : pool.free_bytes;
+            const ratio = pool.compressratio != null ? pool.compressratio : null;
+            const effectiveUsable = ratio && usable ? usable * ratio : usable;
+
+            const usageHtml = usable > 0 && pct != null ? `
+                <div class="pool-usage-bar" style="background:#444;border-radius:4px;height:10px;overflow:hidden;margin:6px 0">
+                    <div style="width:${Math.min(100, pct)}%;height:100%;background:${pct >= 90 ? '#e74c3c' : (pct >= 70 ? '#f39c12' : '#2ecc71')}"></div>
+                </div>
+                <div class="overview-stats">
+                    <span>${pct.toFixed(1)}% used ${used != null ? `(${formatBytes(used)})` : ''}</span>
+                    <span>Free: ${free != null ? formatBytes(free) : 'Unknown'}</span>
+                </div>` : `<span class="text-muted">Capacity unknown</span>`;
+
+            const effectiveHtml = effectiveUsable > 0 ? `
+                <span class="overview-meta"><i class="fas fa-expand-arrows-alt"></i> Usable: ${formatBytes(effectiveUsable)}${ratio ? ' (incl. compression)' : ''}</span>` : '';
+
+            const ratioHtml = ratio !== null
+                ? `<span class="overview-compression"><i class="fas fa-compress-arrows-alt"></i> Compression x${ratio.toFixed(2)}</span>` : '';
+
+            const dsCount = (pool.datasets && pool.datasets.length) != null
+                ? `<span class="overview-meta"><i class="fas fa-database"></i> ${pool.datasets.length} datasets</span>` : '';
+
+            const unhealthy = pool.health && pool.health.toUpperCase() !== 'ONLINE';
+            return `
+                <div class="pool-card${unhealthy ? ' card-unhealthy' : ''}">
+                    <h3>${pool.name}</h3>
+                    <div class="pool-info">
+                        <span class="status status-${pool.status}">${pool.status}</span>
+                        <span class="topology">${pool.topology}</span>
+                    </div>
+                    ${usageHtml}
+                    <div class="overview-meta-row">
+                        ${effectiveHtml}
+                        ${ratioHtml}
+                        ${dsCount}
+                    </div>
+                </div>`;
+        }).join('');
+    } catch (error) {
+        console.error('Failed to load pools:', error);
+        document.getElementById('pools-overview').innerHTML = '<p class="error">Failed to load pools</p>';
+    }
+}
+
+async function loadRecentEvents() {
+    const container = document.getElementById('recent-events');
+    const showReads = document.getElementById('show-reads').checked;
+    try {
+        const data = await api.getCommandLog({ type: showReads ? 'read,write,system' : 'write,system' });
+        const entries = (data.entries || []).slice(0, 8);
+        if (entries.length === 0) {
+            container.innerHTML = '<p class="empty-state">No commands recorded yet.</p>';
+            return;
+        }
+        container.innerHTML = entries.map(function (e) {
+            const cls = e.status === 'success' ? 'event-success' : 'event-failed';
+            return `<div class="event-row">
+                <span class="event-status ${cls}">${e.status}</span>
+                <code class="event-cmd">${escapeHtml(e.command)}</code>
+            </div>`;
+        }).join('');
+    } catch (error) {
+        container.innerHTML = '<p class="error">Failed to load events</p>';
+    }
+}
+
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
+async function refreshAll() {
+    await loadDashboard();
+    await pollMetrics();
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('pool-select').addEventListener('change', function() {
+        selectedPool = this.value;
+        if (selectedPool) localStorage.setItem('nazman_pool', selectedPool);
+        else localStorage.removeItem('nazman_pool');
+    });
+    document.getElementById('show-reads').addEventListener('change', loadRecentEvents);
+    loadDashboard().then(function() {
+        loadRecentEvents();
+        metricsTimer = setInterval(function() {
+            pollMetrics();
+            loadRecentEvents();
+        }, POLL_INTERVAL);
+    });
+});
+</script>
+{% endblock %}

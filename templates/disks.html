@@ -1,0 +1,375 @@
+{% extends "base.html" %}
+
+{% block title %}Disks - NAZMan{% endblock %}
+{% block page_title %}Disk Management{% endblock %}
+
+{% block content %}
+<div class="disks-page">
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-hdd"></i> Disks</h2>
+            <div style="display:flex;gap:8px;align-items:center">
+                <button class="btn btn-primary" id="partition-btn" style="display:none" onclick="openPartitionModal()">
+                    <i class="fas fa-cut"></i> Partition Selected
+                </button>
+                <button class="btn btn-secondary" onclick="refreshDisks()">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="disks-table">
+                <p class="loading">Loading disks...</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Partition Modal -->
+<div id="partition-modal" class="modal" style="display: none;">
+    <div class="modal-content" style="max-width:600px">
+        <div class="modal-header">
+            <h3 id="partition-modal-title">Partition Disks</h3>
+            <button class="close" onclick="hidePartitionModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p id="partition-disk-info"></p>
+            <div class="form-group">
+                <label>Partitions:</label>
+                <div id="partition-rows"></div>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="addPartitionRow()" style="margin-top:6px">
+                    <i class="fas fa-plus"></i> Add Partition
+                </button>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-danger" onclick="wipeAndPartitionSelected()" id="partition-submit-btn">
+                    <i class="fas fa-cut"></i> Wipe &amp; Partition
+                </button>
+                <button class="btn btn-warning" onclick="wipeOnlySelected()" id="partition-wipe-btn">
+                    <i class="fas fa-eraser"></i> Wipe Only
+                </button>
+                <button class="btn btn-secondary" onclick="hidePartitionModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let disks = [];
+let diskPartitionsCache = {};   // disk_id -> [{number, slot_uuid, device_path, size_bytes}]
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadDisks();
+});
+
+async function loadDisks() {
+    try {
+        disks = await api.getDisks();
+        diskPartitionsCache = {};
+        for (const disk of disks) {
+            if (disk.is_os_disk) continue;
+            try {
+                const info = await api.getDiskPartitions(disk.id);
+                diskPartitionsCache[disk.id] = info.partitions;
+            } catch (e) {
+                diskPartitionsCache[disk.id] = [];
+            }
+        }
+        renderDisks();
+    } catch (error) {
+        console.error('Failed to load disks:', error);
+    }
+}
+
+function renderDisks() {
+    const container = document.getElementById('disks-table');
+    const osDisks = disks.filter(d => d.is_os_disk);
+    const available = disks
+        .filter(d => !d.is_os_disk)
+        .sort((a, b) => {
+            const present = d => d.device_name && d.status !== 'removed' && d.status !== 'dead';
+            return (present(b) - present(a) || a.id - b.id);
+        });
+
+    let html = '';
+
+    if (available.length > 0) {
+        html += `
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th style="width:32px"></th>
+                        <th>Device</th>
+                        <th>Model</th>
+                        <th>Serial</th>
+                        <th>Size</th>
+                        <th>Type</th>
+                        <th>Health</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${available.map(disk => {
+                        const parts = diskPartitionsCache[disk.id] || [];
+                        const hasParts = parts.length > 0;
+                        const isDead = disk.status === 'dead';
+                        const isRemoved = disk.status === 'removed';
+                        const label = disk.device_name || (disk.by_id || '').replace('/dev/disk/by-id/', '') || disk.serial || 'Unknown';
+                        const absentBadge = (!disk.device_name && !isDead) ? '<span class="badge badge-removed">not present</span>' : '';
+                        return `
+                        <tr class="${isDead ? 'dead-row' : (isRemoved ? 'removed-row' : '')}" data-disk-id="${disk.id}">
+                            <td>
+                                ${(!isDead && !isRemoved) ? `<input type="checkbox" class="disk-cb" value="${disk.id}">` : ''}
+                            </td>
+                            <td>
+                                ${label} ${absentBadge} ${isRemoved ? '<span class="badge badge-removed">removed</span>' : ''}
+                                <br><small class="text-muted" title="${disk.by_id || ''}">${(disk.by_id || '').replace('/dev/disk/by-id/', '') || 'by-id unavailable'}</small>
+                            </td>
+                            <td>${disk.model || 'Unknown'}</td>
+                            <td>${disk.serial || 'Unknown'}</td>
+                            <td>${formatSize(disk.size_bytes)}</td>
+                            <td><span class="badge badge-${disk.disk_type}">${disk.disk_type}</span></td>
+                            <td><span class="status status-${disk.health_status}">${disk.health_status}</span></td>
+                            <td>
+                                ${isDead
+                                    ? `<button class="btn btn-sm btn-primary" onclick="resurrectDisk(${disk.id})">Resurrect</button>`
+                                    : (!isRemoved ? `<button class="btn btn-sm btn-danger" onclick="markDead(${disk.id})">Dead</button>` : '')
+                                }
+                                ${(isRemoved || !disk.device_name) ? `<button class="btn btn-sm btn-secondary" onclick="dropDisk(${disk.id})">Drop</button>` : ''}
+                            </td>
+                        </tr>
+                        ${parts.map(p => `
+                            <tr class="partition-row" data-parent-disk="${disk.id}">
+                                <td></td>
+                                <td style="text-align:right;padding-right:24px" colspan="5">
+                                    <small class="text-muted">
+                                        <i class="fas fa-columns"></i>
+                                        Partition ${p.number}
+                                        <code style="margin-left:4px">${p.slot_uuid.substring(0, 8)}...</code>
+                                    </small>
+                                </td>
+                                <td><small>${formatSize(p.size_bytes)}</small></td>
+                                <td></td>
+                            </tr>
+                        `).join('')}
+                    `}).join('')}
+                </tbody>
+            </table>`;
+    } else {
+        html += '<p class="empty-state">No available disks found.</p>';
+    }
+
+    if (osDisks.length > 0) {
+        html += `
+            <h3 style="margin-top:24px">System Disk(s)</h3>
+            <table class="data-table">
+                <thead>
+                    <tr><th></th><th>Device</th><th>Model</th><th>Size</th><th>Type</th><th>Health</th><th></th></tr>
+                </thead>
+                <tbody>
+                    ${osDisks.map(disk => `
+                        <tr>
+                            <td></td>
+                            <td>${disk.device_name || (disk.by_id || '').replace('/dev/disk/by-id/', '') || disk.serial || 'Unknown'} <span class="badge badge-system">System</span></td>
+                            <td>${disk.model || 'Unknown'}</td>
+                            <td>${formatSize(disk.size_bytes)}</td>
+                            <td><span class="badge badge-${disk.disk_type}">${disk.disk_type}</span></td>
+                            <td><span class="status status-${disk.health_status}">${disk.health_status}</span></td>
+                            <td></td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>`;
+    }
+
+    container.innerHTML = html;
+
+    document.querySelectorAll('.disk-cb').forEach(cb => {
+        cb.addEventListener('change', updatePartitionButton);
+    });
+}
+
+function updatePartitionButton() {
+    const checked = document.querySelectorAll('.disk-cb:checked');
+    const btn = document.getElementById('partition-btn');
+    btn.style.display = checked.length > 0 ? '' : 'none';
+    btn.innerHTML = checked.length > 1
+        ? `<i class="fas fa-cut"></i> Partition ${checked.length} Disks`
+        : `<i class="fas fa-cut"></i> Partition Selected`;
+}
+
+function refreshDisks() {
+    loadDisks();
+}
+
+function formatSize(bytes) {
+    if (!bytes) return 'Unknown';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = 0;
+    while (bytes >= 1024 && i < units.length - 1) {
+        bytes /= 1024;
+        i++;
+    }
+    return bytes.toFixed(2) + ' ' + units[i];
+}
+
+// ── Partition Modal ──────────────────────────────────────────
+
+let selectedDiskIds = [];
+
+function openPartitionModal() {
+    selectedDiskIds = [...document.querySelectorAll('.disk-cb:checked')].map(cb => parseInt(cb.value));
+    if (selectedDiskIds.length === 0) return;
+
+    const title = document.getElementById('partition-modal-title');
+    if (selectedDiskIds.length === 1) {
+        const disk = disks.find(d => d.id === selectedDiskIds[0]);
+        title.textContent = `Partition ${disk.device_name}`;
+        document.getElementById('partition-disk-info').innerHTML =
+            `<strong>${disk.device_name}</strong> — ${formatSize(disk.size_bytes)} ${disk.disk_type}`;
+    } else {
+        title.textContent = `Partition ${selectedDiskIds.length} Disks`;
+        const names = selectedDiskIds.map(id => disks.find(d => d.id === id)?.device_name).filter(Boolean);
+        document.getElementById('partition-disk-info').innerHTML =
+            `Applying same layout to: <strong>${names.join(', ')}</strong>`;
+    }
+
+    document.getElementById('partition-rows').innerHTML = '';
+    addPartitionRow('');
+    document.getElementById('partition-modal').style.display = 'flex';
+}
+
+function hidePartitionModal() {
+    document.getElementById('partition-modal').style.display = 'none';
+    selectedDiskIds = [];
+}
+
+function addPartitionRow(size = '') {
+    const container = document.getElementById('partition-rows');
+    const row = document.createElement('div');
+    row.style.display = 'flex';
+    row.style.gap = '8px';
+    row.style.marginBottom = '6px';
+    row.style.alignItems = 'center';
+    row.innerHTML = `
+        <input type="text" class="form-control part-size" placeholder="Size (e.g. 10G, 500M, empty = rest)" value="${size}" style="flex:1">
+        <button type="button" class="btn btn-sm btn-danger" onclick="this.parentElement.remove()">
+            <i class="fas fa-times"></i>
+        </button>
+    `;
+    container.appendChild(row);
+}
+
+function parseSizeToMB(str) {
+    const match = str.match(/^(\d+(?:\.\d+)?)\s*(T|G|M|K)?$/i);
+    if (!match) return null;
+    const value = parseFloat(match[1]);
+    const unit = (match[2] || 'M').toUpperCase();
+    const multipliers = { T: 1024 * 1024, G: 1024, M: 1, K: 1 / 1024 };
+    return Math.round(value * (multipliers[unit] || 1));
+}
+
+async function wipeAndPartitionSelected() {
+    if (selectedDiskIds.length === 0) return;
+
+    const rows = document.querySelectorAll('#partition-rows .part-size');
+    const partitions = [];
+    for (const row of rows) {
+        const sizeStr = row.value.trim();
+        let size_mb = null;
+        if (sizeStr) {
+            size_mb = parseSizeToMB(sizeStr);
+            if (size_mb === null) {
+                showAlert(`Invalid size: "${sizeStr}". Use formats like 10G, 500M, 1T.`, 'error');
+                return;
+            }
+        }
+        partitions.push({ size_mb });
+    }
+
+    if (partitions.length === 0) {
+        return wipeOnlySelected();
+    }
+
+    const names = selectedDiskIds.map(id => disks.find(d => d.id === id)?.device_name).filter(Boolean);
+    const label = names.length === 1 ? names[0] : `${names.length} disks (${names.join(', ')})`;
+    if (!confirm(`Wipe and create ${partitions.length} partition(s) on ${label}?`)) return;
+
+    try {
+        const results = await api.batchPartitionDisks({ disk_ids: selectedDiskIds, partitions });
+        const failed = results.filter(r => !r.success);
+        hidePartitionModal();
+        await loadDisks();
+        if (failed.length === 0) {
+            showAlert(`Partitioned ${names.length} disk(s)`, 'success');
+        } else {
+            const msgs = failed.map(f => `Disk ${f.disk_id}: ${f.error}`).join('; ');
+            showAlert(`Partitioned ${names.length - failed.length}/${names.length} disk(s). Failures: ${msgs}`, 'warning');
+        }
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+async function wipeOnlySelected() {
+    if (selectedDiskIds.length === 0) return;
+
+    const names = selectedDiskIds.map(id => disks.find(d => d.id === id)?.device_name).filter(Boolean);
+    const label = names.length === 1 ? names[0] : `${names.length} disks (${names.join(', ')})`;
+    if (!confirm(`Wipe all partition tables on ${label}? This removes all partitions.`)) return;
+
+    try {
+        const results = await api.batchWipeDisks({ disk_ids: selectedDiskIds, partitions: [] });
+        const failed = results.filter(r => !r.success);
+        hidePartitionModal();
+        await loadDisks();
+        if (failed.length === 0) {
+            showAlert(`Wiped ${names.length} disk(s)`, 'success');
+        } else {
+            const msgs = failed.map(f => `Disk ${f.disk_id}: ${f.error}`).join('; ');
+            showAlert(`Wiped ${names.length - failed.length}/${names.length} disk(s). Failures: ${msgs}`, 'warning');
+        }
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+// ── Disk Actions ─────────────────────────────────────────────
+
+async function markDead(diskId) {
+    const disk = disks.find(d => d.id === diskId);
+    if (!confirm(`Mark ${disk.device_name} as dead?`)) return;
+    try {
+        await api.updateDisk(diskId, { status: 'dead' });
+        showAlert(`${disk.device_name} marked as dead`, 'success');
+        await loadDisks();
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+async function resurrectDisk(diskId) {
+    try {
+        await api.resurrectDisk(diskId);
+        showAlert('Disk resurrected', 'success');
+        await loadDisks();
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+
+async function dropDisk(diskId) {
+    const disk = disks.find(d => d.id === diskId);
+    if (!confirm(`Permanently drop ${disk.model || disk.serial || disk.by_id || disk.id} from the database?`)) return;
+    try {
+        await api.deleteDisk(diskId);
+        showAlert('Disk record dropped', 'success');
+        await loadDisks();
+    } catch (error) {
+        showAlert('Failed: ' + error.message, 'error');
+    }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,256 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - NAZMan{% endblock %}
+{% block page_title %}System Settings{% endblock %}
+
+{% block content %}
+<div class="settings-page">
+    <!-- System Information -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-info-circle"></i> System Information</h2>
+        </div>
+        <div class="card-body">
+            <div id="system-info" class="info-grid">
+                <p class="loading">Loading system information...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scheduled Tasks -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-clock"></i> Scheduled Tasks</h2>
+            <button class="btn btn-primary" onclick="showCreateTaskModal()">
+                <i class="fas fa-plus"></i> Create Task
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="scheduled-tasks" class="tasks-table">
+                <p class="loading">Loading scheduled tasks...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Application Settings -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-cog"></i> Application Settings</h2>
+        </div>
+        <div class="card-body">
+            <form id="settings-form">
+                <div class="form-group">
+                    <label for="setting-auth">Authentication:</label>
+                    <select id="setting-auth">
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="setting-backup">Auto Backup:</label>
+                    <select id="setting-backup">
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="setting-refresh">Refresh Interval (seconds):</label>
+                    <input type="number" id="setting-refresh" value="5" min="1" max="60">
+                </div>
+                <button type="submit" class="btn btn-primary">
+                    <i class="fas fa-save"></i> Save Settings
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Create Task Modal -->
+<div id="create-task-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Create Scheduled Task</h3>
+            <button class="close" onclick="hideCreateTaskModal()">&times;</button>
+        </div>
+        <form id="create-task-form">
+            <div class="form-group">
+                <label for="task-name">Task Name:</label>
+                <input type="text" id="task-name" required placeholder="e.g., weekly-scrub">
+            </div>
+            <div class="form-group">
+                <label for="task-type">Task Type:</label>
+                <select id="task-type" required>
+                    <option value="scrub">Pool Scrub</option>
+                    <option value="snapshot">Snapshot</option>
+                    <option value="backup">Backup</option>
+                    <option value="health_check">Health Check</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="task-target">Target:</label>
+                <input type="text" id="task-target" required placeholder="e.g., tank or tank/data">
+            </div>
+            <div class="form-group">
+                <label for="task-schedule">Schedule (cron format):</label>
+                <input type="text" id="task-schedule" required placeholder="0 2 * * 0">
+                <small>Example: 0 2 * * 0 = Every Sunday at 2 AM</small>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="hideCreateTaskModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Task</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let scheduledTasks = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadSettingsPage();
+    document.getElementById('create-task-form').addEventListener('submit', handleCreateTask);
+    document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
+});
+
+async function loadSettingsPage() {
+    await Promise.all([
+        loadSystemInfo(),
+        loadScheduledTasks()
+    ]);
+}
+
+async function loadSystemInfo() {
+    try {
+        const status = await api.getSystemStatus();
+        renderSystemInfo(status);
+    } catch (error) {
+        console.error('Failed to load system info:', error);
+        showError('system-info', 'Failed to load system information');
+    }
+}
+
+async function loadScheduledTasks() {
+    // For now, use mock data since scheduler API isn't implemented
+    scheduledTasks = [
+        { id: 1, name: 'weekly-scrub', task_type: 'scrub', target: 'tank', schedule: '0 2 * * 0', enabled: true },
+        { id: 2, name: 'daily-snapshot', task_type: 'snapshot', target: 'tank/data', schedule: '0 0 * * *', enabled: true }
+    ];
+    renderScheduledTasks();
+}
+
+function renderSystemInfo(status) {
+    const container = document.getElementById('system-info');
+    
+    container.innerHTML = `
+        <div class="info-grid">
+            <div class="info-item">
+                <label>CPU Usage:</label>
+                <span>${status.system.cpu_percent}%</span>
+            </div>
+            <div class="info-item">
+                <label>Memory:</label>
+                <span>${status.system.memory.percent}% (${formatBytes(status.system.memory.available)} free)</span>
+            </div>
+            <div class="info-item">
+                <label>OS Disk:</label>
+                <span>${status.system.disk.percent}% (${formatBytes(status.system.disk.free)} free)</span>
+            </div>
+            <div class="info-item">
+                <label>ZFS Pools:</label>
+                <span>${status.storage.pool_count}</span>
+            </div>
+            <div class="info-item">
+                <label>Disks:</label>
+                <span>${status.storage.disk_count}</span>
+            </div>
+        </div>
+    `;
+}
+
+function renderScheduledTasks() {
+    const container = document.getElementById('scheduled-tasks');
+    
+    if (scheduledTasks.length === 0) {
+        container.innerHTML = '<p class="empty-state">No scheduled tasks. <a href="javascript:void(0)" onclick="showCreateTaskModal()">Create one</a></p>';
+        return;
+    }
+    
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Target</th>
+                    <th>Schedule</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${scheduledTasks.map(task => `
+                    <tr>
+                        <td>${task.name}</td>
+                        <td>${task.task_type}</td>
+                        <td>${task.target}</td>
+                        <td><code>${task.schedule}</code></td>
+                        <td><span class="status status-${task.enabled ? 'online' : 'faulted'}">${task.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleTask(${task.id}, ${!task.enabled})">
+                                <i class="fas fa-${task.enabled ? 'pause' : 'play'}"></i>
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteTask(${task.id})">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function showCreateTaskModal() {
+    document.getElementById('create-task-modal').style.display = 'flex';
+}
+
+function hideCreateTaskModal() {
+    document.getElementById('create-task-modal').style.display = 'none';
+}
+
+async function handleCreateTask(e) {
+    e.preventDefault();
+    
+    const name = document.getElementById('task-name').value;
+    const taskType = document.getElementById('task-type').value;
+    const target = document.getElementById('task-target').value;
+    const schedule = document.getElementById('task-schedule').value;
+    
+    // TODO: Call API to create task
+    showAlert('Task creation coming soon', 'success');
+    hideCreateTaskModal();
+}
+
+function toggleTask(id, enabled) {
+    // TODO: Call API to toggle task
+    showAlert('Task toggle coming soon', 'success');
+}
+
+function deleteTask(id) {
+    if (!confirm('Delete this scheduled task?')) {
+        return;
+    }
+    // TODO: Call API to delete task
+    showAlert('Task deletion coming soon', 'success');
+}
+
+async function handleSaveSettings(e) {
+    e.preventDefault();
+    
+    // TODO: Save settings
+    showAlert('Settings saved (coming soon)', 'success');
+}
+</script>
+{% endblock %}

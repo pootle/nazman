@@ -1,0 +1,342 @@
+{% extends "base.html" %}
+
+{% block title %}NFS - NAZMan{% endblock %}
+{% block page_title %}NFS Share Management{% endblock %}
+
+{% block content %}
+<div class="nfs-page">
+    <!-- Presence warning -->
+    <div class="card" id="nfs-presence-card" style="display:none;">
+        <div class="card-body">
+            <p class="callout callout-warning" id="nfs-presence-msg"></p>
+        </div>
+    </div>
+
+    <!-- NFS Shares (live ZFS sharenfs) -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-share-alt"></i> NFS Shares</h2>
+            <div>
+                <button class="btn btn-secondary" onclick="loadNfsShares()">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+                <button class="btn btn-primary" onclick="showCreateExportModal()">
+                    <i class="fas fa-plus"></i> Create Share
+                </button>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="nfs-shares" class="exports-table">
+                <p class="loading">Loading NFS shares...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Active Exports -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-network-wired"></i> Active Exports</h2>
+            <button class="btn btn-secondary" onclick="loadActiveExports()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="active-exports" class="exports-table">
+                <p class="loading">Loading active exports...</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create/Edit Share Modal -->
+<div id="create-export-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="export-modal-title">Create NFS Share</h3>
+            <button class="close" onclick="hideCreateExportModal()">&times;</button>
+        </div>
+        <form id="create-export-form">
+            <div class="form-group">
+                <label for="export-dataset">Dataset:</label>
+                <select id="export-dataset" required>
+                    <option value="">-- Select Dataset --</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="export-client">Client Specification:</label>
+                <input type="text" id="export-client" required placeholder="e.g., 192.168.1.0/24 or *">
+            </div>
+            <div class="form-group">
+                <label>Export Options:</label>
+                <div class="checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="opt-rw" checked disabled> Read/Write
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="opt-sync" checked> Sync
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="opt-subtree" checked> No Subtree Check
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="opt-nohide"> No Hide (NFSv4)
+                    </label>
+                </div>
+                <p class="text-muted" style="margin-top:8px">
+                    All shares squash every client to the shared anonymous user
+                    (<code>nfsanon</code>, UID/GID 65533) for consistent read/write access.
+                </p>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="hideCreateExportModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Share</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let shares = [];
+let datasets = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadNfsPage();
+    document.getElementById('create-export-form').addEventListener('submit', handleCreateExport);
+});
+
+async function loadNfsPage() {
+    await Promise.all([
+        loadNfsShares(),
+        loadActiveExports(),
+        loadDatasets(),
+        checkNfsPresence()
+    ]);
+}
+
+async function checkNfsPresence() {
+    const card = document.getElementById('nfs-presence-card');
+    try {
+        const p = await api.getNfsPresence();
+        if (p.installed) {
+            card.style.display = 'none';
+        } else {
+            document.getElementById('nfs-presence-msg').textContent =
+                'The NFS kernel server is not installed on this server. NFS sharing will not work ' +
+                'until you install it: run the NAZMan installer (build.sh, choosing to install NFS) ' +
+                'or run `sudo apt-get install -y nfs-kernel-server` on the server.';
+            card.style.display = '';
+        }
+    } catch (e) {
+        console.error('Failed to check NFS presence:', e);
+    }
+}
+
+async function loadNfsShares() {
+    try {
+        shares = await api.getNfsExports();
+        renderNfsShares();
+    } catch (error) {
+        console.error('Failed to load NFS shares:', error);
+        showError('nfs-shares', 'Failed to load NFS shares');
+    }
+}
+
+async function loadActiveExports() {
+    try {
+        const activeExports = await api.getActiveExports();
+        renderActiveExports(activeExports);
+    } catch (error) {
+        console.error('Failed to load active exports:', error);
+        showError('active-exports', 'Failed to load active exports');
+    }
+}
+
+async function loadDatasets() {
+    try {
+        datasets = await api.getDatasets();
+        updateDatasetSelect();
+    } catch (error) {
+        console.error('Failed to load datasets:', error);
+    }
+}
+
+function renderNfsShares() {
+    const container = document.getElementById('nfs-shares');
+
+    if (shares.length === 0) {
+        container.innerHTML = createEmptyState('No NFS shares configured.');
+        return;
+    }
+
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Path</th>
+                    <th>Share Options (sharenfs)</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${shares.map(s => `
+                    <tr>
+                        <td><code>${s.export_path}</code></td>
+                        <td><code>${s.sharenfs || 'not set'}</code></td>
+                        <td><span class="status status-${s.enabled ? 'online' : 'faulted'}">${s.enabled ? 'Shared' : 'Not shared'}</span></td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})">
+                                <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
+                            </button>
+                            ${s.enabled ? `<button class="btn btn-sm btn-secondary" onclick="editShare('${s.dataset_name}')">
+                                <i class="fas fa-edit"></i>
+                            </button>` : ''}
+                            <button class="btn btn-sm btn-danger" onclick="deleteExport('${s.dataset_name}')">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function renderActiveExports(activeExports) {
+    const container = document.getElementById('active-exports');
+
+    if (activeExports.length === 0) {
+        container.innerHTML = createEmptyState('No active exports.');
+        return;
+    }
+
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Path</th>
+                    <th>Client</th>
+                    <th>Options</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${activeExports.map(exp => `
+                    <tr>
+                        <td><code>${exp.path}</code></td>
+                        <td>${exp.client}</td>
+                        <td><code>${exp.options}</code></td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function updateDatasetSelect() {
+    const select = document.getElementById('export-dataset');
+    if (select) {
+        const current = select.value;
+        select.innerHTML = '<option value="">-- Select Dataset --</option>' +
+            datasets.map(d => `<option value="${d.name}" ${d.name === current ? 'selected' : ''}>${d.name}</option>`).join('');
+    }
+}
+
+function showCreateExportModal() {
+    document.getElementById('export-modal-title').textContent = 'Create NFS Share';
+    document.getElementById('export-dataset').value = '';
+    document.getElementById('export-client').value = '';
+    document.getElementById('create-export-form').removeAttribute('data-edit-name');
+    updateDatasetSelect();
+    document.getElementById('create-export-modal').style.display = 'flex';
+}
+
+function editShare(datasetName) {
+    const s = shares.find(x => x.dataset_name === datasetName);
+    if (!s) return;
+    document.getElementById('export-modal-title').textContent = 'Edit NFS Share';
+    document.getElementById('export-dataset').value = s.dataset_name;
+    document.getElementById('export-client').value = '';
+    document.getElementById('create-export-form').setAttribute('data-edit-name', datasetName);
+    // Pre-populate checkboxes from the current sharenfs string if possible.
+    const opts = (s.sharenfs || '').split(',');
+    document.getElementById('opt-sync').checked = opts.includes('sync');
+    document.getElementById('opt-subtree').checked = opts.includes('no_subtree_check');
+    document.getElementById('opt-nohide').checked = opts.includes('nohide');
+    updateDatasetSelect();
+    document.getElementById('create-export-modal').style.display = 'flex';
+}
+
+function hideCreateExportModal() {
+    document.getElementById('create-export-modal').style.display = 'none';
+}
+
+async function handleCreateExport(e) {
+    e.preventDefault();
+
+    const datasetName = document.getElementById('export-dataset').value;
+    const clientSpec = document.getElementById('export-client').value;
+    if (!datasetName || !clientSpec) {
+        showAlert('Select a dataset and enter a client specification', 'error');
+        return;
+    }
+
+    const options = {
+        rw: document.getElementById('opt-rw').checked,
+        sync: document.getElementById('opt-sync').checked,
+        async: !document.getElementById('opt-sync').checked,
+        no_subtree_check: document.getElementById('opt-subtree').checked,
+        nohide: document.getElementById('opt-nohide').checked
+    };
+
+    if (!confirm(`Share dataset to client ${clientSpec}?`)) {
+        return;
+    }
+
+    try {
+        const editName = document.getElementById('create-export-form').getAttribute('data-edit-name');
+        if (editName) {
+            await api.updateNfsExport(editName, { client_spec: clientSpec, options });
+            showAlert('Share updated', 'success');
+        } else {
+            await api.createNfsExport({ dataset_name: datasetName, client_spec: clientSpec, options });
+            showAlert('Share created', 'success');
+        }
+        hideCreateExportModal();
+        await loadNfsShares();
+    } catch (error) {
+        showAlert('Failed to save share: ' + error.message, 'error');
+    }
+}
+
+async function toggleShare(datasetName, enable) {
+    try {
+        if (enable) {
+            // Re-enable with the existing sharenfs value (already set).
+            await api.updateNfsExport(datasetName, { enabled: true });
+        } else {
+            await api.updateNfsExport(datasetName, { enabled: false });
+        }
+        await loadNfsShares();
+        showAlert(enable ? 'Share enabled' : 'Share disabled', 'success');
+    } catch (error) {
+        showAlert('Failed to update share: ' + error.message, 'error');
+    }
+}
+
+async function deleteExport(datasetName) {
+    if (!confirm('Disable this NFS share?')) {
+        return;
+    }
+
+    try {
+        await api.deleteNfsExport(datasetName);
+        await loadNfsShares();
+        showAlert('Share disabled', 'success');
+    } catch (error) {
+        showAlert('Failed to disable share: ' + error.message, 'error');
+    }
+}
+</script>
+{% endblock %}

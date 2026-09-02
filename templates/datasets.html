@@ -1,0 +1,519 @@
+{% extends "base.html" %}
+
+{% block title %}Datasets - NAZMan{% endblock %}
+{% block page_title %}Dataset Management{% endblock %}
+
+{% block content %}
+<div class="datasets-page">
+    <!-- Datasets List -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-folder-open"></i> ZFS Datasets</h2>
+            <button class="btn btn-primary" onclick="showCreateDatasetModal()">
+                <i class="fas fa-plus"></i> Create Dataset
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="datasets-list" class="datasets-table">
+                <p class="loading">Loading datasets...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Snapshot Operations -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-camera"></i> Snapshot Operations</h2>
+        </div>
+        <div class="card-body">
+            <div class="operations-grid">
+                <div class="operation-card">
+                    <h3><i class="fas fa-camera"></i> Create Snapshot</h3>
+                    <p>Create a manual snapshot of a dataset.</p>
+                    <select id="snapshot-dataset-select" class="form-control">
+                        <option value="">-- Select Dataset --</option>
+                    </select>
+                    <input type="text" id="snapshot-name" placeholder="Snapshot name" class="form-control">
+                    <button class="btn btn-primary" onclick="createSnapshot()">
+                        Create Snapshot
+                    </button>
+                </div>
+                <div class="operation-card">
+                    <h3><i class="fas fa-list"></i> View Snapshots</h3>
+                    <p>View snapshots for a dataset.</p>
+                    <select id="view-snapshot-dataset-select" class="form-control">
+                        <option value="">-- All Datasets --</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="viewSnapshots()">
+                        View Snapshots
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create Dataset Modal -->
+<div id="create-dataset-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Create ZFS Dataset</h3>
+            <button class="close" onclick="hideCreateDatasetModal()">&times;</button>
+        </div>
+        <form id="create-dataset-form">
+            <div class="form-group">
+                <label for="dataset-pool">Pool:</label>
+                <select id="dataset-pool" required>
+                    <option value="">-- Select Pool --</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="dataset-name">Dataset Name:</label>
+                <input type="text" id="dataset-name" required placeholder="e.g., data/media">
+            </div>
+            <div class="form-group">
+                <label for="dataset-compression">Compression:</label>
+                <select id="dataset-compression">
+                    <option value="zstd">zstd (recommended)</option>
+                    <option value="lz4">lz4</option>
+                    <option value="off">Off</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="dataset-atime">Atime:</label>
+                <select id="dataset-atime">
+                    <option value="partial" selected>Partial (recommended)</option>
+                    <option value="none">None</option>
+                    <option value="all">All</option>
+                </select>
+                <small class="form-hint">none=off, partial=update when older than mtime/ctime, all=update on every read</small>
+            </div>
+            <div class="form-group">
+                <label for="dataset-sync">Sync:</label>
+                <select id="dataset-sync">
+                    <option value="standard">Standard</option>
+                    <option value="always">Always (safer)</option>
+                    <option value="disabled">Disabled (fastest)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="dataset-quota">Quota:</label>
+                <input type="text" id="dataset-quota" placeholder="e.g., 500G, 1T">
+            </div>
+            <div class="form-group">
+                <label for="dataset-recordsize">Record Size:</label>
+                <select id="dataset-recordsize">
+                    <option value="4K">4K (databases)</option>
+                    <option value="8K">8K</option>
+                    <option value="16K">16K</option>
+                    <option value="32K">32K</option>
+                    <option value="64K">64K</option>
+                    <option value="128K" selected>128K (default)</option>
+                    <option value="1M">1M (media)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="dataset-canmount">CanMount:</label>
+                <select id="dataset-canmount">
+                    <option value="on" selected>On</option>
+                    <option value="off">Off</option>
+                    <option value="noauto">NoAuto</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="dataset-readonly">Read Only:</label>
+                <select id="dataset-readonly">
+                    <option value="off" selected>Off</option>
+                    <option value="on">On</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="dataset-special-small-blocks">Special Small Blocks:</label>
+                <select id="dataset-special-small-blocks">
+                    <option value="">Off (disabled)</option>
+                    <option value="4K">4K</option>
+                    <option value="64K">64K</option>
+                    <option value="128K">128K</option>
+                </select>
+                <small class="form-hint">Files/blocks up to this size are stored on the special vdev (if present).</small>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="hideCreateDatasetModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Dataset</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Edit Dataset Modal -->
+<div id="edit-dataset-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Edit ZFS Dataset</h3>
+            <button class="close" onclick="hideEditDatasetModal()">&times;</button>
+        </div>
+        <form id="edit-dataset-form">
+            <div class="form-group">
+                <label>Dataset Name:</label>
+                <input type="text" id="edit-dataset-name" disabled>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-compression">Compression:</label>
+                <select id="edit-dataset-compression">
+                    <option value="zstd">zstd (recommended)</option>
+                    <option value="lz4">lz4</option>
+                    <option value="off">Off</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-atime">Atime:</label>
+                <select id="edit-dataset-atime">
+                    <option value="none">None</option>
+                    <option value="partial">Partial</option>
+                    <option value="all">All</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-sync">Sync:</label>
+                <select id="edit-dataset-sync">
+                    <option value="standard">Standard</option>
+                    <option value="always">Always (safer)</option>
+                    <option value="disabled">Disabled (fastest)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-quota">Quota:</label>
+                <input type="text" id="edit-dataset-quota" placeholder="e.g., 500G, 1T (blank to clear)">
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-recordsize">Record Size:</label>
+                <select id="edit-dataset-recordsize">
+                    <option value="4K">4K (databases)</option>
+                    <option value="8K">8K</option>
+                    <option value="16K">16K</option>
+                    <option value="32K">32K</option>
+                    <option value="64K">64K</option>
+                    <option value="128K">128K (default)</option>
+                    <option value="1M">1M (media)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-canmount">CanMount:</label>
+                <select id="edit-dataset-canmount">
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                    <option value="noauto">NoAuto</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-readonly">Read Only:</label>
+                <select id="edit-dataset-readonly">
+                    <option value="off">Off</option>
+                    <option value="on">On</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="edit-dataset-special-small-blocks">Special Small Blocks:</label>
+                <select id="edit-dataset-special-small-blocks">
+                    <option value="">Off (disabled)</option>
+                    <option value="4K">4K</option>
+                    <option value="64K">64K</option>
+                    <option value="128K">128K</option>
+                </select>
+                <small class="form-hint">Files/blocks up to this size are stored on the special vdev (if present).</small>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="hideEditDatasetModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let datasets = [];
+let pools = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadDatasetsPage();
+    document.getElementById('create-dataset-form').addEventListener('submit', handleCreateDataset);
+    document.getElementById('edit-dataset-form').addEventListener('submit', handleSaveDatasetChanges);
+});
+
+async function loadDatasetsPage() {
+    await Promise.all([
+        loadDatasets(),
+        loadPools()
+    ]);
+    updateDatasetSelects();
+}
+
+async function loadDatasets() {
+    try {
+        datasets = await api.getDatasets();
+        renderDatasets();
+    } catch (error) {
+        console.error('Failed to load datasets:', error);
+        showError('datasets-list', 'Failed to load datasets');
+    }
+}
+
+async function loadPools() {
+    try {
+        pools = await api.getPools();
+        updatePoolSelect();
+    } catch (error) {
+        console.error('Failed to load pools:', error);
+    }
+}
+
+function renderDatasets() {
+    const container = document.getElementById('datasets-list');
+    
+    if (datasets.length === 0) {
+        container.innerHTML = '<p class="empty-state">No datasets configured. <a href="javascript:void(0)" onclick="showCreateDatasetModal()">Create one</a></p>';
+        return;
+    }
+    
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Pool</th>
+                    <th>Compression</th>
+                    <th>Atime</th>
+                    <th>Sync</th>
+                    <th>Record Size</th>
+                    <th>CanMount</th>
+                    <th>Read Only</th>
+                    <th>Special Blocks</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${datasets.map(dataset => `
+                    <tr>
+                        <td>${dataset.name}</td>
+                        <td>${dataset.name.split('/')[0]}</td>
+                        <td>${dataset.compression}</td>
+                        <td>${dataset.atime || '-'}</td>
+                        <td>${dataset.sync_mode}</td>
+                        <td>${dataset.recordsize}</td>
+                        <td>${dataset.canmount || '-'}</td>
+                        <td>${dataset.readonly || '-'}</td>
+                        <td>${dataset.special_small_blocks || '0'}</td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="editDataset('${dataset.name}')">
+                                <i class="fas fa-edit"></i>
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="destroyDataset('${dataset.name}')">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function updatePoolSelect() {
+    const select = document.getElementById('dataset-pool');
+    if (select) {
+        select.innerHTML = '<option value="">-- Select Pool --</option>' +
+            pools.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+    }
+}
+
+function updateDatasetSelects() {
+    const selects = ['snapshot-dataset-select', 'view-snapshot-dataset-select'];
+    selects.forEach(selectId => {
+        const select = document.getElementById(selectId);
+        if (select) {
+            select.innerHTML = '<option value="">-- Select Dataset --</option>' +
+                datasets.map(d => `<option value="${d.name}">${d.name}</option>`).join('');
+        }
+    });
+}
+
+function showCreateDatasetModal() {
+    document.getElementById('create-dataset-modal').style.display = 'flex';
+}
+
+function hideCreateDatasetModal() {
+    document.getElementById('create-dataset-modal').style.display = 'none';
+}
+
+async function handleCreateDataset(e) {
+    e.preventDefault();
+    
+    const poolName = document.getElementById('dataset-pool').value;
+    const name = document.getElementById('dataset-name').value;
+    const compression = document.getElementById('dataset-compression').value;
+    const atime = document.getElementById('dataset-atime').value;
+    const syncMode = document.getElementById('dataset-sync').value;
+    const quota = document.getElementById('dataset-quota').value || null;
+    const recordsize = document.getElementById('dataset-recordsize').value;
+    const canmount = document.getElementById('dataset-canmount').value;
+    const readonly = document.getElementById('dataset-readonly').value;
+    const specialSmallBlocks = document.getElementById('dataset-special-small-blocks').value || null;
+    
+    if (!confirm(`Create dataset "${poolName}/${name}"?`)) {
+        return;
+    }
+    
+    try {
+        await api.createDataset({
+            name,
+            pool_name: poolName,
+            compression,
+            atime,
+            sync_mode: syncMode,
+            quota,
+            recordsize,
+            canmount,
+            readonly,
+            special_small_blocks: specialSmallBlocks
+        });
+        hideCreateDatasetModal();
+        await loadDatasets();
+        showAlert('Dataset created successfully', 'success');
+    } catch (error) {
+        showAlert('Failed to create dataset: ' + error.message, 'error');
+    }
+}
+
+async function createSnapshot() {
+    const datasetName = document.getElementById('snapshot-dataset-select').value;
+    const snapshotName = document.getElementById('snapshot-name').value;
+    
+    if (!datasetName || !snapshotName) {
+        showAlert('Please select a dataset and enter a snapshot name', 'error');
+        return;
+    }
+    
+    try {
+        await api.createSnapshot({
+            dataset_name: datasetName,
+            snapshot_name: snapshotName
+        });
+        showAlert('Snapshot created successfully', 'success');
+    } catch (error) {
+        showAlert('Failed to create snapshot: ' + error.message, 'error');
+    }
+}
+
+async function viewSnapshots() {
+    const datasetName = document.getElementById('view-snapshot-dataset-select').value || null;
+    
+    try {
+        const snapshots = await api.getSnapshots(datasetName);
+        if (snapshots.length === 0) {
+            showAlert('No snapshots found', 'success');
+        } else {
+            alert(`Found ${snapshots.length} snapshot(s)`);
+        }
+    } catch (error) {
+        showAlert('Failed to load snapshots: ' + error.message, 'error');
+    }
+}
+
+let editDatasetName = null;
+
+function editDataset(name) {
+    const dataset = datasets.find(d => d.name === name);
+    if (!dataset) {
+        showAlert('Dataset not found', 'error');
+        return;
+    }
+
+    editDatasetName = dataset.name;
+    document.getElementById('edit-dataset-name').value = dataset.name;
+    document.getElementById('edit-dataset-compression').value = dataset.compression;
+    document.getElementById('edit-dataset-atime').value = dataset.atime || 'partial';
+    document.getElementById('edit-dataset-sync').value = dataset.sync_mode;
+    document.getElementById('edit-dataset-quota').value = dataset.quota || '';
+    document.getElementById('edit-dataset-recordsize').value = dataset.recordsize;
+    document.getElementById('edit-dataset-canmount').value = dataset.canmount || 'on';
+    document.getElementById('edit-dataset-readonly').value = dataset.readonly || 'off';
+    document.getElementById('edit-dataset-special-small-blocks').value =
+        (dataset.special_small_blocks && dataset.special_small_blocks !== '0') ? dataset.special_small_blocks : '';
+    document.getElementById('edit-dataset-modal').style.display = 'flex';
+}
+
+function hideEditDatasetModal() {
+    document.getElementById('edit-dataset-modal').style.display = 'none';
+}
+
+async function handleSaveDatasetChanges(e) {
+    e.preventDefault();
+
+    if (editDatasetName == null) {
+        hideEditDatasetModal();
+        return;
+    }
+
+    const data = {
+        compression: document.getElementById('edit-dataset-compression').value,
+        recordsize: document.getElementById('edit-dataset-recordsize').value,
+        sync_mode: document.getElementById('edit-dataset-sync').value,
+        quota: document.getElementById('edit-dataset-quota').value || null,
+        special_small_blocks: document.getElementById('edit-dataset-special-small-blocks').value || null,
+        atime: document.getElementById('edit-dataset-atime').value,
+        canmount: document.getElementById('edit-dataset-canmount').value,
+        readonly: document.getElementById('edit-dataset-readonly').value
+    };
+
+    try {
+        await api.updateDataset(editDatasetName, data);
+        hideEditDatasetModal();
+        editDatasetName = null;
+        await loadDatasets();
+        showAlert('Dataset updated successfully', 'success');
+    } catch (error) {
+        showAlert('Failed to update dataset: ' + error.message, 'error');
+    }
+}
+
+async function destroyDataset(name) {
+    if (!confirm(`DESTROY dataset "${name}"?\n\nThis will destroy all data and cannot be undone!\n\nNote: the dataset must be unmounted with no active NFS clients before it can be destroyed.`)) {
+        return;
+    }
+    
+    // Ask about recursive destroy (children + snapshots)
+    let recursive = false;
+    if (!confirm('Include ALL child datasets and snapshots?\n\nClick OK for recursive destroy, Cancel to destroy only if no children exist.')) {
+        // Non-recursive — try first, suggest recursive on failure
+    } else {
+        recursive = true;
+    }
+    
+    try {
+        await api.destroyDataset(name, recursive);
+        showAlert('Dataset destroyed', 'success');
+        await loadDatasets();
+    } catch (error) {
+        const msg = error.message || '';
+        if (msg.includes('mounted') || msg.includes('NFS client')) {
+            showAlert(`Cannot destroy "${name}": ${msg}\n\nUnmount the dataset and disconnect NFS clients first.`, 'error');
+        } else if (!recursive && (msg.includes('has children') || msg.includes('snapshot'))) {
+            // Suggest recursive destroy
+            if (confirm(`Dataset "${name}" has children/snapshots.\n\nDestroy recursively?`)) {
+                try {
+                    await api.destroyDataset(name, true);
+                    showAlert('Dataset destroyed', 'success');
+                    await loadDatasets();
+                } catch (e2) {
+                    showAlert('Failed: ' + e2.message, 'error');
+                }
+            }
+        } else {
+            showAlert('Failed to destroy dataset: ' + msg, 'error');
+        }
+    }
+}
+</script>
+{% endblock %}

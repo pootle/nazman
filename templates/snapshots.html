@@ -1,0 +1,291 @@
+{% extends "base.html" %}
+
+{% block title %}Snapshots - NAZMan{% endblock %}
+{% block page_title %}Snapshot Management{% endblock %}
+
+{% block content %}
+<div class="snapshots-page">
+    <!-- Snapshots List -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-camera"></i> Snapshots</h2>
+            <button class="btn btn-primary" onclick="showCreateSnapshotModal()">
+                <i class="fas fa-plus"></i> Create Snapshot
+            </button>
+        </div>
+        <div class="card-body">
+            <div class="filter-bar">
+                <select id="dataset-filter" onchange="filterSnapshots()">
+                    <option value="">All Datasets</option>
+                </select>
+                <button class="btn btn-secondary" onclick="refreshSnapshots()">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+            </div>
+            <div id="snapshots-list" class="snapshots-table">
+                <p class="loading">Loading snapshots...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Snapshot Operations -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-wrench"></i> Snapshot Operations</h2>
+        </div>
+        <div class="card-body">
+            <div class="operations-grid">
+                <div class="operation-card">
+                    <h3><i class="fas fa-trash"></i> Destroy Snapshot</h3>
+                    <p>Permanently delete a snapshot.</p>
+                    <select id="destroy-snapshot-select" class="form-control">
+                        <option value="">-- Select Snapshot --</option>
+                    </select>
+                    <button class="btn btn-danger" onclick="destroySelectedSnapshot()">
+                        Destroy Snapshot
+                    </button>
+                </div>
+                <div class="operation-card">
+                    <h3><i class="fas fa-list"></i> Snapshot Info</h3>
+                    <p>View detailed information about a snapshot.</p>
+                    <select id="info-snapshot-select" class="form-control">
+                        <option value="">-- Select Snapshot --</option>
+                    </select>
+                    <button class="btn btn-secondary" onclick="viewSnapshotInfo()">
+                        View Info
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create Snapshot Modal -->
+<div id="create-snapshot-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Create Snapshot</h3>
+            <button class="close" onclick="hideCreateSnapshotModal()">&times;</button>
+        </div>
+        <form id="create-snapshot-form">
+            <div class="form-group">
+                <label for="snapshot-dataset">Dataset:</label>
+                <select id="snapshot-dataset" required>
+                    <option value="">-- Select Dataset --</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="snapshot-name-input">Snapshot Name:</label>
+                <input type="text" id="snapshot-name-input" required placeholder="e.g., backup-2024-01-15">
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="hideCreateSnapshotModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create Snapshot</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let snapshots = [];
+let datasets = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadSnapshotsPage();
+    document.getElementById('create-snapshot-form').addEventListener('submit', handleCreateSnapshot);
+});
+
+async function loadSnapshotsPage() {
+    await Promise.all([
+        loadSnapshots(),
+        loadDatasets()
+    ]);
+    updateSnapshotSelects();
+}
+
+async function loadSnapshots() {
+    try {
+        snapshots = await api.getSnapshots();
+        renderSnapshots();
+    } catch (error) {
+        console.error('Failed to load snapshots:', error);
+        showError('snapshots-list', 'Failed to load snapshots');
+    }
+}
+
+async function loadDatasets() {
+    try {
+        datasets = await api.getDatasets();
+        updateDatasetFilter();
+    } catch (error) {
+        console.error('Failed to load datasets:', error);
+    }
+}
+
+function renderSnapshots() {
+    const container = document.getElementById('snapshots-list');
+    
+    if (snapshots.length === 0) {
+        container.innerHTML = createEmptyState('No snapshots found.');
+        return;
+    }
+    
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Dataset</th>
+                    <th>Snapshot</th>
+                    <th>Used</th>
+                    <th>Referenced</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${snapshots.map(snap => `
+                    <tr>
+                        <td>${snap.dataset_name}</td>
+                        <td>${snap.snapshot_name}</td>
+                        <td>${snap.used || 'N/A'}</td>
+                        <td>${snap.referenced || 'N/A'}</td>
+                        <td>
+                            <button class="btn btn-sm btn-secondary" onclick="viewSnapshotInfo('${snap.name}')">
+                                <i class="fas fa-info-circle"></i>
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="destroySnapshot('${snap.name}')">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function updateDatasetFilter() {
+    const select = document.getElementById('dataset-filter');
+    if (select) {
+        select.innerHTML = '<option value="">All Datasets</option>' +
+            datasets.map(d => `<option value="${d.name}">${d.name}</option>`).join('');
+    }
+    
+    // Also update create modal
+    const createSelect = document.getElementById('snapshot-dataset');
+    if (createSelect) {
+        createSelect.innerHTML = '<option value="">-- Select Dataset --</option>' +
+            datasets.map(d => `<option value="${d.name}">${d.name}</option>`).join('');
+    }
+}
+
+function updateSnapshotSelects() {
+    const selectOptions = snapshots.map(snap => {
+        return `<option value="${snap.name}">${snap.name}</option>`;
+    }).join('');
+    
+    ['destroy-snapshot-select', 'info-snapshot-select'].forEach(selectId => {
+        const select = document.getElementById(selectId);
+        if (select) {
+            select.innerHTML = '<option value="">-- Select Snapshot --</option>' + selectOptions;
+        }
+    });
+}
+
+function filterSnapshots() {
+    const datasetName = document.getElementById('dataset-filter').value;
+    
+    if (!datasetName) {
+        renderSnapshots();
+        return;
+    }
+    
+    const filtered = snapshots.filter(snap => snap.dataset_name === datasetName);
+    
+    // Re-render with filtered snapshots
+    const container = document.getElementById('snapshots-list');
+    if (filtered.length === 0) {
+        container.innerHTML = createEmptyState('No snapshots for selected dataset.');
+        return;
+    }
+    
+    // Reuse render function but with filtered data
+    const originalSnapshots = snapshots;
+    snapshots = filtered;
+    renderSnapshots();
+    snapshots = originalSnapshots;
+}
+
+function showCreateSnapshotModal() {
+    document.getElementById('create-snapshot-modal').style.display = 'flex';
+}
+
+function hideCreateSnapshotModal() {
+    document.getElementById('create-snapshot-modal').style.display = 'none';
+}
+
+async function handleCreateSnapshot(e) {
+    e.preventDefault();
+    
+    const datasetName = document.getElementById('snapshot-dataset').value;
+    const snapshotName = document.getElementById('snapshot-name-input').value;
+    
+    if (!confirm(`Create snapshot "${datasetName}@${snapshotName}"?`)) {
+        return;
+    }
+    
+    try {
+        await api.createSnapshot({
+            dataset_name: datasetName,
+            snapshot_name: snapshotName
+        });
+        hideCreateSnapshotModal();
+        await loadSnapshots();
+        showAlert('Snapshot created successfully', 'success');
+    } catch (error) {
+        showAlert('Failed to create snapshot: ' + error.message, 'error');
+    }
+}
+
+async function destroySnapshot(fullName) {
+    if (!confirm(`DESTROY snapshot "${fullName}"?\n\nThis will destroy all data in this snapshot and cannot be undone!`)) {
+        return;
+    }
+    
+    try {
+        await api.destroySnapshot(fullName);
+        await loadSnapshots();
+        showAlert('Snapshot destroyed', 'success');
+    } catch (error) {
+        showAlert('Failed to destroy snapshot: ' + error.message, 'error');
+    }
+}
+
+function destroySelectedSnapshot() {
+    const fullName = document.getElementById('destroy-snapshot-select').value;
+    if (!fullName) {
+        showAlert('Please select a snapshot', 'error');
+        return;
+    }
+    destroySnapshot(fullName);
+}
+
+function viewSnapshotInfo(fullName = null) {
+    if (!fullName) {
+        fullName = document.getElementById('info-snapshot-select').value;
+    }
+    
+    if (!fullName) {
+        showAlert('Please select a snapshot', 'error');
+        return;
+    }
+    
+    alert(`Snapshot: ${fullName}\n\nDetailed information coming soon.`);
+}
+
+function refreshSnapshots() {
+    loadSnapshots();
+}
+</script>
+{% endblock %}

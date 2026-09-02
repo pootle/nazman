@@ -1,0 +1,608 @@
+{% extends "base.html" %}
+
+{% block title %}Backup - NAZMan{% endblock %}
+{% block page_title %}Configuration Backup{% endblock %}
+
+{% block content %}
+<div class="backup-page">
+    <!-- Backup Status -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-save"></i> Backup Status</h2>
+            <button class="btn btn-primary" onclick="createBackup()">
+                <i class="fas fa-save"></i> Backup Now
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="backup-status" class="status-info">
+                <p class="loading">Loading backup status...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Backup History -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-history"></i> Backup History</h2>
+            <button class="btn btn-secondary" onclick="refreshBackupHistory()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="backup-history" class="history-table">
+                <p class="loading">Loading backup history...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Restore -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-undo"></i> Restore Configuration</h2>
+        </div>
+        <div class="card-body">
+            <div class="restore-section">
+                <p>Restore configuration from a previous backup.</p>
+                <div class="form-group">
+                    <label for="restore-commit">Select Backup:</label>
+                    <select id="restore-commit" class="form-control">
+                        <option value="">-- Select Backup --</option>
+                    </select>
+                </div>
+                <button class="btn btn-danger" onclick="restoreBackup()">
+                    <i class="fas fa-undo"></i> Restore
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <hr style="margin:24px 0;border:none;border-top:2px solid var(--border);">
+
+    <h2 style="margin-bottom:4px;"><i class="fas fa-database"></i> ZFS Data Backup</h2>
+    <p class="text-muted">Back up selected ZFS datasets to a declared external backup disk. Full and incremental (snapshot-stream to gzip files).</p>
+
+    <!-- Backup Disks -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-hdd"></i> Backup Disks</h2>
+            <button class="btn btn-secondary" onclick="loadBackupDisks()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="backup-disks" class="backup-disks"><p class="loading">Loading backup disks...</p></div>
+            <button class="btn btn-primary" style="margin-top:12px;" onclick="openDeclareDisk()">
+                <i class="fas fa-plus"></i> Declare New Backup Disk
+            </button>
+        </div>
+    </div>
+
+    <!-- Datasets / Scheduling / On-demand -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-folder-open"></i> Datasets to Back Up</h2>
+        </div>
+        <div class="card-body">
+            <div id="dataset-backup" class="dataset-backup"><p class="loading">Loading datasets...</p></div>
+        </div>
+    </div>
+
+    <!-- Runs / History / Restore -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-history"></i> Backup Runs</h2>
+            <button class="btn btn-secondary" onclick="loadBackupRuns()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="backup-runs" class="history-table"><p class="loading">Loading backup runs...</p></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-upload"></i> Restore from Backup Disk</h2>
+            <button class="btn btn-secondary" onclick="loadDiskStreams()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <p class="text-muted">Restore a dataset on this server (or a fresh server) from a stream file already
+                stored on a mounted backup disk, regardless of stored run records.</p>
+            <div class="row mb-3">
+                <div class="col-md-4">
+                    <select id="restore-disk" class="form-select" onchange="loadDiskStreams()">
+                        <option value="">Select backup disk...</option>
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <select id="restore-stream" class="form-select">
+                        <option value="">Select stream file...</option>
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <input id="restore-name" class="form-control" placeholder="Dataset name to restore, e.g. tank/data">
+                </div>
+            </div>
+            <button class="btn btn-warning" onclick="restoreFromFile()">Restore</button>
+            <div id="restore-note" class="mt-2"></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let backupHistory = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadBackupPage();
+});
+
+async function loadBackupPage() {
+    await Promise.all([
+        loadBackupStatus(),
+        loadBackupHistory(),
+        refreshRestoreDisks()
+    ]);
+}
+
+async function refreshRestoreDisks() {
+    try {
+        const disks = await api.listBackupDisks();
+        const sel = document.getElementById('restore-disk');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">Select backup disk...</option>';
+        disks.filter(d => d.status === 'mounted').forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d.id;
+            opt.textContent = d.mount_point || ('Disk ' + d.id);
+            const kept = String(d.id) === current;
+            opt.selected = kept;
+            sel.appendChild(opt);
+        });
+        if (current) loadDiskStreams();
+    } catch (e) { /* disk dropdown optional */ }
+}
+
+async function loadDiskStreams() {
+    const diskId = document.getElementById('restore-disk').value;
+    const streamSel = document.getElementById('restore-stream');
+    streamSel.innerHTML = '<option value="">Select stream file...</option>';
+    if (!diskId) return;
+    try {
+        const streams = await api.listDiskStreams(diskId);
+        streams.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.path;
+            opt.textContent = s.dataset + ' | ' + s.path.split('/').pop() + ' (' + formatBytes(s.size_bytes) + ')';
+            streamSel.appendChild(opt);
+        });
+    } catch (e) {
+        showAlert('Failed to list streams: ' + e.message, 'error');
+    }
+}
+
+async function restoreFromFile() {
+    const diskId = document.getElementById('restore-disk').value;
+    const streamFile = document.getElementById('restore-stream').value;
+    const name = document.getElementById('restore-name').value.trim();
+    if (!diskId || !streamFile || !name) { showAlert('Select disk, stream, and enter a dataset name', 'error'); return; }
+    if (!confirm('Restore dataset "' + name + '" from ' + streamFile.split('/').pop() + '? This will overwrite any existing dataset.')) return;
+    try {
+        const res = await api.restoreFromFile(parseInt(diskId, 10), streamFile, name);
+        document.getElementById('restore-note').innerHTML =
+            '<p class="text-success">Restored: ' + res.dataset + ' from ' + res.source + '</p>';
+        showAlert('Restore started', 'success');
+    } catch (e) {
+        document.getElementById('restore-note').innerHTML =
+            '<p class="text-danger">Restore failed: ' + e.message + '</p>';
+        showAlert('Restore failed: ' + e.message, 'error');
+    }
+}
+
+async function loadBackupStatus() {
+    try {
+        const status = await api.getBackupStatus();
+        renderBackupStatus(status);
+    } catch (error) {
+        console.error('Failed to load backup status:', error);
+        showError('backup-status', 'Failed to load backup status');
+    }
+}
+
+async function loadBackupHistory() {
+    try {
+        backupHistory = await api.getBackupHistory();
+        renderBackupHistory();
+        updateRestoreSelect();
+    } catch (error) {
+        console.error('Failed to load backup history:', error);
+        showError('backup-history', 'Failed to load backup history');
+    }
+}
+
+function renderBackupStatus(status) {
+    const container = document.getElementById('backup-status');
+    
+    container.innerHTML = `
+        <div class="status-grid">
+            <div class="status-item">
+                <label>Repository:</label>
+                <span class="${status.repo_exists ? 'status-ok' : 'status-faulted'}">
+                    ${status.repo_exists ? 'Initialized' : 'Not Initialized'}
+                </span>
+            </div>
+            <div class="status-item">
+                <label>Path:</label>
+                <span>${status.repo_path}</span>
+            </div>
+            <div class="status-item">
+                <label>Last Backup:</label>
+                <span>${status.last_commit ? status.last_commit.date : 'Never'}</span>
+            </div>
+            <div class="status-item">
+                <label>Last Message:</label>
+                <span>${status.last_commit ? status.last_commit.message : 'N/A'}</span>
+            </div>
+            <div class="status-item">
+                <label>Uncommitted Changes:</label>
+                <span class="${status.has_uncommitted_changes ? 'status-degraded' : 'status-online'}">
+                    ${status.has_uncommitted_changes ? 'Yes' : 'No'}
+                </span>
+            </div>
+        </div>
+    `;
+}
+
+function renderBackupHistory() {
+    const container = document.getElementById('backup-history');
+    
+    if (backupHistory.length === 0) {
+        container.innerHTML = createEmptyState('No backup history.');
+        return;
+    }
+    
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Commit</th>
+                    <th>Message</th>
+                    <th>Files Changed</th>
+                    <th>Date</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${backupHistory.map(backup => `
+                    <tr>
+                        <td><code>${backup.commit_hash.substring(0, 8)}</code></td>
+                        <td>${backup.commit_message}</td>
+                        <td>${backup.files_changed}</td>
+                        <td>${formatDate(backup.created_at)}</td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function updateRestoreSelect() {
+    const select = document.getElementById('restore-commit');
+    if (select) {
+        select.innerHTML = '<option value="">-- Select Backup --</option>' +
+            backupHistory.map(b => `
+                <option value="${b.commit_hash}">
+                    ${b.commit_hash.substring(0, 8)} - ${b.commit_message}
+                </option>
+            `).join('');
+    }
+}
+
+async function createBackup() {
+    const message = prompt('Enter backup message (optional):');
+    
+    try {
+        await api.createBackup(message);
+        showAlert('Backup created successfully', 'success');
+        await loadBackupPage();
+    } catch (error) {
+        showAlert('Failed to create backup: ' + error.message, 'error');
+    }
+}
+
+async function restoreBackup() {
+    const commitHash = document.getElementById('restore-commit').value;
+    
+    if (!commitHash) {
+        showAlert('Please select a backup to restore', 'error');
+        return;
+    }
+    
+    if (!confirm('Restore configuration from this backup?\n\nThis will overwrite current configuration!')) {
+        return;
+    }
+    
+    if (!confirm('Are you REALLY sure? This cannot be undone!')) {
+        return;
+    }
+    
+    try {
+        await api.restoreBackup(commitHash);
+        showAlert('Configuration restored successfully', 'success');
+        await loadBackupPage();
+    } catch (error) {
+        showAlert('Failed to restore backup: ' + error.message, 'error');
+    }
+}
+
+function refreshBackupHistory() {
+    loadBackupHistory();
+}
+
+// ── ZFS data backup ──────────────────────────────────────────────────
+let backupDisks = [];
+let backupDatasets = [];
+let diskCandidates = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadZfsBackup();
+});
+
+async function loadZfsBackup() {
+    await Promise.all([
+        loadBackupDisks(),
+        loadBackupDatasets(),
+        loadBackupRuns()
+    ]);
+}
+
+function formatBytes(n) {
+    if (!n && n !== 0) return '-';
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(1) + ' ' + units[i];
+}
+
+async function loadBackupDisks() {
+    try {
+        backupDisks = await api.listBackupDisks();
+        diskCandidates = await api.backupDiskCandidates();
+        renderBackupDisks();
+    } catch (e) {
+        showError('backup-disks', 'Failed to load backup disks');
+    }
+}
+
+function renderBackupDisks() {
+    const c = document.getElementById('backup-disks');
+    if (backupDisks.length === 0) {
+        c.innerHTML = createEmptyState('No backup disks declared yet.');
+        return;
+    }
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr>
+                <th>Device</th><th>FS</th><th>Capacity</th><th>Free</th>
+                <th>Status</th><th>Actions</th>
+            </tr></thead>
+            <tbody>
+                ${backupDisks.map(d => {
+                    const pct = d.total_bytes ? Math.round((d.free_bytes / d.total_bytes) * 100) : 0;
+                    return `<tr>
+                        <td><code>${d.device_path.split('/').pop()}</code></td>
+                        <td>${d.fs_type}</td>
+                        <td>${formatBytes(d.total_bytes)}</td>
+                        <td>${formatBytes(d.free_bytes)} (${pct}%)</td>
+                        <td><span class="status-${d.status === 'mounted' ? 'online' : 'degraded'}">${d.status}</span></td>
+                        <td>
+                            <button class="btn btn-secondary btn-sm" onclick="toggleMount(${d.id})">${d.status === 'mounted' ? 'Unmount' : 'Mount'}</button>
+                            <button class="btn btn-secondary btn-sm" onclick="scanDisk(${d.id})">Scan</button>
+                            <button class="btn btn-danger btn-sm" onclick="removeBackupDisk(${d.id})">Remove</button>
+                        </td>
+                    </tr>`;
+                }).join('')}
+            </tbody>
+        </table>`;
+}
+
+async function toggleMount(id) {
+    const d = backupDisks.find(x => x.id === id);
+    try {
+        if (d && d.status === 'mounted') await api.unmountBackupDisk(id);
+        else await api.mountBackupDisk(id);
+        await loadBackupDisks();
+    } catch (e) {
+        showAlert('Failed to toggle mount: ' + e.message, 'error');
+    }
+}
+
+async function scanDisk(id) {
+    try {
+        await api.scanBackupDisk(id);
+        await loadBackupDisks();
+    } catch (e) {
+        showAlert('Scan failed: ' + e.message, 'error');
+    }
+}
+
+async function removeBackupDisk(id) {
+    if (!confirm('Deregister this backup disk? (Note: files on disk are preserved, disk keeps its data)')) return;
+    try {
+        await api.deleteBackupDisk(id);
+        await loadZfsBackup();
+    } catch (e) {
+        showAlert('Failed: ' + e.message, 'error');
+    }
+}
+
+function openDeclareDisk() {
+    if (diskCandidates.length === 0) {
+        showAlert('No disks available to declare as a backup disk (all in use or OS disks).', 'error');
+        return;
+    }
+    const sel = diskCandidates.map(d =>
+        `<option value="${d.id}">${d.device_name} (${d.model || d.serial || ''}, ${formatBytes(d.size_bytes)})</option>`
+    ).join('');
+    const confirmed = confirm(
+        'Declare a disk as ZFS backup target?\n\nIt will be WIPED and formatted as ext4.\n\nChoose disk:'
+        + '\n\n' + diskCandidates.map(d => ` - ${d.device_name} (${d.model || d.serial || ''}, ${formatBytes(d.size_bytes)})`).join('\n')
+    );
+    if (!confirmed) return;
+    const idStr = prompt('Enter the disk ID to declare (from the list above):');
+    const id = parseInt(idStr, 10);
+    if (!id || !diskCandidates.find(d => d.id === id)) {
+        showAlert('Invalid disk id', 'error');
+        return;
+    }
+    if (!confirm('REALLY wipe and format this disk as the backup target?')) return;
+    declareDisk(id);
+}
+
+async function declareDisk(id) {
+    try {
+        await api.declareBackupDisk(id, true);
+        showAlert('Backup disk declared and formatted', 'success');
+        await loadZfsBackup();
+    } catch (e) {
+        showAlert('Failed to declare backup disk: ' + e.message, 'error');
+    }
+}
+
+async function loadBackupDatasets() {
+    try {
+        backupDatasets = await api.listBackupableDatasets();
+        renderBackupDatasets();
+    } catch (e) {
+        showError('dataset-backup', 'Failed to load datasets');
+    }
+}
+
+function renderBackupDatasets() {
+    const c = document.getElementById('dataset-backup');
+    if (backupDatasets.length === 0) {
+        c.innerHTML = createEmptyState('No datasets found.');
+        return;
+    }
+    const diskOpts = backupDisks.map(d =>
+        `<option value="${d.id}">${d.device_path.split('/').pop()}</option>`).join('') || '<option value="">No backup disks</option>';
+
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr>
+                <th>Dataset</th><th>Backup Disk</th><th>Full Cron</th><th>Incr Cron</th>
+                <th>Changed since full</th><th>Actions</th>
+            </tr></thead>
+            <tbody>
+                ${backupDatasets.map(ds => `
+                    <tr>
+                        <td><code>${ds.name}</code></td>
+                        <td>
+                            <select id="bd-${ds.name}" class="form-control">${diskOpts}</select>
+                        </td>
+                        <td><input id="fc-${ds.name}" class="form-control" placeholder="e.g. 0 2 * * 0" value="${ds.full_cron || ''}"></td>
+                        <td><input id="ic-${ds.name}" class="form-control" placeholder="e.g. 0 3 * * *" value="${ds.incremental_cron || ''}"></td>
+                        <td>${formatBytes(ds.changed_since_full)} <small class="text-muted">(${ds.full_runs || 0} fulls; ${ds.last_type || '-'}/${ds.last_status || '-'})</small></td>
+                        <td style="white-space:nowrap;">
+                            <button class="btn btn-primary btn-sm" onclick="runDataset('${ds.name}', 'full')">Full</button>
+                            <button class="btn btn-secondary btn-sm" onclick="runDataset('${ds.name}', 'incremental')">Incr</button>
+                            <button class="btn btn-secondary btn-sm" onclick="saveSchedule('${ds.name}')">Save Sched</button>
+                            <button class="btn btn-danger btn-sm" onclick="removeSchedule('${ds.name}')">Remove Sched</button>
+                        </td>
+                    </tr>`
+                ).join('')}
+            </tbody>
+        </table>`;
+}
+
+async function runDataset(name, type) {
+    const bd = document.getElementById('bd-' + name).value;
+    if (!bd) { showAlert('Select a backup disk first', 'error'); return; }
+    try {
+        showAlert(`Starting ${type} backup...`, 'info');
+        await api.runBackup(name, parseInt(bd, 10), type);
+        showAlert(`${type} backup complete`, 'success');
+        await loadZfsBackup();
+    } catch (e) {
+        showAlert(`Backup failed: ${e.message}`, 'error');
+        await loadBackupRuns();
+    }
+}
+
+async function saveSchedule(name) {
+    const bd = document.getElementById('bd-' + name).value;
+    const fc = document.getElementById('fc-' + name).value;
+    const ic = document.getElementById('ic-' + name).value;
+    if (!bd) { showAlert('Select a backup disk', 'error'); return; }
+    try {
+        await api.upsertBackupSchedule({
+            dataset_name: name, backup_disk_id: parseInt(bd, 10),
+            full_cron: fc || null, incremental_cron: ic || null, enabled: true
+        });
+        showAlert('Schedule saved', 'success');
+    } catch (e) {
+        showAlert('Schedule save failed: ' + e.message, 'error');
+    }
+}
+
+async function removeSchedule(name) {
+    if (!confirm('Remove the backup schedule for this dataset?')) return;
+    try {
+        await api.deleteBackupSchedule(name);
+        showAlert('Schedule removed', 'success');
+        await loadBackupDatasets();
+    } catch (e) {
+        showAlert('Schedule remove failed: ' + e.message, 'error');
+    }
+}
+
+async function loadBackupRuns() {
+    try {
+        const runs = await api.listBackupRuns();
+        renderBackupRuns(runs);
+    } catch (e) {
+        showError('backup-runs', 'Failed to load backup runs');
+    }
+}
+
+function renderBackupRuns(runs) {
+    const c = document.getElementById('backup-runs');
+    if (!runs || runs.length === 0) {
+        c.innerHTML = createEmptyState('No backup runs yet.');
+        return;
+    }
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr>
+                <th>Dataset</th><th>Type</th><th>Status</th><th>Stream Size</th>
+                <th>Changed</th><th>Snapshot</th><th>Date</th><th>Restore</th>
+            </tr></thead>
+            <tbody>
+                ${runs.map(r => `
+                    <tr>
+                        <td><code>${r.dataset_name}</code></td>
+                        <td><span class="badge">${r.backup_type}</span></td>
+                        <td><span class="status-${r.status === 'success' ? 'online' : 'faulted'}">${r.status}</span></td>
+                        <td>${formatBytes(r.size_bytes)}</td>
+                        <td>${formatBytes(r.changed_bytes)}</td>
+                        <td><code title="${r.stream_file}">${r.snapshot}</code></td>
+                        <td>${formatDate(r.completed_at || r.started_at)}</td>
+                        <td><button class="btn btn-danger btn-sm" onclick="restoreRun(${r.id}, '${r.dataset_name}')">Restore</button></td>
+                    </tr>`
+                ).join('')}
+            </tbody>
+        </table>`;
+}
+
+function restoreRun(runId, dsName) {
+    if (!confirm(`Restore dataset "${dsName}" from this backup run?\n\nThis overwrites the live dataset with the backup stream.`)) return;
+    if (!confirm('Are you REALLY sure? Live data will be replaced.')) return;
+    api.restoreBackupRun(runId, dsName).then(() => {
+        showAlert('Restore job submitted', 'success');
+    }).catch(e => showAlert('Restore failed: ' + e.message, 'error'));
+}
+</script>
+{% endblock %}

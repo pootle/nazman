@@ -1,0 +1,16 @@
+fastapi>=0.100.0
+uvicorn[standard]
+sqlalchemy
+pydantic>=2.0
+pydantic-settings>=2.0
+gitpython
+apscheduler<4
+python-multipart
+websockets
+jinja2
+passlib[bcrypt]
+bcrypt
+aiofiles
+psutil
+PyJWT
+httpx

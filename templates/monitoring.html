@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+
+{% block title %}Performance - NAZMan{% endblock %}
+{% block page_title %}Performance Monitoring{% endblock %}
+
+{% block content %}
+<div class="monitoring">
+    <!-- Per-pool disk utilisation -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-hdd"></i> Pool Disk Utilisation</h2>
+            <select id="mon-pool-select" class="pool-select">
+                <option value="">Select pool</option>
+            </select>
+        </div>
+        <div class="card-body">
+            <canvas id="mon-disk-chart" class="mon-chart mon-disk-chart"></canvas>
+            <div id="mon-disk-legend" class="disk-legend"></div>
+        </div>
+    </div>
+
+    <!-- CPU / Memory / Network -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-microchip"></i> System Load</h2>
+        </div>
+        <div class="card-body mon-system-grid">
+            <div class="mon-metric">
+                <h3>CPU <span class="metric-value" id="mon-cpu">--%</span></h3>
+                <canvas id="mon-cpu-chart" class="sparkline-canvas mon-pad-chart"></canvas>
+            </div>
+            <div class="mon-metric">
+                <h3>Memory <span class="metric-value" id="mon-mem">--%</span></h3>
+                <p class="memory-detail" id="mon-mem-detail">--</p>
+                <canvas id="mon-mem-chart" class="sparkline-canvas mon-pad-chart"></canvas>
+            </div>
+            <div class="mon-metric">
+                <h3>Network <span class="metric-value" id="mon-net">--%</span></h3>
+                <p class="memory-detail" id="mon-net-detail">--</p>
+                <canvas id="mon-net-chart" class="sparkline-canvas mon-pad-chart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Historical playback -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-history"></i> Historical Data</h2>
+            <div class="history-controls">
+                <button class="btn btn-secondary btn-sm hist-range" data-days="0.0416667">1h</button>
+                <button class="btn btn-secondary btn-sm hist-range" data-days="0.25">6h</button>
+                <button class="btn btn-secondary btn-sm hist-range" data-days="1">24h</button>
+                <button class="btn btn-secondary btn-sm hist-range active" data-days="7">7d</button>
+                <button class="btn btn-primary btn-sm" id="mon-load-history">
+                    <i class="fas fa-redo-alt"></i> Load
+                </button>
+            </div>
+        </div>
+        <div class="card-body">
+            <p class="memory-detail" id="mon-history-status">Enable metric logging on the Pools page to view recorded history here.</p>
+            <canvas id="mon-history-chart" class="mon-chart mon-history-chart"></canvas>
+            <div id="mon-history-legend" class="disk-legend"></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const MON_POLL_INTERVAL = 5000;
+let monPollTimer = null;
+let monPoolsMap = {};
+let monSelectedPool = '';
+let monDays = 7;
+const SYSTEM_COLORS = { cpu: '#3498db', memory: '#9b59b6', net: '#16a085' };
+
+function setMonPoolSelect(poolsMap) {
+    const sel = document.getElementById('mon-pool-select');
+    const names = Object.keys(poolsMap || {});
+    const current = sel.value;
+    const existing = Array.from(sel.options).map(o => o.value);
+    const same = names.length === existing.length - 1 && names.every(n => existing.includes(n));
+    if (!same) {
+        sel.innerHTML = '<option value="">Select pool</option>';
+        names.forEach(n => {
+            const o = document.createElement('option');
+            o.value = n;
+            o.textContent = n;
+            sel.appendChild(o);
+        });
+    }
+    if (monSelectedPool && poolsMap[monSelectedPool] !== undefined) {
+        sel.value = monSelectedPool;
+    } else {
+        sel.value = '';
+    }
+}
+
+function drawLive() {
+    drawSparkline('mon-cpu-chart', monLiveCpu, SYSTEM_COLORS.cpu);
+    drawSparkline('mon-mem-chart', monLiveMem, SYSTEM_COLORS.memory);
+    drawSparkline('mon-net-chart', monLiveNet, SYSTEM_COLORS.net);
+
+    const sel = document.getElementById('mon-pool-select');
+    const bases = sel.value ? (monPoolsMap[sel.value] || []) : [];
+    const seriesList = [];
+    bases.forEach(base => {
+        const data = (monLiveDisks[base] || []).map(s => s.value);
+        if (data.length) seriesList.push({ name: base, data: data });
+    });
+    const colors = seriesList.map(s => seriesColor(s.name));
+    drawMultiline('mon-disk-chart', seriesList, colors);
+    const legend = document.getElementById('mon-disk-legend');
+    legend.innerHTML = seriesList.length
+        ? seriesList.map((s, i) => `<span class="legend-item"><span class="legend-swatch" style="background:${colors[i]}"></span>${s.name}</span>`).join('')
+        : '<span class="legend-item muted">No disks in this pool</span>';
+}
+
+let monLiveCpu = [];
+let monLiveMem = [];
+let monLiveNet = [];
+let monLiveDisks = {};
+
+async function pollMonLive() {
+    try {
+        const m = await api.getMonitoringSummary();
+        monPoolsMap = m.pools || {};
+        setMonPoolSelect(monPoolsMap);
+        const sel = document.getElementById('mon-pool-select');
+        if (sel.value) monSelectedPool = sel.value;
+
+        monLiveCpu = (m.cpu || []).map(s => s.value);
+        monLiveMem = (m.memory || []).map(s => s.value);
+        monLiveNet = (m.net || []).map(s => s.value);
+        monLiveDisks = m.disks || {};
+
+        const cpuCur = monLiveCpu.length ? monLiveCpu[monLiveCpu.length - 1] : 0;
+        const memCur = monLiveMem.length ? monLiveMem[monLiveMem.length - 1] : 0;
+        const netCur = monLiveNet.length ? monLiveNet[monLiveNet.length - 1] : 0;
+
+        document.getElementById('mon-cpu').textContent = Number(cpuCur).toFixed(1) + '%';
+        document.getElementById('mon-mem').textContent = Number(memCur).toFixed(1) + '%';
+        document.getElementById('mon-net').textContent = Number(netCur).toFixed(5) + '%';
+        updateUsageColor('mon-cpu', cpuCur);
+        updateUsageColor('mon-mem', memCur);
+        updateUsageColor('mon-net', netCur);
+
+        document.getElementById('mon-net-detail').textContent =
+            (m.selected_interface || 'n/a') + ' iface';
+        document.getElementById('mon-mem-detail').textContent = '--';
+
+        drawLive();
+        updateHistoryStatus();
+    } catch (e) {
+        console.error('Live poll failed:', e);
+    }
+}
+
+async function updateHistoryStatus() {
+    let logging;
+    try {
+        logging = await api.getLoggingState();
+    } catch (e) { return; }
+    const on = (logging.enabled && logging.enabled[monSelectedPool]) || false;
+    const status = document.getElementById('mon-history-status');
+    if (!monSelectedPool) {
+        status.textContent = 'Select a pool above to view its disk history.';
+    } else if (!on) {
+        status.textContent = 'Metric logging is off for this pool — enable it on the Pools page to record history.';
+    } else {
+        status.textContent = 'Showing recorded history for ' + (monSelectedPool) + ' (' + logging.retention_days + ' day retention).';
+    }
+}
+
+async function loadMonHistory() {
+    if (!monSelectedPool) {
+        showAlert('Select a pool to view history', 'info');
+        return;
+    }
+    const status = document.getElementById('mon-history-status');
+    status.textContent = 'Loading history...';
+
+    const diskHist = await api.getMonitoringHistory(monSelectedPool, 'disk', monDays);
+    const diskSeries = Object.keys(diskHist.series || {}).map(dev => ({
+        name: dev,
+        data: diskHist.series[dev].map(s => s.value)
+    }));
+    const diskColors = diskSeries.map(s => seriesColor(s.name));
+    drawMultiline('mon-history-chart', diskSeries, diskColors);
+    const legend = document.getElementById('mon-history-legend');
+    legend.innerHTML = diskSeries.length
+        ? diskSeries.map((s, i) => `<span class="legend-item"><span class="legend-swatch" style="background:${diskColors[i]}"></span>${s.name}</span>`).join('')
+        : '<span class="legend-item muted">No recorded history for this pool</span>';
+
+    const rangeLabel = monDays < 1
+        ? (monDays === 0.0416667 ? '1h' : '6h')
+        : (monDays + 'd');
+    status.textContent = 'Loaded history for ' + monSelectedPool + ' (last ' + rangeLabel + ').';
+}
+
+function loadMonitoringPage() {
+    pollMonLive();
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('mon-pool-select').addEventListener('change', function() {
+        monSelectedPool = this.value;
+        if (monSelectedPool) localStorage.setItem('nazman_mon_pool', monSelectedPool);
+        else localStorage.removeItem('nazman_mon_pool');
+        updateHistoryStatus();
+    });
+    document.querySelectorAll('.hist-range').forEach(btn => {
+        btn.addEventListener('click', function() {
+            document.querySelectorAll('.hist-range').forEach(b => b.classList.remove('active'));
+            this.classList.add('active');
+            monDays = parseFloat(this.dataset.days);
+        });
+    });
+    document.getElementById('mon-load-history').addEventListener('click', loadMonHistory);
+    monSelectedPool = localStorage.getItem('nazman_mon_pool') || '';
+    loadMonitoringPage();
+    monPollTimer = setInterval(pollMonLive, MON_POLL_INTERVAL);
+});
+</script>
+{% endblock %}

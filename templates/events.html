@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}Command Log - NAZMan{% endblock %}
+{% block page_title %}Command Log{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        <h3>Recent Commands</h3>
+        <button class="btn btn-secondary btn-sm" id="events-refresh-btn">
+            <i class="fas fa-sync-alt"></i> Refresh
+        </button>
+    </div>
+    <div class="card-content">
+        <div class="log-filter-bar">
+            <label>Type</label>
+            <select id="filter-type">
+                <option value="">All</option>
+                <option value="read">Read</option>
+                <option value="write">Change</option>
+                <option value="system">System</option>
+            </select>
+            <label>Category</label>
+            <select id="filter-category">
+                <option value="">All</option>
+            </select>
+            <label>Status</label>
+            <select id="filter-status">
+                <option value="">All</option>
+                <option value="success">Success</option>
+                <option value="failed">Failed</option>
+                <option value="timeout">Timeout</option>
+                <option value="error">Error</option>
+            </select>
+            <span class="log-summary" id="log-summary"></span>
+        </div>
+        <table class="table" id="command-log-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Type</th>
+                    <th>Category</th>
+                    <th>Command</th>
+                    <th>Status</th>
+                    <th>Return</th>
+                    <th>Duration</th>
+                    <th>Error</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td colspan="8" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
+function statusBadge(status) {
+    const map = {
+        success: 'status-success',
+        failed: 'status-failed',
+        timeout: 'status-failed',
+        error: 'status-failed'
+    };
+    return `<span class="event-status ${map[status] || ''}">${escapeHtml(status)}</span>`;
+}
+
+function opBadge(op) {
+    const map = { read: 'op-read', write: 'op-write', system: 'op-system' };
+    const label = { read: 'Read', write: 'Change', system: 'System' };
+    const key = op || 'write'; // untagged entries group as Change
+    return `<span class="op-badge ${map[key] || 'op-write'}">${label[key] || 'Change'}</span>`;
+}
+
+function populateCategoryOptions(entries) {
+    const sel = document.getElementById('filter-category');
+    const cats = new Set();
+    (entries || []).forEach(e => { if (e.category) cats.add(e.category); });
+    const sorted = Array.from(cats).sort();
+    const current = sel.value;
+    sel.innerHTML = '<option value="">All</option>' + sorted.map(c =>
+        `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    if (current) sel.value = current;
+}
+
+async function loadCommandLog() {
+    const tbody = document.querySelector('#command-log-table tbody');
+    const summary = document.getElementById('log-summary');
+    const typeFilter = document.getElementById('filter-type').value;
+    const statusFilter = document.getElementById('filter-status').value;
+    const catFilter = document.getElementById('filter-category').value;
+    try {
+        const data = await api.getCommandLog({
+            type: typeFilter || undefined,
+            status: statusFilter || undefined
+        });
+        let entries = data.entries || [];
+        populateCategoryOptions(entries);
+        if (catFilter) entries = entries.filter(e => e.category === catFilter);
+        const total = data.total != null ? data.total : entries.length;
+        if (entries.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" class="empty">No commands match the current filters.</td></tr>';
+            summary.textContent = entries.length + ' shown';
+            return;
+        }
+        tbody.innerHTML = entries.map(function (e) {
+            const ts = e.ts ? new Date(e.ts).toLocaleString() : '';
+            return `<tr>
+                <td class="mono">${escapeHtml(ts)}</td>
+                <td>${opBadge(e.op)}</td>
+                <td>${e.category ? `<span class="text-muted">${escapeHtml(e.category)}</span>` : '-'}</td>
+                <td class="mono command-cell">${escapeHtml(e.command)}</td>
+                <td>${statusBadge(e.status)}</td>
+                <td class="mono">${e.returncode !== undefined ? escapeHtml(e.returncode) : '-'}</td>
+                <td class="mono">${e.duration_ms !== undefined ? escapeHtml(e.duration_ms) + ' ms' : '-'}</td>
+                <td class="mono error-cell">${escapeHtml(e.stderr || '')}</td>
+            </tr>`;
+        }).join('');
+        summary.textContent = entries.length + ' of ' + total + ' shown';
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="8" class="empty">Failed to load: ${escapeHtml(err.message)}</td></tr>`;
+        summary.textContent = '';
+    }
+}
+
+['filter-type', 'filter-status', 'filter-category'].forEach(id => {
+    document.getElementById(id).addEventListener('change', loadCommandLog);
+});
+document.getElementById('events-refresh-btn').addEventListener('click', loadCommandLog);
+loadCommandLog();
+</script>
+{% endblock %}
