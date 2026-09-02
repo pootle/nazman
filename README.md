@@ -19,7 +19,7 @@ provides a GUI for ZFS storage management with NFS v4 and SMB access.
 
 ## Requirements
 
-- Ubuntu Server 20.04+ or Raspberry Pi OS (Bookworm/Linux) — any Debian-based distro
+- Ubuntu Server 20.04+ (x86-64) or Raspberry Pi OS 64-bit (Trixie recommended) — any Debian-based distro
 - Root access
 - ZFS support (zfsutils-linux)
 - Python 3.9+
@@ -73,6 +73,50 @@ sudo ./deploy.sh
 
 `deploy.sh` uses `deploy.txt` as a manifest and applies only new/changed/deleted
 files, then restarts the service.
+
+## Raspberry Pi OS
+
+NAZMan runs on Raspberry Pi OS (64-bit). Typical roles for a Pi:
+
+| Role | Branch | Purpose | Notes |
+|------|--------|---------|-------|
+| **Dev machine** | `dev` | Run opencode, the test suite, and the dev server | No live ZFS needed — tests mock ZFS |
+| **Backup service** | `main` | Receive/restore ZFS backup streams from the main NAS | Needs working ZFS |
+
+Use the **Trixie** release of Raspberry Pi OS (64-bit) — it ships Python 3.13
+and kernel 6.12 (the older Bookworm release only has Python 3.11).
+
+### Dev machine
+
+The dev setup has no ZFS dependency:
+
+```bash
+# Install opencode (native arm64 binary)
+curl -fsSL https://opencode.ai/install | bash
+
+# Clone and set up the dev branch
+git clone git@github.com:pootle/nazman.git
+cd nazman
+git checkout dev
+
+# Create the venv and run the test suite
+./dev-env.sh
+./venv/bin/python -m pytest tests/ -q
+```
+
+### Backup / production service
+
+Install the service with the standard one-liner (requires a working ZFS). On
+Raspberry Pi OS, `prepare.sh` automatically enables the Debian `contrib`
+repository and builds the ZFS kernel module via DKMS, which takes a few minutes
+on first install:
+
+```bash
+sudo curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | bash
+```
+
+If the DKMS build fails against a newly-shipped Pi kernel, `prepare.sh` prints
+manual instructions for pulling newer ZFS from `trixie-backports`.
 
 ### Access the Web Interface
 
@@ -141,7 +185,7 @@ branches, then:
 ```bash
 git checkout dev
 
-# Create a local dev venv (python3.13) and install deps + test tooling
+# Create a local dev venv (prefers python3.13, falls back to any Python 3.9+)
 ./dev-env.sh
 
 # Or, if you have a Makefile toolchain:
