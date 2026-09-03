@@ -30,6 +30,7 @@ nazman/utils/command_log.py
 nazman/utils/command_tags.py
 nazman/utils/command_log_store.py
 nazman/api/__init__.py
+nazman/api/auth.py
 nazman/api/disks.py
 nazman/api/pools.py
 nazman/api/datasets.py
@@ -65,6 +66,7 @@ templates/events.html
 # Tests
 tests/__init__.py
 tests/conftest.py
+tests/test_api_auth.py
 tests/test_api_disks.py
 tests/test_api_pools.py
 tests/test_api_datasets.py
