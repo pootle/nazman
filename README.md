@@ -54,7 +54,7 @@ The recommended way to install NAZMan on a fresh server is a one-liner. On Ubunt
 Server or Raspberry Pi OS, with root:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | sudo bash
 ```
 
 `install.sh` downloads the `main` branch into `/opt/nazman`, then:
@@ -127,7 +127,7 @@ repository and builds the ZFS kernel module via DKMS, which takes a few minutes
 on first install:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | sudo bash
 ```
 
 If the DKMS build fails against a newly-shipped Pi kernel, `prepare.sh` prints

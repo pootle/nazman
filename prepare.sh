@@ -41,8 +41,12 @@ enable_contrib() {
     local changed=0
 
     # deb822 format: /etc/apt/sources.list.d/*.sources with a Components: line.
+    # Skip Pi-specific repos (archive.raspberrypi.com) which don't carry contrib.
     for f in /etc/apt/sources.list.d/*.sources; do
         [[ -e "$f" ]] || continue
+        if grep -q "archive.raspberrypi.com" "$f"; then
+            continue
+        fi
         if ! grep -q "^Components:.* contrib" "$f"; then
             sed -i -E 's/^(Components:\s*main[^#]*)$/\1 contrib /' "$f"
             changed=1
@@ -50,9 +54,11 @@ enable_contrib() {
     done
 
     # Legacy format: lines like "deb <uri> <suite> main [contrib]".
+    # Only touch lines whose URI is NOT a Pi-specific repo.
     if [[ -f /etc/apt/sources.list ]]; then
-        if ! grep -q "contrib" /etc/apt/sources.list; then
-            sed -i -E 's/^(deb\s+\S+\s+\S+\s+main)([^#]*)$/\1 contrib \2/' /etc/apt/sources.list
+        if grep -q "^deb " /etc/apt/sources.list && \
+           ! grep -q "contrib" /etc/apt/sources.list; then
+            sed -i -E '/archive\.raspberrypi\.com/!s/^(deb\s+\S+\s+\S+\s+main)([^#]*)$/\1 contrib \2/' /etc/apt/sources.list
             changed=1
         fi
     fi
@@ -96,8 +102,7 @@ apt-get install -y \
     wget \
     python3 \
     python3-venv \
-    python3-pip \
-    software-properties-common
+    python3-pip
 
 # Extra pieces needed by the app's backing store logic:
 #   util-linux provides lsblk/sfdisk/blkid/wipefs/partprobe/mount/umount
