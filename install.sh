@@ -3,13 +3,14 @@
 #
 # This is the entry point for the documented one-liner:
 #
-#   sudo curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/pootle/nazman/main/install.sh | sudo bash
 #
 # It downloads the production branch of the repo into /opt/nazman and then runs
 # the existing prepare.sh (system deps) and build.sh (service setup) scripts
 # that ship with the project. Idempotent: safe to re-run on an existing install.
 #
-# Usage: sudo bash install.sh [<repo_url>] [<branch>]
+# Usage: curl ... | sudo bash install.sh [<repo_url>] [<branch>]
+#   or:  sudo bash install.sh [<repo_url>] [<branch>]
 
 set -euo pipefail
 
@@ -28,7 +29,7 @@ echo "==============================================="
 
 if [[ $EUID -ne 0 ]]; then
     echo "ERROR: This script must be run as root (sudo)." >&2
-    echo "Usage: sudo curl -fsSL <url>/install.sh | bash" >&2
+    echo "Usage: curl -fsSL <url>/install.sh | sudo bash" >&2
     exit 1
 fi
 
