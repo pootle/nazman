@@ -27,6 +27,10 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Run apt non-interactively: the zfs-dkms install pops a license prompt that
+# cannot be answered in a piped/scripted context (no interactive TTY).
+export DEBIAN_FRONTEND=noninteractive
+
 # Determine the platform: Ubuntu (deb.debian.org repos enable contrib) vs
 # Raspberry Pi OS (Debian-based; contrib disabled by default).
 IS_RPI=0
@@ -88,6 +92,10 @@ if [[ "$IS_RPI" -eq 1 ]]; then
     KERN_REL="$(uname -r)"
     RPI_ZFS_PKGS="linux-headers-${KERN_REL} zfs-dkms zfs-zed"
 fi
+
+# Pre-accept the zfs-dkms licenses note to avoid a blocking debconf prompt
+# (the postinst pops a "note" dialog that cannot be answered without a TTY).
+echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections || true
 
 echo "Installing system packages..."
 apt-get install -y \
