@@ -3,6 +3,8 @@ class NasManAPI {
     constructor(baseUrl = '') {
         this.baseUrl = baseUrl;
         this.token = localStorage.getItem('nazman_token');
+        this._loginResolvers = [];
+        this._loginActive = false;
     }
 
     async request(method, path, data = null) {
@@ -26,8 +28,13 @@ class NasManAPI {
         const response = await fetch(`${this.baseUrl}${path}`, options);
 
         if (response.status === 401) {
-            this.showLoginModal();
-            throw new Error('Unauthorized');
+            // A stored token is present but no longer valid; drop it so we prompt.
+            if (this.token) {
+                this.logout();
+            }
+            await this._requireAuth();
+            // Retry once with the (now-present) token.
+            return this.request(method, path, data);
         }
 
         if (!response.ok) {
@@ -345,10 +352,75 @@ class NasManAPI {
     logout() {
         this.token = null;
         localStorage.removeItem('nazman_token');
+        const logoutBtn = document.getElementById('logout-btn');
+        if (logoutBtn) logoutBtn.style.display = 'none';
+    }
+
+    _hasToken() {
+        return Boolean(this.token);
+    }
+
+    _requireAuth() {
+        // If we already have a (valid) token, nothing to wait on.
+        if (this._hasToken()) {
+            return Promise.resolve();
+        }
+        // Queue a promise that resolves once the user signs in successfully.
+        return new Promise((resolve) => {
+            this._loginResolvers.push(resolve);
+            this._showLoginModal();
+        });
+    }
+
+    _showLoginModal() {
+        if (this._loginActive) {
+            return;
+        }
+        this._loginActive = true;
+
+        const modal = document.getElementById('login-modal');
+        const password = document.getElementById('login-password');
+        const errorEl = document.getElementById('login-error');
+        const loginBtn = document.getElementById('login-btn');
+
+        if (!modal || !password || !loginBtn) {
+            return;
+        }
+
+        const hideError = () => { if (errorEl) errorEl.style.display = 'none'; };
+
+        const doLogin = async () => {
+            hideError();
+            loginBtn.disabled = true;
+            const ok = await this.login(password.value);
+            loginBtn.disabled = false;
+            if (ok) {
+                modal.style.display = 'none';
+                password.value = '';
+                this._loginActive = false;
+                const resolvers = this._loginResolvers.splice(0);
+                resolvers.forEach((r) => r());
+            } else {
+                if (errorEl) {
+                    errorEl.textContent = 'Invalid password.';
+                    errorEl.style.display = 'block';
+                }
+                password.focus();
+            }
+        };
+
+        loginBtn.onclick = doLogin;
+        password.onkeydown = (e) => {
+            if (e.key === 'Enter') doLogin();
+            hideError();
+        };
+
+        modal.style.display = 'flex';
+        password.focus();
     }
 
     showLoginModal() {
-        console.log('Login required');
+        this._showLoginModal();
     }
 }
 

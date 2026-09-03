@@ -11,7 +11,19 @@ async function initializeApp() {
     if (refreshBtn) {
         refreshBtn.addEventListener('click', refreshCurrentPage);
     }
-    
+
+    // Setup logout button
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', () => {
+            api.logout();
+            window.location.reload();
+        });
+        if (api._hasToken()) {
+            logoutBtn.style.display = '';
+        }
+    }
+
     // Check authentication
     await checkAuthentication();
     
@@ -20,13 +32,17 @@ async function initializeApp() {
 }
 
 async function checkAuthentication() {
-    // For now, just check if we can access the API
+    // Validate the stored token; if absent or invalid, prompt to sign in.
+    if (!api._hasToken()) {
+        await api._requireAuth().catch(() => {});
+        return;
+    }
     try {
         await api.getSystemStatus();
     } catch (error) {
-        if (error.message === 'Unauthorized') {
-            console.log('Authentication required');
-        }
+        // Token may be invalid / expired: clear it and re-prompt.
+        api.logout();
+        await api._requireAuth().catch(() => {});
     }
 }
 

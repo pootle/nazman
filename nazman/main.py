@@ -10,7 +10,7 @@ from .utils.exceptions import NAZManError
 from .api import (
     disks_router, pools_router, datasets_router,
     nfs_router, smb_router, snapshots_router, backup_router, zfs_backup_router,
-    system_router, metrics_router,
+    system_router, metrics_router, auth_router,
 )
 
 # Get application settings
@@ -91,6 +91,7 @@ app.include_router(snapshots_router)
 app.include_router(backup_router)
 app.include_router(zfs_backup_router)
 app.include_router(metrics_router)
+app.include_router(auth_router)
 
 
 # Web UI routes
