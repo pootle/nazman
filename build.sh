@@ -102,14 +102,21 @@ echo "2/7 Creating directories..."
 mkdir -p "$DEST" /var/lib/nazman /var/log/nazman /etc/nazman
 
 echo "3/7 Copying application files to $DEST..."
-while IFS= read -r file; do
-    [[ -z "$file" || "$file" =~ ^# ]] && continue
-    src="$SCRIPT_DIR/$file"
-    if [[ -f "$src" ]]; then
-        mkdir -p "$(dirname "$DEST/$file")"
-        cp "$src" "$DEST/$file"
-    fi
-done < "$MANIFEST"
+# When build.sh runs from within $DEST itself (as install.sh does after cloning
+# the repo into /opt/nazman), source and destination are the same directory, so
+# there is nothing to copy.
+if [[ "$(cd "$SCRIPT_DIR" && pwd -P)" == "$(cd "$DEST" && pwd -P)" ]]; then
+    echo "  source is $DEST itself; skipping copy."
+else
+    while IFS= read -r file; do
+        [[ -z "$file" || "$file" =~ ^# ]] && continue
+        src="$SCRIPT_DIR/$file"
+        if [[ -f "$src" ]]; then
+            mkdir -p "$(dirname "$DEST/$file")"
+            cp "$src" "$DEST/$file"
+        fi
+    done < "$MANIFEST"
+fi
 
 echo "4/7 Setting up Python virtual environment ($PY_BIN)..."
 if [[ ! -x "$DEST/venv/bin/python" ]]; then
