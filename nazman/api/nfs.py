@@ -112,3 +112,19 @@ async def get_presence(
 ):
     """Return whether the NFS kernel server (exportfs) is installed."""
     return {"installed": nfs_manager.is_server_present()}
+
+
+class InstallResponse(BaseModel):
+    installed: bool
+    message: str
+
+
+@router.post("/install", response_model=InstallResponse)
+async def install_server(
+    current_user: dict = Depends(get_current_user),
+):
+    """Install the NFS kernel server (nfs-kernel-server) on this server via apt."""
+    try:
+        return await nfs_manager.install_server()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

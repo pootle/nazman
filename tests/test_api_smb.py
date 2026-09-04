@@ -95,3 +95,23 @@ async def test_presence(client):
         response = client.get("/api/smb/presence")
         assert response.status_code == 200
         assert response.json() == {"installed": True}
+
+
+@pytest.mark.asyncio
+async def test_install_server(client):
+    with patch("nazman.api.smb.smb_manager") as mock:
+        mock.install_server = AsyncMock(
+            return_value={"installed": True, "message": "Samba installed successfully."})
+        response = client.post("/api/smb/install")
+        assert response.status_code == 200
+        assert response.json()["installed"] is True
+
+
+@pytest.mark.asyncio
+async def test_install_server_error(client):
+    from nazman.utils.exceptions import SmbError
+    with patch("nazman.api.smb.smb_manager") as mock:
+        mock.install_server = AsyncMock(side_effect=SmbError("apt failed"))
+        response = client.post("/api/smb/install")
+        assert response.status_code == 400
+        assert "apt failed" in response.json()["detail"]

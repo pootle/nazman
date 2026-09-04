@@ -1,4 +1,6 @@
 from typing import List, Dict, Any, Optional
+import os
+import shutil
 
 from sqlalchemy.orm import Session
 
@@ -32,6 +34,54 @@ class NfsManager:
         import os
 
         return any(os.path.isfile(p) for p in ("/usr/sbin/exportfs", "/usr/bin/exportfs"))
+
+    async def install_server(self) -> Dict[str, Any]:
+        """Install the NFS kernel server on this host via apt.
+
+        Idempotent: returns immediately when ``exportfs`` is already present.
+        Installs ``nfs-kernel-server``, ensures the ``nfsd`` kernel module is
+        loaded (NFSv4), enables/starts the service, and ensures the shared
+        anonymous identity used by NAZMan's shares exists.
+        """
+        if self.is_server_present():
+            return {"installed": True, "message": "The NFS kernel server is already installed."}
+
+        if shutil.which("apt-get") is None:
+            raise NfsError(
+                "The NFS kernel server is not installed and apt-get is not "
+                "available on this server. Install the `nfs-kernel-server` "
+                "package manually."
+            )
+
+        env = {"DEBIAN_FRONTEND": "noninteractive"}
+
+        _, stderr, rc = await run_command(
+            ["apt-get", "update"], timeout=600, check=False,
+            env=env, op="system", category="nfs",
+        )
+        if rc != 0:
+            raise NfsError(f"apt-get update failed: {stderr.strip()}")
+
+        _, stderr, rc = await run_command(
+            ["apt-get", "install", "-y", "nfs-kernel-server"], timeout=600, check=False,
+            env=env, op="system", category="nfs",
+        )
+        if rc != 0:
+            raise NfsError(f"Failed to install nfs-kernel-server: {stderr.strip()}")
+
+        # NFSv4 is served by the nfsd kernel module; load it if not present so
+        # /proc/fs/nfsd is available to the running server.
+        await run_command(["modprobe", "nfsd"], timeout=30, check=False, op="system", category="nfs")
+        await run_command(["systemctl", "enable", "nfs-kernel-server"], timeout=60, op="system", category="nfs")
+        await run_command(["systemctl", "start", "nfs-kernel-server"], timeout=60, op="system", category="nfs")
+
+        await self._ensure_anon_user()
+
+        return {
+            "installed": self.is_server_present(),
+            "message": "NFS kernel server installed successfully." if self.is_server_present()
+            else "NFS install completed but exportfs was not found.",
+        }
 
     # -- live property access ---------------------------------------------
 

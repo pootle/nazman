@@ -15,6 +15,7 @@ async def run_command(
     input: Optional[str] = None,
     op: str | None = None,
     category: str | None = None,
+    env: Optional[dict] = None,
 ) -> Tuple[str, str, int]:
     """
     Run a system command asynchronously.
@@ -28,6 +29,8 @@ async def run_command(
         op: Optional command-log type tag (read/write/system). Auto-detected
             from the command when not given.
         category: Optional command-log category tag (e.g. zfs, smartctl).
+        env: Optional dict of environment variables to set for the child
+            process. Defaults to inheriting the parent environment.
 
     Returns:
         Tuple of (stdout, stderr, returncode)
@@ -39,7 +42,8 @@ async def run_command(
             *cmd,
             stdin=asyncio.subprocess.PIPE if input is not None else None,
             stdout=asyncio.subprocess.PIPE if capture_output else None,
-            stderr=asyncio.subprocess.PIPE if capture_output else None
+            stderr=asyncio.subprocess.PIPE if capture_output else None,
+            env=env,
         )
         
         stdin_data = input.encode('utf-8') if input is not None else None

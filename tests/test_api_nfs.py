@@ -132,3 +132,66 @@ async def test_get_presence(client):
         response = client.get("/api/nfs/presence")
         assert response.status_code == 200
         assert response.json() == {"installed": True}
+
+
+@pytest.mark.asyncio
+async def test_install_server(client):
+    with patch("nazman.api.nfs.nfs_manager") as mock:
+        mock.install_server = AsyncMock(
+            return_value={"installed": True, "message": "NFS kernel server installed successfully."})
+        response = client.post("/api/nfs/install")
+        assert response.status_code == 200
+        assert response.json()["installed"] is True
+
+
+@pytest.mark.asyncio
+async def test_install_server_error(client):
+    from nazman.utils.exceptions import NfsError
+    with patch("nazman.api.nfs.nfs_manager") as mock:
+        mock.install_server = AsyncMock(side_effect=NfsError("apt failed"))
+        response = client.post("/api/nfs/install")
+        assert response.status_code == 400
+        assert "apt failed" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_install_server_already_installed(client):
+    with patch("nazman.api.nfs.nfs_manager") as mock:
+        mock.install_server = AsyncMock(
+            return_value={"installed": True, "message": "The NFS kernel server is already installed."})
+        response = client.post("/api/nfs/install")
+        assert response.status_code == 200
+        assert response.json()["installed"] is True
+
+
+@pytest.mark.asyncio
+async def test_nfs_install_server_runs_apt_and_systemctl():
+    manager = nfs_manager.__class__()
+    calls = []
+
+    async def fake_cmd(cmd, **kw):
+        calls.append(cmd)
+        return ("", "", 0)
+
+    with patch.object(manager.__class__, "is_server_present", side_effect=[False, True, True]), \
+         patch("nazman.managers.nfs_manager.run_command", side_effect=fake_cmd), \
+         patch("nazman.managers.nfs_manager.shutil.which", return_value="/usr/bin/apt-get"):
+        result = await manager.install_server()
+
+    assert calls[0] == ["apt-get", "update"]
+    assert calls[1] == ["apt-get", "install", "-y", "nfs-kernel-server"]
+    assert ["systemctl", "enable", "nfs-kernel-server"] in calls
+    assert ["systemctl", "start", "nfs-kernel-server"] in calls
+    assert ["modprobe", "nfsd"] in calls
+    assert result["installed"] is True
+    assert "installed successfully" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_nfs_install_server_no_apt():
+    manager = nfs_manager.__class__()
+    from nazman.utils.exceptions import NfsError
+    with patch.object(manager.__class__, "is_server_present", return_value=False), \
+         patch("nazman.managers.nfs_manager.shutil.which", return_value=None):
+        with pytest.raises(NfsError, match="apt-get"):
+            await manager.install_server()

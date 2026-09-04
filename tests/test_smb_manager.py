@@ -129,6 +129,68 @@ async def test_set_share_end_to_end(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_install_server_already_installed(tmp_path):
+    _write_conf(tmp_path)
+    manager = SmbManager()
+    with patch.object(SmbManager, "is_server_present", return_value=True):
+        result = await manager.install_server()
+    assert result["installed"] is True
+    assert "already installed" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_install_server_runs_apt_and_systemctl(tmp_path):
+    _write_conf(tmp_path)
+    manager = SmbManager()
+    calls = []
+
+    async def fake_cmd(cmd, **kw):
+        calls.append(cmd)
+        return ("", "", 0)
+
+    with patch.object(SmbManager, "is_server_present", side_effect=[False, True, True]), \
+         patch("nazman.managers.smb_manager.run_command", side_effect=fake_cmd), \
+         patch("nazman.managers.smb_manager.shutil.which", return_value="/usr/bin/apt-get"):
+        result = await manager.install_server()
+
+    assert calls[0] == ["apt-get", "update"]
+    assert calls[1] == ["apt-get", "install", "-y", "samba"]
+    assert ["systemctl", "enable", "smbd"] in calls
+    assert ["systemctl", "start", "nmbd"] in calls
+    assert result["installed"] is True
+    assert "installed successfully" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_install_server_no_apt(tmp_path):
+    _write_conf(tmp_path)
+    manager = SmbManager()
+    from nazman.utils.exceptions import SmbError
+    with patch.object(SmbManager, "is_server_present", return_value=False), \
+         patch("nazman.managers.smb_manager.shutil.which", return_value=None):
+        with pytest.raises(SmbError, match="apt-get"):
+            await manager.install_server()
+
+
+@pytest.mark.asyncio
+async def test_install_server_apt_failure(tmp_path):
+    _write_conf(tmp_path)
+    manager = SmbManager()
+    from nazman.utils.exceptions import SmbError
+
+    async def fake_cmd(cmd, **kw):
+        if cmd and cmd[0] == "apt-get" and cmd[1] == "install":
+            return ("", "apt error", 100)
+        return ("", "", 0)
+
+    with patch.object(SmbManager, "is_server_present", side_effect=[False, False]), \
+         patch("nazman.managers.smb_manager.run_command", side_effect=fake_cmd), \
+         patch("nazman.managers.smb_manager.shutil.which", return_value="/usr/bin/apt-get"):
+        with pytest.raises(SmbError, match="Failed to install samba"):
+            await manager.install_server()
+
+
+@pytest.mark.asyncio
 async def test_reload_validation_failure(tmp_path):
     _write_conf(tmp_path)
     manager = smb_manager.__class__()

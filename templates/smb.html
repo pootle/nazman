@@ -9,18 +9,23 @@
     <div class="card" id="smb-presence-card" style="display:none;">
         <div class="card-body">
             <p class="callout callout-warning" id="smb-presence-msg"></p>
+            <div class="modal-actions" id="smb-install-actions" style="display:none;">
+                <button class="btn btn-primary" id="smb-install-btn" onclick="installSamba()">
+                    <i class="fas fa-download"></i> Install Samba
+                </button>
+            </div>
         </div>
     </div>
 
     <!-- SMB Shares (managed smb.conf) -->
-    <div class="card">
+    <div class="card" id="smb-shares-card">
         <div class="card-header">
             <h2><i class="fas fa-share-alt"></i> SMB Shares</h2>
             <div>
-                <button class="btn btn-secondary" onclick="loadSmbPage()">
+                <button class="btn btn-secondary" id="smb-refresh-btn" onclick="loadSmbPage()">
                     <i class="fas fa-sync-alt"></i> Refresh
                 </button>
-                <button class="btn btn-primary" onclick="showCreateShareModal()">
+                <button class="btn btn-primary" id="smb-create-btn" onclick="showCreateShareModal()">
                     <i class="fas fa-plus"></i> Create Share
                 </button>
             </div>
@@ -73,18 +78,25 @@
 <script>
 let shares = [];
 let datasets = [];
+let smbInstalled = true;
 
 document.addEventListener('DOMContentLoaded', function() {
     loadSmbPage();
     document.getElementById('create-share-form').addEventListener('submit', handleCreateShare);
 });
 
-async function loadSmbPage() {
-    await Promise.all([
-        loadSmbShares(),
-        loadDatasets(),
-        checkSmbPresence()
-    ]);
+async function setSmbActiveState(installed) {
+    smbInstalled = installed;
+    const createBtn = document.getElementById('smb-create-btn');
+    const refreshBtn = document.getElementById('smb-refresh-btn');
+    const installActions = document.getElementById('smb-install-actions');
+    const shareBtns = document.querySelectorAll('#smb-shares-card button.action-btn');
+    const tooltip = installed ? '' : (createBtn.dataset.tooltip || 'Samba is not installed on this server.');
+    document.getElementById('smb-create-btn').disabled = !installed;
+    document.getElementById('smb-create-btn').title = tooltip;
+    document.getElementById('smb-refresh-btn').disabled = !installed;
+    document.getElementById('smb-refresh-btn').title = tooltip;
+    shareBtns.forEach(b => { b.disabled = !installed; b.title = tooltip; });
 }
 
 async function checkSmbPresence() {
@@ -93,16 +105,44 @@ async function checkSmbPresence() {
         const p = await api.getSmbPresence();
         if (p.installed) {
             card.style.display = 'none';
+            document.getElementById('smb-install-actions').style.display = 'none';
         } else {
             document.getElementById('smb-presence-msg').textContent =
-                'Samba is not installed on this server. SMB sharing will not work until you install it: ' +
-                'run the NAZMan installer (build.sh, choosing to install Samba) or run ' +
-                '`sudo apt-get install -y samba` on the server.';
+                'Samba is not installed on this server. SMB sharing will not work until you install it.';
+            document.getElementById('smb-install-actions').style.display = '';
             card.style.display = '';
         }
+        await setSmbActiveState(p.installed);
     } catch (e) {
         console.error('Failed to check SMB presence:', e);
     }
+}
+
+async function installSamba() {
+    const btn = document.getElementById('smb-install-btn');
+    if (!confirm('Install the Samba server (samba package) now? This may take a few minutes.')) {
+        return;
+    }
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Installing...';
+    try {
+        await api.installSmb();
+        showAlert('Samba installed successfully', 'success');
+        await loadSmbPage();
+    } catch (error) {
+        showAlert('Failed to install Samba: ' + error.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-download"></i> Install Samba';
+    }
+}
+
+async function loadSmbPage() {
+    await Promise.all([
+        loadSmbShares(),
+        loadDatasets(),
+        checkSmbPresence()
+    ]);
 }
 
 async function loadSmbShares() {
@@ -151,13 +191,13 @@ function renderSmbShares() {
                         <td>${s.read_only ? '<span class="status status-warning">Read-only</span>' : '<span class="status status-online">Read-write</span>'}</td>
                         <td><span class="status status-${s.enabled ? 'online' : 'faulted'}">${s.enabled ? 'Shared' : 'Disabled'}</span></td>
                         <td>
-                            <button class="btn btn-sm btn-secondary" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})">
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})" ${smbInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
                             </button>
-                            ${s.enabled ? `<button class="btn btn-sm btn-secondary" onclick="editShare('${s.dataset_name}')">
+                            ${s.enabled ? `<button class="btn btn-sm btn-secondary action-btn" onclick="editShare('${s.dataset_name}')" ${smbInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-edit"></i>
                             </button>` : ''}
-                            <button class="btn btn-sm btn-danger" onclick="deleteShare('${s.dataset_name}')">
+                            <button class="btn btn-sm btn-danger action-btn" onclick="deleteShare('${s.dataset_name}')" ${smbInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-trash"></i>
                             </button>
                         </td>
@@ -178,6 +218,7 @@ function updateDatasetSelect() {
 }
 
 function showCreateShareModal() {
+    if (!smbInstalled) return;
     document.getElementById('share-modal-title').textContent = 'Create SMB Share';
     document.getElementById('share-dataset').value = '';
     document.getElementById('share-readonly').checked = false;
@@ -187,6 +228,7 @@ function showCreateShareModal() {
 }
 
 function editShare(datasetName) {
+    if (!smbInstalled) return;
     const s = shares.find(x => x.dataset_name === datasetName);
     if (!s) return;
     document.getElementById('share-modal-title').textContent = 'Edit SMB Share';
@@ -232,6 +274,7 @@ async function handleCreateShare(e) {
 }
 
 async function toggleShare(datasetName, enable) {
+    if (!smbInstalled) return;
     try {
         await api.updateSmbShare(datasetName, { enabled: enable });
         await loadSmbShares();
@@ -242,6 +285,7 @@ async function toggleShare(datasetName, enable) {
 }
 
 async function deleteShare(datasetName) {
+    if (!smbInstalled) return;
     if (!confirm('Remove this SMB share?')) {
         return;
     }

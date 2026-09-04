@@ -89,6 +89,22 @@ if [[ "$install_nfs" == "y" ]]; then
     apt-get install -y nfs-kernel-server
     systemctl enable nfs-kernel-server
     systemctl start nfs-kernel-server
+
+    # Verify NFSv4 support is available.
+    if ! lsmod | grep -q nfsd; then
+        modprobe nfsd 2>/dev/null || true
+    fi
+    if [[ -d /proc/fs/nfsd ]]; then
+        echo "NFSv4 support is available."
+    else
+        echo ""
+        echo "==============================================="
+        echo "WARNING: NFSv4 support is NOT available." >&2
+        echo "The nfsd kernel module is not loaded.  Try:" >&2
+        echo "  sudo modprobe nfsd && sudo systemctl restart nfs-kernel-server" >&2
+        echo "===============================================" >&2
+        echo ""
+    fi
 fi
 
 if [[ "$install_smb" == "y" ]]; then

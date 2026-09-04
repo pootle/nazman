@@ -38,6 +38,15 @@ async def test_run_command_timeout():
 
 
 @pytest.mark.asyncio
+async def test_run_command_env():
+    stdout, stderr, rc = await run_command(
+        ["printenv", "NAZMAN_TEST_ENV"], env={"NAZMAN_TEST_ENV": "hello"}, timeout=10
+    )
+    assert rc == 0
+    assert stdout.strip() == "hello"
+
+
+@pytest.mark.asyncio
 async def test_run_zpool_success():
     with patch("nazman.utils.commands.run_command", new_callable=AsyncMock,
                return_value=("pool\n", "", 0)):

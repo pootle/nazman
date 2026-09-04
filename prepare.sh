@@ -118,6 +118,35 @@ apt-get install -y \
 #   coreutils provides chown/chmod
 apt-get install -y util-linux e2fsprogs coreutils
 
+# ── NFSv4 availability check ───────────────────────────────────────────
+# NAZMan's NFS sharing uses ZFS sharenfs, which relies on the kernel NFS
+# server.  Ensure the nfsd module is loaded and the proc filesystem is
+# accessible so that NFSv4 is available to clients.
+echo "Checking NFSv4 support..."
+if ! lsmod | grep -q nfsd; then
+    modprobe nfsd 2>/dev/null || true
+fi
+if [[ -d /proc/fs/nfsd ]]; then
+    echo "NFSv4 support is available (/proc/fs/nfsd present)."
+else
+    echo ""
+    echo "==============================================="
+    echo "WARNING: NFSv4 support is NOT available." >&2
+    echo "" >&2
+    echo "The /proc/fs/nfsd directory is missing, which means the nfsd" >&2
+    echo "kernel module is not loaded.  This can happen on minimal installs" >&2
+    echo "or if the kernel was updated without rebooting." >&2
+    echo "" >&2
+    echo "To fix:" >&2
+    echo "  sudo modprobe nfsd" >&2
+    echo "  sudo systemctl restart nfs-kernel-server" >&2
+    echo "" >&2
+    echo "If modprobe fails, ensure nfs-kernel-server is installed and" >&2
+    echo "reboot into the running kernel." >&2
+    echo "===============================================" >&2
+    echo ""
+fi
+
 # Post-install ZFS sanity check (DKMS builds the module; newly-shipped Pi
 # kernels can break the build). If the module isn't functional, report the
 # failure and give manual remediation rather than silently proceeding to build.sh.

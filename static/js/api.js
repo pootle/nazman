@@ -214,9 +214,17 @@ class NasManAPI {
         return this.request('GET', '/api/nfs/presence');
     }
 
+    async installNfs() {
+        return this.request('POST', '/api/nfs/install');
+    }
+
     // SMB
     async getSmbPresence() {
         return this.request('GET', '/api/smb/presence');
+    }
+
+    async installSmb() {
+        return this.request('POST', '/api/smb/install');
     }
 
     async getSmbShares() {

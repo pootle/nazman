@@ -34,12 +34,28 @@ class PresenceResponse(BaseModel):
     installed: bool
 
 
+class InstallResponse(BaseModel):
+    installed: bool
+    message: str
+
+
 @router.get("/presence", response_model=PresenceResponse)
 async def get_presence(
     current_user: dict = Depends(get_current_user),
 ):
     """Return whether Samba (smbd) is installed on this server."""
     return {"installed": smb_manager.is_server_present()}
+
+
+@router.post("/install", response_model=InstallResponse)
+async def install_server(
+    current_user: dict = Depends(get_current_user),
+):
+    """Install Samba (smbd) on this server via apt."""
+    try:
+        return await smb_manager.install_server()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/", response_model=List[SmbShareResponse])
