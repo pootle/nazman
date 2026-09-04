@@ -86,7 +86,15 @@ async def test_destroy_pool_deletes_record(db_session):
     async def fake_run_zpool(*args, **kwargs):
         return ("", "", 0)
 
-    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+    async def fake_run_zfs(*args, **kwargs):
+        return ("", "", 0)
+
+    async def fake_run_command(*args, **kwargs):
+        return ("", "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
+         patch("nazman.managers.zfs_manager.run_zfs", side_effect=fake_run_zfs), \
+         patch("nazman.managers.zfs_manager.run_command", side_effect=fake_run_command):
         await zfs_manager.destroy_pool(db_session, "oldpool")
 
     assert db_session.query(Pool).filter(Pool.name == "oldpool").count() == 0
@@ -117,6 +125,7 @@ async def test_destroy_pool_unexports_nfs_before_destroy(db_session):
 
     with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
          patch("nazman.managers.zfs_manager.run_command", side_effect=fake_run_command), \
+         patch("nazman.managers.zfs_manager.run_zfs", side_effect=fake_run_zfs), \
          patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_run_zfs):
 
         await zfs_manager.destroy_pool(db_session, "photolib1")

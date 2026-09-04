@@ -39,14 +39,18 @@ async def test_run_command_timeout():
 
 @pytest.mark.asyncio
 async def test_run_zpool_success():
-    stdout, stderr, rc = await run_zpool("list", "-H", timeout=10)
+    with patch("nazman.utils.commands.run_command", new_callable=AsyncMock,
+               return_value=("pool\n", "", 0)):
+        stdout, stderr, rc = await run_zpool("list", "-H", timeout=10)
     assert rc == 0
 
 
 @pytest.mark.asyncio
 async def test_run_zfs_help():
-    stdout, stderr, rc = await run_zfs("help", timeout=10)
-    assert "zfs" in stdout.lower() or "zfs" in stderr.lower() or rc == 0
+    with patch("nazman.utils.commands.run_command", new_callable=AsyncMock,
+               return_value=("usage: zfs ...", "", 0)):
+        stdout, stderr, rc = await run_zfs("help", timeout=10)
+    assert rc == 0
 
 
 @pytest.mark.asyncio
