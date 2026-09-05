@@ -24,8 +24,11 @@ Work on `dev`; only merge production changes into `main`.
 # Run the test suite
 ./venv/bin/python -m pytest tests/ -q
 
-# Run the dev server with auto-reload
-./venv/bin/uvicorn nazman.main:app --reload --host 0.0.0.0 --port 8080
+# Live-test the production setup on this machine (sudo; installs ZFS on setup)
+sudo ./dev-live.sh setup     # full provision: prepare.sh + build.sh -> /opt/nazman + systemd
+sudo ./dev-live.sh update    # deploy.sh: copy changed files to /opt/nazman + restart
+./dev-live.sh status         # service status + HTTP check
+./dev-live.sh logs -f        # journalctl -u nazman
 ```
 
 ## Structure

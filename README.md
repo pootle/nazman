@@ -95,7 +95,7 @@ NAZMan runs on Raspberry Pi OS (64-bit). Typical roles for a Pi:
 
 | Role | Branch | Purpose | Notes |
 |------|--------|---------|-------|
-| **Dev machine** | `dev` | Run opencode, the test suite, and the dev server | No live ZFS needed — tests mock ZFS |
+| **Dev machine** | `dev` | Run opencode, the test suite, and live-test the app | Unit tests mock ZFS; live testing runs the real production setup |
 | **Backup service** | `main` | Receive/restore ZFS backup streams from the main NAS | Needs working ZFS |
 
 Use the **Trixie** release of Raspberry Pi OS (64-bit) — it ships Python 3.13
@@ -103,7 +103,7 @@ and kernel 6.12 (the older Bookworm release only has Python 3.11).
 
 ### Dev machine
 
-The dev setup has no ZFS dependency:
+The test suite has no ZFS dependency (ZFS commands are mocked):
 
 ```bash
 # Install opencode (native arm64 binary)
@@ -117,6 +117,38 @@ git checkout dev
 # Create the venv and run the test suite
 ./dev-env.sh
 ./venv/bin/python -m pytest tests/ -q
+```
+
+To *live-test* the app on the dev machine in the same way production runs, use
+`dev-live.sh`. It provisions the machine exactly like the Pi: `prepare.sh`
+(apt system packages including ZFS) then `build.sh` (app copied to
+`/opt/nazman`, venv there, `/etc/nazman/nazman.conf`, the `nfsanon` identity,
+and the `nazman` systemd service `Requires=zfs.target`):
+
+```bash
+# One-time provision (sudo; installs ZFS and upgrades apt packages)
+sudo ./dev-live.sh setup
+
+# Check the service and endpoint
+./dev-live.sh status
+
+# After editing code, re-apply only changed files and restart
+sudo ./dev-live.sh update
+
+# Service logs
+./dev-live.sh logs -f
+```
+
+Stop any local dev server (e.g. `make dev`, which binds 8080) before
+`dev-live.sh setup`, or the service will not start. The fresh install accepts
+any password at the login prompt (no auth hash set, like a fresh Pi); use
+`set_setting`/`AUTH_PASSWORD_HASH` in `/etc/nazman/nazman.conf` to enforce one.
+To exercise the ZFS API on a ZFS-less dev box, create a scratch pool on loop
+devices, for example:
+
+```bash
+sudo truncate -s 1G /var/lib/nazman/disk{1,2}.img
+sudo zpool create testpool /var/lib/nazman/disk1.img /var/lib/nazman/disk2.img
 ```
 
 ### Backup / production service
