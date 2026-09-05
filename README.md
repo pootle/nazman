@@ -109,6 +109,13 @@ The test suite has no ZFS dependency (ZFS commands are mocked):
 # Install opencode (native arm64 binary)
 curl -fsSL https://opencode.ai/install | bash
 
+# Install git if not present
+sudo apt-get install -y git
+
+# Configure your Git identity (required for commits)
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+
 # Clone and set up the dev branch
 git clone git@github.com:pootle/nazman.git
 cd nazman
@@ -226,10 +233,20 @@ backup history, create manual backups, and restore from previous backups.
 
 ## Development
 
-The `dev` branch is geared toward development (including with opencode). Switch
-branches, then:
+The `dev` branch is geared toward development (including with opencode). Make
+sure `git` is installed and your credentials are configured, then:
 
 ```bash
+# Install git if not present (Debian/Ubuntu)
+sudo apt-get install -y git
+
+# Configure your Git identity (required for commits)
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+
+# Clone and switch to the dev branch
+git clone git@github.com:pootle/nazman.git
+cd nazman
 git checkout dev
 
 # Create a local dev venv (prefers python3.13, falls back to any Python 3.9+)
@@ -238,11 +255,40 @@ git checkout dev
 # Or, if you have a Makefile toolchain:
 make setup
 
-# Run the test suite
+# Run the test suite (ZFS commands are mocked)
 ./venv/bin/python -m pytest tests/ -q
+```
 
-# Run the development server (auto-reload)
-./venv/bin/uvicorn nazman.main:app --reload --host 0.0.0.0 --port 8080
+To *live-test* the app on the dev machine in the same way production runs, use
+`dev-live.sh`. It provisions the machine exactly like a Pi: `prepare.sh`
+(apt system packages including ZFS) then `build.sh` (app copied to
+`/opt/nazman`, venv there, `/etc/nazman/nazman.conf`, the `nfsanon` identity,
+and the `nazman` systemd service `Requires=zfs.target`):
+
+```bash
+# One-time provision (sudo; installs ZFS and upgrades apt packages)
+sudo ./dev-live.sh setup
+
+# Check the service and endpoint
+./dev-live.sh status
+
+# After editing code, re-apply only changed files and restart
+sudo ./dev-live.sh update
+
+# Service logs
+./dev-live.sh logs -f
+```
+
+Stop any local dev server (e.g. `make dev`, which binds 8080) before
+`dev-live.sh setup`, or the service will not start. The fresh install accepts
+any password at the login prompt (no auth hash set, like a fresh Pi); use
+`set_setting`/`AUTH_PASSWORD_HASH` in `/etc/nazman/nazman.conf` to enforce one.
+To exercise the ZFS API on a ZFS-less dev box, create a scratch pool on loop
+devices, for example:
+
+```bash
+sudo truncate -s 1G /var/lib/nazman/disk{1,2}.img
+sudo zpool create testpool /var/lib/nazman/disk1.img /var/lib/nazman/disk2.img
 ```
 
 ### Project Structure
