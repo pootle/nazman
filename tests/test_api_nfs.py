@@ -173,8 +173,13 @@ async def test_nfs_install_server_runs_apt_and_systemctl():
         calls.append(cmd)
         return ("", "", 0)
 
+    async def fake_zfs(*args, **kw):
+        calls.append(["zfs"] + list(args))
+        return ("", "", 0)
+
     with patch.object(manager.__class__, "is_server_present", side_effect=[False, True, True]), \
          patch("nazman.managers.nfs_manager.run_command", side_effect=fake_cmd), \
+         patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_zfs), \
          patch("nazman.managers.nfs_manager.shutil.which", return_value="/usr/bin/apt-get"):
         result = await manager.install_server()
 
@@ -183,8 +188,34 @@ async def test_nfs_install_server_runs_apt_and_systemctl():
     assert ["systemctl", "enable", "nfs-kernel-server"] in calls
     assert ["systemctl", "start", "nfs-kernel-server"] in calls
     assert ["modprobe", "nfsd"] in calls
+    assert ["zfs", "share", "-a"] in calls
     assert result["installed"] is True
     assert "installed successfully" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_nfs_install_server_installs_reshare_dropin():
+    manager = nfs_manager.__class__()
+    written = []
+
+    async def fake_cmd(cmd, **kw):
+        if cmd[0] == "tee":
+            written.append((cmd, kw.get("input")))
+        return ("", "", 0)
+
+    async def fake_zfs(*args, **kw):
+        return ("", "", 0)
+
+    with patch.object(manager.__class__, "is_server_present", side_effect=[False, True, True]), \
+         patch("nazman.managers.nfs_manager.run_command", side_effect=fake_cmd), \
+         patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_zfs), \
+         patch("nazman.managers.nfs_manager.shutil.which", return_value="/usr/bin/apt-get"):
+        await manager.install_server()
+
+    assert len(written) == 1
+    cmd, content = written[0]
+    assert cmd == ["tee", "/etc/systemd/system/nfs-server.service.d/zfs-share.conf"]
+    assert "ExecStartPost=/usr/sbin/zfs share -a" in content
 
 
 @pytest.mark.asyncio

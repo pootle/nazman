@@ -26,6 +26,32 @@ class NfsManager:
     ANON_UID = 65533
     ANON_GID = 65533
 
+    # zfs-share.service runs `zfs share -a` before nfs-server.service, so on
+    # slow boots the kernel export table can be left empty (exportfs -r only
+    # re-reads /etc/exports, not ZFS's etab). A drop-in re-shares after start.
+    RESHARE_UNIT_DIR = "/etc/systemd/system/nfs-server.service.d"
+    RESHARE_DROP_IN = "zfs-share.conf"
+
+    # Content of the ExecStartPost unit drop-in.
+    @staticmethod
+    def _reshare_drop_in_content() -> str:
+        return (
+            "# Re-register ZFS sharenfs exports once the NFS server is up; a\n"
+            "# reboot may otherwise leave the kernel export table empty.\n"
+            "[Service]\n"
+            "ExecStartPost=/usr/sbin/zfs share -a\n"
+        )
+
+    async def _install_reshare_hook(self) -> None:
+        """Install a drop-in that re-shares ZFS exports whenever nfs-server starts."""
+        await run_command(["mkdir", "-p", self.RESHARE_UNIT_DIR], timeout=30, op="system", category="nfs")
+        await run_command(
+            ["tee", os.path.join(self.RESHARE_UNIT_DIR, self.RESHARE_DROP_IN)],
+            input=self._reshare_drop_in_content(),
+            timeout=30, op="system", category="nfs",
+        )
+        await run_command(["systemctl", "daemon-reload"], timeout=30, op="system", category="nfs")
+
     # -- presence / server readiness --------------------------------------
 
     @staticmethod
@@ -74,6 +100,12 @@ class NfsManager:
         await run_command(["modprobe", "nfsd"], timeout=30, check=False, op="system", category="nfs")
         await run_command(["systemctl", "enable", "nfs-kernel-server"], timeout=60, op="system", category="nfs")
         await run_command(["systemctl", "start", "nfs-kernel-server"], timeout=60, op="system", category="nfs")
+
+        # nfs-server runs `exportfs -r` (only /etc/exports) on start, which can
+        # drop ZFS shares registered before the server was up; re-share now and
+        # keep a drop-in that does so on every future start.
+        await self._install_reshare_hook()
+        await run_zfs("share", "-a", check=False, category="nfs")
 
         await self._ensure_anon_user()
 

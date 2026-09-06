@@ -90,6 +90,18 @@ if [[ "$install_nfs" == "y" ]]; then
     systemctl enable nfs-kernel-server
     systemctl start nfs-kernel-server
 
+    # zfs-share.service runs `zfs share -a` before nfs-server.service; on slow
+    # boots the kernel export table is left empty (exportfs -r only re-reads
+    # /etc/exports). Re-register ZFS shares after every nfs-server start.
+    mkdir -p /etc/systemd/system/nfs-server.service.d
+    cat > /etc/systemd/system/nfs-server.service.d/zfs-share.conf << 'EOF'
+# Re-register ZFS sharenfs exports once the NFS server is up; a reboot may
+# otherwise leave the kernel export table empty.
+[Service]
+ExecStartPost=/usr/sbin/zfs share -a
+EOF
+    systemctl daemon-reload
+
     # Verify NFSv4 support is available.
     if ! lsmod | grep -q nfsd; then
         modprobe nfsd 2>/dev/null || true
