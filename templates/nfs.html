@@ -88,7 +88,8 @@
                     </label>
                 </div>
                 <p class="text-muted" style="margin-top:8px">
-                    All shares squash every client to the shared anonymous user
+                    Shares are restricted to the client specification, and every
+                    client is squashed to the shared anonymous user
                     (<code>nfsanon</code>, UID/GID 65533) for consistent read/write access.
                 </p>
             </div>
@@ -225,14 +226,14 @@ function renderNfsShares() {
                     <tr>
                         <td><code>${s.export_path}</code></td>
                         <td><code>${s.sharenfs || 'not set'}</code></td>
-                        <td><span class="status status-${s.enabled ? 'online' : 'faulted'}">${s.enabled ? 'Shared' : 'Not shared'}</span></td>
+                        <td><span class="status status-${s.enabled ? 'online' : 'warning'}">${s.enabled ? 'Shared' : 'Paused'}</span></td>
                         <td>
                             <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
                             </button>
-                            ${s.enabled ? `<button class="btn btn-sm btn-secondary action-btn" onclick="editShare('${s.dataset_name}')" ${nfsInstalled ? '' : 'disabled'}>
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="editShare('${s.dataset_name}')" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-edit"></i>
-                            </button>` : ''}
+                            </button>
                             <button class="btn btn-sm btn-danger action-btn" onclick="deleteExport('${s.dataset_name}')" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-trash"></i>
                             </button>
@@ -265,7 +266,7 @@ function renderActiveExports(activeExports) {
                 ${activeExports.map(exp => `
                     <tr>
                         <td><code>${exp.path}</code></td>
-                        <td>${exp.client}</td>
+                        <td>${exp.client === '*' || exp.client === '<world>' ? '* (all other hosts)' : exp.client}</td>
                         <td><code>${exp.options}</code></td>
                     </tr>
                 `).join('')}
@@ -356,13 +357,13 @@ async function toggleShare(datasetName, enable) {
     if (!nfsInstalled) return;
     try {
         if (enable) {
-            // Re-enable with the existing sharenfs value (already set).
+            // Resume: options were kept by pause, so just re-share.
             await api.updateNfsExport(datasetName, { enabled: true });
         } else {
             await api.updateNfsExport(datasetName, { enabled: false });
         }
         await loadNfsShares();
-        showAlert(enable ? 'Share enabled' : 'Share disabled', 'success');
+        showAlert(enable ? 'Share resumed' : 'Share paused', 'success');
     } catch (error) {
         showAlert('Failed to update share: ' + error.message, 'error');
     }
@@ -370,16 +371,16 @@ async function toggleShare(datasetName, enable) {
 
 async function deleteExport(datasetName) {
     if (!nfsInstalled) return;
-    if (!confirm('Disable this NFS share?')) {
+    if (!confirm('Remove this NFS share permanently? Its settings will be discarded.')) {
         return;
     }
 
     try {
         await api.deleteNfsExport(datasetName);
         await loadNfsShares();
-        showAlert('Share disabled', 'success');
+        showAlert('Share removed', 'success');
     } catch (error) {
-        showAlert('Failed to disable share: ' + error.message, 'error');
+        showAlert('Failed to remove share: ' + error.message, 'error');
     }
 }
 </script>

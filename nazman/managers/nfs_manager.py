@@ -186,16 +186,39 @@ class NfsManager:
                     names.append(name)
         return names
 
+    async def _active_export_paths(self) -> set:
+        """Set of currently active export paths from the kernel export table."""
+        try:
+            stdout, _, rc = await run_command(["exportfs", "-v"], timeout=30, check=False)
+            if rc != 0:
+                return set()
+            paths = set()
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line:
+                    paths.add(line.split()[0])
+            return paths
+        except Exception:
+            return set()
+
     async def list_exports(self, db: Session) -> List[Dict[str, Any]]:
-        """List every dataset with its live sharenfs value."""
+        """List every dataset with NFS sharing configured (sharenfs not off).
+
+        Fully-disabled datasets are omitted so a deleted share disappears; a
+        paused share (options retained, export unshared) is shown as paused.
+        """
+        active = await self._active_export_paths()
         rows = []
         for name in await self._list_dataset_names():
             sharenfs = await self._read_sharenfs(name)
+            if sharenfs in ("", "off"):
+                continue
             rows.append({
                 "dataset_name": name,
                 "export_path": f"/{name}",
                 "sharenfs": sharenfs,
-                "enabled": sharenfs not in ("off", ""),
+                "enabled": f"/{name}" in active,
+                "paused": f"/{name}" not in active,
             })
         return rows
 
@@ -239,7 +262,10 @@ class NfsManager:
         """Build a ZFS sharenfs option string for the common-anon squash model.
 
         Standard options (rw/sync/async/no_subtree_check) plus a universal
-        ``all_squash`` to the shared anon uid/gid, restricted to ``client_spec``.
+        ``all_squash`` to the shared anon uid/gid, with mount access restricted
+        to ``client_spec``. ``access=`` is used instead of ``rw=`` so the export
+        is limited to the named clients; a bare ``rw=@net`` would otherwise add
+        an implicit wildcard entry for every other host.
         """
         tokens = [k for k, v in (options or {}).items() if v]
         # all_squash is implied by the shared-anon model; force it and pin ids.
@@ -247,7 +273,20 @@ class NfsManager:
         parts = ",".join(toks)
         parts = f"{parts},{'all_squash'},anonuid={self.ANON_UID},anongid={self.ANON_GID}" if parts \
             else f"all_squash,anonuid={self.ANON_UID},anongid={self.ANON_GID}"
-        return f"rw={client_spec},{parts}"
+        return f"access={client_spec},rw,{parts}"
+
+    async def _export_status(self, dataset_name: str, sharenfs_value: str) -> Dict[str, Any]:
+        """Live status of a dataset's share: enabled (in kernel) or paused."""
+        active = await self._active_export_paths()
+        path = f"/{dataset_name}"
+        normalized = self._normalize_sharenfs(sharenfs_value)
+        return {
+            "dataset_name": dataset_name,
+            "export_path": path,
+            "sharenfs": normalized,
+            "enabled": path in active,
+            "paused": path not in active and normalized != "off",
+        }
 
     async def set_export(
         self,
@@ -258,7 +297,13 @@ class NfsManager:
         sharenfs: str = None,
         enabled: bool = None,
     ) -> Dict[str, Any]:
-        """Create or update a dataset's NFS share via the sharenfs property."""
+        """Create, update, pause or resume a dataset's NFS share.
+
+        Creating/updating sets the ``sharenfs`` property (ZFS is the source of
+        truth). Pausing (``enabled=False``) only runs ``zfs unshare`` so the
+        configured options survive and the share can be resumed. A share whose
+        options were discarded (deleted) cannot be resumed and must be created.
+        """
         if not await self._dataset_exists(dataset_name):
             raise ValidationError(f"Dataset '{dataset_name}' not found")
 
@@ -269,36 +314,37 @@ class NfsManager:
                 "`sudo apt-get install -y nfs-kernel-server`."
             )
 
+        if enabled is False:
+            await run_zfs("unshare", dataset_name, check=False)
+            return await self._export_status(dataset_name, await self._read_sharenfs(dataset_name))
+
         if sharenfs is not None:
             value = sharenfs.strip()
-        elif enabled is not None and enabled is False:
-            value = "off"
         elif client_spec is not None:
             validate_ip_cidr(client_spec)
             value = self._build_sharenfs_value(client_spec, options)
         else:
-            # No new sharing info provided: preserve the current value.
+            # No new config supplied: re-share with the stored options, or
+            # refuse to enable a share whose settings were discarded.
             current = await self._read_sharenfs(dataset_name)
-            if enabled is True and current == "off":
-                raise ValidationError(
-                    "Provide client_spec and options to enable a disabled share"
-                )
-            value = current
+            if current in ("", "off"):
+                if enabled is True:
+                    raise ValidationError(
+                        "This share has no stored configuration; recreate it to enable it."
+                    )
+                return await self._export_status(dataset_name, current)
+            await run_zfs("share", dataset_name, check=False)
+            return await self._export_status(dataset_name, current)
 
         if value not in ("", "off"):
             await self._ensure_anon_user()
             await self._prepare_dataset_dir(dataset_name)
 
         await self._set_sharenfs(dataset_name, value)
-        return {
-            "dataset_name": dataset_name,
-            "export_path": f"/{dataset_name}",
-            "sharenfs": self._normalize_sharenfs(value),
-            "enabled": value not in ("off", ""),
-        }
+        return await self._export_status(dataset_name, value)
 
     async def delete_export(self, db: Session, dataset_name: str) -> None:
-        """Disable (unshare) a dataset's NFS share."""
+        """Permanently remove a dataset's NFS share (sharenfs -> off)."""
         if not await self._dataset_exists(dataset_name):
             raise ValidationError(f"Dataset '{dataset_name}' not found")
         await self._set_sharenfs(dataset_name, "off")
@@ -327,24 +373,31 @@ class NfsManager:
         """Return share status and active NFS clients for a pool's datasets."""
         dataset_names = await self._list_dataset_names(pool.name)
         export_paths = sorted({f"/{pool.name}"} | {f"/{d}" for d in dataset_names})
+        active = await self._active_export_paths()
 
         exports = []
         for name in dataset_names:
             sharenfs = await self._read_sharenfs(name)
+            if sharenfs in ("", "off"):
+                continue
+            path = f"/{name}"
             exports.append({
-                "export_path": f"/{name}",
+                "export_path": path,
                 "dataset_name": name,
                 "sharenfs": sharenfs,
-                "enabled": sharenfs not in ("off", ""),
+                "enabled": path in active,
+                "paused": path not in active,
             })
-        if pool.name and not any(e["dataset_name"] == pool.name for e in exports):
+        if pool.name:
             root = await self._read_sharenfs(pool.name)
-            if root not in ("off", ""):
+            if root not in ("", "off"):
+                path = f"/{pool.name}"
                 exports.append({
-                    "export_path": f"/{pool.name}",
+                    "export_path": path,
                     "dataset_name": pool.name,
                     "sharenfs": root,
-                    "enabled": True,
+                    "enabled": path in active,
+                    "paused": path not in active,
                 })
 
         active_clients = []

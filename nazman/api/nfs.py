@@ -28,6 +28,7 @@ class NfsShareResponse(BaseModel):
     export_path: str
     sharenfs: str
     enabled: bool
+    paused: bool = False
 
 
 class ActiveExportResponse(BaseModel):
@@ -98,12 +99,12 @@ async def delete_export(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Disable (unshare) a dataset's NFS share."""
+    """Permanently remove a dataset's NFS share (sharenfs -> off)."""
     try:
         await nfs_manager.delete_export(db, dataset_name)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"message": "Export disabled"}
+    return {"message": "Export removed"}
 
 
 @router.get("/presence")
