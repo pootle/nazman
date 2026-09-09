@@ -3,33 +3,20 @@ from sqlalchemy.orm import Session
 import re
 from typing import List, Optional
 from pydantic import BaseModel
-import uuid
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import disk_manager
+from ..managers import disk_manager, zfs_manager
 from ..managers.disk_manager import (
-    read_slot_uuids, write_slot_uuid, partition_by_id,
+    read_slot_uuids, partition_by_id,
     get_device_entry, get_device_path, get_device_name,
     get_os_reserved_partition_names,
 )
 from ..models.disk import Disk
-from ..utils.commands import run_command
 from ..utils.exceptions import DiskError
 
 
-def _live_device_path(disk: Disk, action: str = "this operation") -> str:
-    """Resolve the current ephemeral kernel path for a disk, or 404-style error."""
-    path = get_device_path(disk)
-    if not path:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Disk {get_device_name(disk) or disk.serial or disk.id} is not currently present; cannot {action}",
-        )
-    return path
-
-
-router = APIRouter(prefix="/api/disks", tags=["disks"])
+router = APIRouter(prefix="/api/disks", tags=["disks"], dependencies=[Depends(get_current_user)])
 
 
 class DiskResponse(BaseModel):
@@ -98,7 +85,7 @@ class BatchPartitionRequest(BaseModel):
 @router.get("/", response_model=List[DiskResponse])
 async def list_disks(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """List all discovered disks."""
     disks = await disk_manager.sync_disks_to_database(db)
@@ -109,7 +96,7 @@ async def list_disks(
 async def get_disk(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get disk by ID."""
     disk = db.query(Disk).filter(Disk.id == disk_id).first()
@@ -122,14 +109,17 @@ async def get_disk(
 async def get_disk_health(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get disk health information."""
     disk = db.query(Disk).filter(Disk.id == disk_id).first()
     if not disk:
         raise HTTPException(status_code=404, detail="Disk not found")
 
-    device_path = _live_device_path(disk, action="read SMART health")
+    try:
+        device_path = disk_manager._live_device_path(disk, action="read SMART health")
+    except DiskError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     health = await disk_manager.get_disk_health(device_path)
     return health
 
@@ -138,14 +128,17 @@ async def get_disk_health(
 async def get_disk_partitions(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Read partitions from disk (reads GPT names, not DB)."""
     disk = db.query(Disk).filter(Disk.id == disk_id).first()
     if not disk:
         raise HTTPException(status_code=404, detail="Disk not found")
 
-    device_path = _live_device_path(disk, action="read partitions")
+    try:
+        device_path = disk_manager._live_device_path(disk, action="read partitions")
+    except DiskError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     slot_info = await read_slot_uuids([device_path])
     disk_parts = slot_info.get(device_path, {}).get("partitions", [])
 
@@ -183,21 +176,15 @@ async def get_disk_partitions(
 async def wipe_disk(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Wipe all partition tables from a disk."""
-    disk = db.query(Disk).filter(Disk.id == disk_id).first()
-    if not disk:
-        raise HTTPException(status_code=404, detail="Disk not found")
-
-    if disk.is_os_disk:
-        raise HTTPException(status_code=400, detail="Cannot modify the OS disk")
-
-    device_path = _live_device_path(disk, action="wipe")
-    await run_command(["wipefs", "-a", device_path], timeout=60)
-    await run_command(["parted", "-s", device_path, "mklabel", "gpt"], timeout=60)
-
-    return {"message": f"Wiped partition table from {get_device_name(disk) or disk.model or disk.serial}"}
+    try:
+        return await disk_manager.wipe_disk(db, disk_id)
+    except DiskError as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/{disk_id}/partition", response_model=DiskPartitionsResponse)
@@ -205,68 +192,25 @@ async def partition_disk(
     disk_id: int,
     request: PartitionDiskRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Partition a disk. Generates slot UUIDs and writes them to GPT names."""
-    disk = db.query(Disk).filter(Disk.id == disk_id).first()
-    if not disk:
-        raise HTTPException(status_code=404, detail="Disk not found")
-
-    if disk.is_os_disk:
-        raise HTTPException(status_code=400, detail="Cannot modify the OS disk")
-
-    await _partition_single_disk(disk, request.partitions)
+    try:
+        await disk_manager.partition_disk(
+            db, disk_id, [p.model_dump() for p in request.partitions]
+        )
+    except DiskError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Read back the result
-    return await get_disk_partitions(disk_id, db, current_user)
-
-
-async def _partition_single_disk(disk, partitions_spec):
-    """Apply a partition layout to a single disk. Returns result dict or error."""
-    device_path = _live_device_path(disk, action="partition")
-
-    await run_command(["wipefs", "-a", device_path], timeout=60)
-    await run_command(["parted", "-s", device_path, "mklabel", "gpt"], timeout=60)
-
-    partition_number = 1
-    current_sector = 2048
-
-    for spec in partitions_spec:
-        size_mb = spec.size_mb
-
-        start_sector = current_sector
-        if size_mb:
-            end_sector = start_sector + (size_mb * 2048)
-        else:
-            end_sector = -1
-
-        if end_sector == -1:
-            await run_command([
-                "parted", "-s", device_path, "mkpart", "primary",
-                f"{start_sector}s", "100%"
-            ], timeout=60)
-        else:
-            await run_command([
-                "parted", "-s", device_path, "mkpart", "primary",
-                f"{start_sector}s", f"{end_sector}s"
-            ], timeout=60)
-
-        slot_uuid = str(uuid.uuid4())
-        await write_slot_uuid(device_path, partition_number, slot_uuid)
-
-        if end_sector != -1:
-            current_sector = end_sector + 1
-
-        partition_number += 1
-
-    return {"disk_id": disk.id, "device_name": get_device_name(disk) or disk.model or disk.serial, "success": True}
+    return await get_disk_partitions(disk_id, db)
 
 
 @router.post("/batch-partition")
 async def batch_partition_disks(
     request: BatchPartitionRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Apply the same partition layout to multiple disks."""
     if not request.partitions:
@@ -282,7 +226,9 @@ async def batch_partition_disks(
             results.append({"disk_id": disk_id, "success": False, "error": "Cannot modify OS disk"})
             continue
         try:
-            result = await _partition_single_disk(disk, request.partitions)
+            result = await disk_manager.partition_disk(
+                db, disk_id, [p.model_dump() for p in request.partitions]
+            )
             results.append(result)
         except Exception as e:
             results.append({"disk_id": disk_id, "success": False, "error": str(e)})
@@ -294,26 +240,10 @@ async def batch_partition_disks(
 async def batch_wipe_disks(
     request: BatchPartitionRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Wipe partition tables from multiple disks (no new partitions created)."""
-    results = []
-    for disk_id in request.disk_ids:
-        disk = db.query(Disk).filter(Disk.id == disk_id).first()
-        if not disk:
-            results.append({"disk_id": disk_id, "success": False, "error": "Disk not found"})
-            continue
-        if disk.is_os_disk:
-            results.append({"disk_id": disk_id, "success": False, "error": "Cannot modify OS disk"})
-            continue
-        try:
-            device_path = _live_device_path(disk, action="wipe")
-            await run_command(["wipefs", "-a", device_path], timeout=60)
-            await run_command(["parted", "-s", device_path, "mklabel", "gpt"], timeout=60)
-            results.append({"disk_id": disk.id, "device_name": get_device_name(disk) or disk.model or disk.serial, "success": True})
-        except Exception as e:
-            results.append({"disk_id": disk_id, "success": False, "error": str(e)})
-    return results
+    return await disk_manager.batch_wipe_disks(db, request.disk_ids)
 
 
 @router.patch("/{disk_id}")
@@ -321,28 +251,21 @@ async def update_disk(
     disk_id: int,
     updates: dict,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Update disk fields (status, etc.)."""
-    disk = db.query(Disk).filter(Disk.id == disk_id).first()
-    if not disk:
-        raise HTTPException(status_code=404, detail="Disk not found")
-
-    allowed = {"status"}
-    for key, value in updates.items():
-        if key in allowed:
-            setattr(disk, key, value)
-
-    db.commit()
-    db.refresh(disk)
-    return disk
+    try:
+        disk = await disk_manager.update_disk(db, disk_id, updates)
+        return DiskResponse.from_disk(disk)
+    except DiskError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.delete("/{disk_id}")
 async def drop_disk(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Permanently remove a disk row that is no longer present.
 
@@ -350,45 +273,35 @@ async def drop_disk(
     knowledge of a live device. Use to clean up stale rows (e.g. pulled in
     from another machine) for disks that no longer exist in the system.
     """
-    disk = db.query(Disk).filter(Disk.id == disk_id).first()
-    if not disk:
-        raise HTTPException(status_code=404, detail="Disk not found")
-
-    if get_device_path(disk):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Disk {get_device_name(disk) or disk.serial or disk.id} is currently present; cannot drop it",
-        )
-
-    label = get_device_name(disk) or disk.serial or disk.by_id or disk.id
-    db.query(Disk).filter(Disk.id == disk_id).delete()
-    db.commit()
-    return {"message": f"Dropped disk record for {label}"}
+    try:
+        return await disk_manager.drop_disk(db, disk_id)
+    except DiskError as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/{disk_id}/secure-wipe")
 async def secure_wipe_disk(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Securely wipe a disk using media-appropriate method."""
-    return await disk_manager.secure_wipe_disk(db, disk_id)
+    try:
+        return await disk_manager.secure_wipe_disk(db, disk_id)
+    except DiskError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/{disk_id}/resurrect")
 async def resurrect_disk(
     disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Reactivate a dead disk."""
-    disk = db.query(Disk).filter(Disk.id == disk_id).first()
-    if not disk:
-        raise HTTPException(status_code=404, detail="Disk not found")
-    if disk.status != "dead":
-        raise HTTPException(status_code=400, detail="Disk is not dead")
-    disk.status = "active"
-    db.commit()
-    db.refresh(disk)
-    return {"message": f"Disk {get_device_name(disk) or disk.model or disk.serial} resurrected"}
+    try:
+        return await disk_manager.resurrect_disk(db, disk_id)
+    except DiskError as e:
+        raise HTTPException(status_code=400, detail=str(e))

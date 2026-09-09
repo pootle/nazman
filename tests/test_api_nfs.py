@@ -141,7 +141,7 @@ async def test_pause_unshares_and_preserves_options():
     async def fake_exists(*a, **k):
         return True
 
-    async def fake_present(*a, **k):
+    def fake_present(*a, **k):
         return True
 
     async def fake_read(*a, **k):
@@ -175,7 +175,7 @@ async def test_resume_reshare_with_stored_options():
     async def fake_exists(*a, **k):
         return True
 
-    async def fake_present(*a, **k):
+    def fake_present(*a, **k):
         return True
 
     async def fake_read(*a, **k):
@@ -204,7 +204,7 @@ async def test_resume_off_share_raises():
     async def fake_exists(*a, **k):
         return True
 
-    async def fake_present(*a, **k):
+    def fake_present(*a, **k):
         return True
 
     async def fake_read(*a, **k):
@@ -229,7 +229,7 @@ async def test_set_export_uses_access_and_ensures_anon():
     async def fake_exists(*a, **k):
         return True
 
-    async def fake_present(*a, **k):
+    def fake_present(*a, **k):
         return True
 
     async def fake_active(self=None):

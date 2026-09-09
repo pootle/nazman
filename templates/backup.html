@@ -130,6 +130,52 @@
         </div>
     </div>
 </div>
+
+<div id="declare-disk-modal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:520px">
+        <div class="modal-header">
+            <h3>Declare Backup Disk</h3>
+            <button class="close" onclick="hideDeclareDisk()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <label for="declare-disk-label" class="form-label" style="display:block;margin-bottom:4px;">Label</label>
+            <input id="declare-disk-label" class="form-control" type="text" maxlength="100"
+                   placeholder="e.g. Backup media 1 (stick a label on the drive)">
+            <p class="text-muted" style="margin-top:10px;margin-bottom:6px;">
+                Selecting a whole disk wipes it (all partitions); a partition is formatted in place.
+            </p>
+            <div id="declare-disk-list" style="max-height:300px;overflow-y:auto;"></div>
+            <div class="modal-actions" style="margin-top:12px">
+                <button class="btn btn-secondary" onclick="clearDeclareSelection()">Clear selection</button>
+                <button class="btn btn-primary" onclick="confirmDeclareDisk()">Declare</button>
+                <button class="btn btn-secondary" onclick="hideDeclareDisk()">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="declare-confirm-modal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:520px">
+        <div class="modal-header">
+            <h3>Confirm Format</h3>
+            <button class="close" onclick="hideDeclareConfirm()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p id="declare-confirm-message" style="white-space:pre-line;"></p>
+            <div id="declare-confirm-raid" style="display:none;margin-top:12px;border:1px solid var(--accent);border-radius:6px;padding:10px;">
+                <p id="declare-confirm-raid-text" class="text-muted" style="white-space:pre-line;margin:0 0 8px;"></p>
+                <label style="display:flex;align-items:center;gap:8px;">
+                    <input type="checkbox" id="declare-confirm-wipe-raid" checked>
+                    <span>confirm DESTROY RAID metadata on this disk</span>
+                </label>
+            </div>
+            <div class="modal-actions" style="margin-top:16px">
+                <button class="btn btn-danger" id="declare-confirm-ok">Wipe &amp; Format</button>
+                <button class="btn btn-secondary" onclick="hideDeclareConfirm()">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -344,15 +390,18 @@ function refreshBackupHistory() {
 // ── ZFS data backup ──────────────────────────────────────────────────
 let backupDisks = [];
 let backupDatasets = [];
-let diskCandidates = [];
+let allDisks = [];
+let diskPartitions = {};
+let usedDisks = [];
 
 document.addEventListener('DOMContentLoaded', function() {
     loadZfsBackup();
 });
 
 async function loadZfsBackup() {
+    // The dataset panel renders backup-disk options, so disks must load first.
+    await loadBackupDisks();
     await Promise.all([
-        loadBackupDisks(),
         loadBackupDatasets(),
         loadBackupRuns()
     ]);
@@ -367,14 +416,53 @@ function formatBytes(n) {
     return v.toFixed(1) + ' ' + units[i];
 }
 
+async function refreshDiskInventory() {
+    usedDisks = await api.backupDiskUsed();
+    allDisks = await api.getDisks();
+    diskPartitions = {};
+    for (const disk of allDisks) {
+        try {
+            const info = await api.getDiskPartitions(disk.id);
+            diskPartitions[disk.id] = info.partitions;
+        } catch (e) {
+            diskPartitions[disk.id] = [];
+        }
+    }
+}
+
 async function loadBackupDisks() {
     try {
         backupDisks = await api.listBackupDisks();
-        diskCandidates = await api.backupDiskCandidates();
+        await refreshDiskInventory();
         renderBackupDisks();
+        renderBackupDatasets();
     } catch (e) {
         showError('backup-disks', 'Failed to load backup disks');
     }
+}
+
+const BACKUP_STATUS_LABELS = {
+    mounted: 'Mounted',
+    unmounted: 'Unmounted',
+    full: 'Full',
+    offline: 'Not connected',
+    mismatch: 'Filesystem changed',
+};
+const BACKUP_STATUS_TIPS = {
+    mounted: 'Plugged in and mounted',
+    unmounted: 'Plugged in, not mounted',
+    full: 'Mounted but the disk is full',
+    offline: 'No device detected. Try Wake / Replug; if the enclosure is fitted but off, power-cycle it.',
+    mismatch: 'A device is present but its filesystem UUID differs from what was declared. Re-scan or re-declare.',
+};
+
+function backupStatusBadge(status) {
+    const cls = status === 'mounted' ? 'status-online'
+        : (status === 'full' ? 'status-warning'
+        : (status === 'unmounted' ? 'status-unknown'
+        : (status === 'mismatch' ? 'status-warning'
+        : 'status-unknown')));
+    return `<span class="${cls}" title="${BACKUP_STATUS_TIPS[status] || ''}">${BACKUP_STATUS_LABELS[status] || status}</span>`;
 }
 
 function renderBackupDisks() {
@@ -383,23 +471,26 @@ function renderBackupDisks() {
         c.innerHTML = createEmptyState('No backup disks declared yet.');
         return;
     }
+    const offline = (d) => d.status === 'offline' || d.status === 'mismatch';
     c.innerHTML = `
         <table class="data-table">
             <thead><tr>
-                <th>Device</th><th>FS</th><th>Capacity</th><th>Free</th>
-                <th>Status</th><th>Actions</th>
+                <th>Label</th><th>FS</th><th>Capacity</th><th>Free</th>
+                <th>Status</th><th>Unmount after backup</th><th>Actions</th>
             </tr></thead>
             <tbody>
                 ${backupDisks.map(d => {
                     const pct = d.total_bytes ? Math.round((d.free_bytes / d.total_bytes) * 100) : 0;
                     return `<tr>
-                        <td><code>${d.device_path.split('/').pop()}</code></td>
+                        <td title="${d.device_path}">${d.label ? d.label : '<span class="text-muted">—</span>'}</td>
                         <td>${d.fs_type}</td>
                         <td>${formatBytes(d.total_bytes)}</td>
                         <td>${formatBytes(d.free_bytes)} (${pct}%)</td>
-                        <td><span class="status-${d.status === 'mounted' ? 'online' : 'degraded'}">${d.status}</span></td>
+                        <td>${backupStatusBadge(d.status)}</td>
+                        <td><input type="checkbox" ${d.unmount_after_backup ? 'checked' : ''} onchange="setUnmountAfter(${d.id}, this.checked)"></td>
                         <td>
-                            <button class="btn btn-secondary btn-sm" onclick="toggleMount(${d.id})">${d.status === 'mounted' ? 'Unmount' : 'Mount'}</button>
+                            <button class="btn btn-secondary btn-sm" onclick="toggleMount(${d.id})" ${offline(d) ? 'disabled title="Disk is not present"' : ''}>${d.status === 'mounted' ? 'Unmount' : 'Mount'}</button>
+                            <button class="btn btn-secondary btn-sm" onclick="wakeDisk(${d.id})" ${offline(d) ? '' : 'disabled title="Disk is present; nothing to wake"'} title="Software wake/replug: force a sleeping or dropped USB disk to re-enumerate, no power cycle needed">Wake / Replug</button>
                             <button class="btn btn-secondary btn-sm" onclick="scanDisk(${d.id})">Scan</button>
                             <button class="btn btn-danger btn-sm" onclick="removeBackupDisk(${d.id})">Remove</button>
                         </td>
@@ -420,12 +511,33 @@ async function toggleMount(id) {
     }
 }
 
+async function setUnmountAfter(id, enabled) {
+    try {
+        await api.updateBackupDisk(id, { unmount_after_backup: enabled });
+        await loadBackupDisks();
+    } catch (e) {
+        showAlert('Failed to update setting: ' + e.message, 'error');
+    }
+}
+
 async function scanDisk(id) {
     try {
         await api.scanBackupDisk(id);
         await loadBackupDisks();
     } catch (e) {
         showAlert('Scan failed: ' + e.message, 'error');
+    }
+}
+
+async function wakeDisk(id) {
+    showAlert('Wake / Replug: forcing the disk to re-enumerate…', 'info');
+    try {
+        await api.wakeBackupDisk(id);
+        showAlert('Backup disk woken successfully', 'success');
+    } catch (e) {
+        showAlert('Could not wake disk: ' + e.message, 'error');
+    } finally {
+        await loadBackupDisks();
     }
 }
 
@@ -439,32 +551,113 @@ async function removeBackupDisk(id) {
     }
 }
 
-function openDeclareDisk() {
-    if (diskCandidates.length === 0) {
+async function openDeclareDisk() {
+    // Refresh so a freshly plugged-in (unclaimed) disk appears in the picker.
+    try {
+        await refreshDiskInventory();
+    } catch (e) {
+        showAlert('Could not refresh disk inventory: ' + e.message, 'error');
+        return;
+    }
+    const available = allDisks.filter(d => d.status !== 'dead' && !d.is_os_disk);
+    if (available.length === 0) {
         showAlert('No disks available to declare as a backup disk (all in use or OS disks).', 'error');
         return;
     }
-    const sel = diskCandidates.map(d =>
-        `<option value="${d.id}">${d.device_name} (${d.model || d.serial || ''}, ${formatBytes(d.size_bytes)})</option>`
-    ).join('');
-    const confirmed = confirm(
-        'Declare a disk as ZFS backup target?\n\nIt will be WIPED and formatted as ext4.\n\nChoose disk:'
-        + '\n\n' + diskCandidates.map(d => ` - ${d.device_name} (${d.model || d.serial || ''}, ${formatBytes(d.size_bytes)})`).join('\n')
-    );
-    if (!confirmed) return;
-    const idStr = prompt('Enter the disk ID to declare (from the list above):');
-    const id = parseInt(idStr, 10);
-    if (!id || !diskCandidates.find(d => d.id === id)) {
-        showAlert('Invalid disk id', 'error');
-        return;
+
+    const disabledWhole = new Set();
+    const disabledPartitions = {};
+    for (const d of usedDisks) {
+        if (d.slot_uuid) {
+            if (!disabledPartitions[d.disk_id]) disabledPartitions[d.disk_id] = new Set();
+            disabledPartitions[d.disk_id].add(d.slot_uuid);
+        } else {
+            disabledWhole.add(String(d.disk_id));
+        }
     }
-    if (!confirm('REALLY wipe and format this disk as the backup target?')) return;
-    declareDisk(id);
+
+    DevicePicker.render(document.getElementById('declare-disk-list'), {
+        disks: allDisks,
+        partitionsByDisk: diskPartitions,
+        single: true,
+        excludeOsDisks: true,
+        alwaysAllowWholeDisk: true,
+        hideUsed: true,
+        disabledWhole,
+        disabledPartitions,
+    });
+
+    document.getElementById('declare-disk-label').value = '';
+    document.getElementById('declare-disk-modal').style.display = 'flex';
 }
 
-async function declareDisk(id) {
+function clearDeclareSelection() {
+    DevicePicker.clear(document.getElementById('declare-disk-list'));
+}
+
+function hideDeclareDisk() {
+    document.getElementById('declare-disk-modal').style.display = 'none';
+    document.getElementById('declare-disk-list').innerHTML = '';
+}
+
+function hideDeclareConfirm() {
+    document.getElementById('declare-confirm-modal').style.display = 'none';
+}
+
+async function confirmDeclareDisk() {
+    const keys = DevicePicker.selectedKeys(document.getElementById('declare-disk-list'));
+    if (keys.length === 0) {
+        showAlert('Select a disk or partition to declare', 'error');
+        return;
+    }
+    const key = keys[0];
+    const [diskId, slotUuid] = key.split(':');
+    const label = document.getElementById('declare-disk-label').value.trim();
+    const disk = allDisks.find(d => d.id === parseInt(diskId, 10));
+    const id = parseInt(diskId, 10);
+    const warning = slotUuid
+        ? 'The selected partition will be wiped and formatted.'
+        : 'This will destroy ALL partitions and data on the ENTIRE disk and format it.';
+    const target = slotUuid
+        ? `${disk.device_name} partition ${(diskPartitions[id] || []).find(p => p.slot_uuid === slotUuid)?.number || '?'}`
+        : `${disk.device_name} (ENTIRE disk)`;
+    hideDeclareDisk();
+
+    const raidLines = [];
     try {
-        await api.declareBackupDisk(id, true);
+        const info = await api.backupDiskRaidInfo(id, slotUuid || null);
+        for (const md of info.md || []) {
+            raidLines.push(
+                `${md.device} is part of Software RAID${md.name ? ' array ' + md.name : ''}`
+                + (md.version ? ` · version ${md.version}` : '')
+                + (md.os_backing ? ' — part of the OS, must be handled manually' : '')
+            );
+        }
+    } catch (e) {
+        // The raid probe is best-effort; the backend re-checks at declare time.
+    }
+
+    const raidDiv = document.getElementById('declare-confirm-raid');
+    if (raidLines.length) {
+        document.getElementById('declare-confirm-raid-text').textContent =
+            raidLines.join('\n') + '\n\nIf confirmed, NAZMan will stop the array and wipe its RAID metadata.';
+        raidDiv.style.display = 'block';
+    } else {
+        raidDiv.style.display = 'none';
+    }
+    document.getElementById('declare-confirm-message').textContent =
+        `Wipe and format ${target} as the backup target?\n\n${warning}`;
+    document.getElementById('declare-confirm-ok').onclick = () => {
+        const wipeRaid = document.getElementById('declare-confirm-wipe-raid').checked;
+        hideDeclareConfirm();
+        declareDisk(id, slotUuid || null, label || null, wipeRaid);
+    };
+    document.getElementById('declare-confirm-modal').style.display = 'flex';
+}
+
+async function declareDisk(id, slotUuid, label, wipeRaid) {
+    try {
+        await api.declareBackupDisk(id, true, slotUuid, label, wipeRaid);
         showAlert('Backup disk declared and formatted', 'success');
         await loadZfsBackup();
     } catch (e) {
@@ -481,77 +674,131 @@ async function loadBackupDatasets() {
     }
 }
 
+let activeRuns = new Set();
+
+function scheduleRunBadge(status) {
+    if (status === 'running') return '<span class="status-running">running…</span>';
+    if (status === 'success') return '<span class="status-online">last OK</span>';
+    if (status === 'failed') return '<span class="status-faulted">last failed</span>';
+    return '<span class="status-unknown">no runs yet</span>';
+}
+
 function renderBackupDatasets() {
     const c = document.getElementById('dataset-backup');
     if (backupDatasets.length === 0) {
         c.innerHTML = createEmptyState('No datasets found.');
         return;
     }
-    const diskOpts = backupDisks.map(d =>
-        `<option value="${d.id}">${d.device_path.split('/').pop()}</option>`).join('') || '<option value="">No backup disks</option>';
+    const diskName = (d) => d.label || d.device_path.split('/').pop();
+    const noDisks = backupDisks.length === 0;
 
     c.innerHTML = `
         <table class="data-table">
             <thead><tr>
-                <th>Dataset</th><th>Backup Disk</th><th>Full Cron</th><th>Incr Cron</th>
-                <th>Changed since full</th><th>Actions</th>
+                <th>Dataset</th><th>Backup disks &amp; schedules</th>
+                <th>Changed since full</th><th>Last backup</th>
             </tr></thead>
             <tbody>
-                ${backupDatasets.map(ds => `
-                    <tr>
+                ${backupDatasets.map(ds => {
+                    const scheds = ds.schedules || [];
+                    const busy = (diskId) => activeRuns.has(ds.name + '/' + diskId);
+                    const assigned = new Set(scheds.map(s => s.backup_disk_id));
+                    const addOpts = backupDisks.filter(d => !assigned.has(d.id))
+                        .map(d => `<option value="${d.id}" title="${d.device_path}">${diskName(d)}</option>`).join('');
+                    const blocks = scheds.length ? scheds.map(s => {
+                        const diskId = s.backup_disk_id;
+                        const running = busy(diskId);
+                        const btn = (t, title) => `<button class="btn btn-${t === 'full' ? 'primary' : 'secondary'} btn-sm" ${running ? 'disabled' : ''} title="${title}" onclick="runDataset('${ds.name}', ${diskId}, '${t}')">${t === 'full' ? 'Full' : 'Incr'}</button>`;
+                        return `<div class="sched-block">
+                            <div class="sched-head">
+                                <strong>${s.label}</strong>
+                                ${running ? '<span class="status-running">running…</span>' : scheduleRunBadge(s.last_status)}
+                            </div>
+                            <div class="sched-crons">
+                                <input id="fc-${ds.name}-${diskId}" class="form-control" placeholder="Full cron e.g. 0 2 * * 0" value="${s.full_cron || ''}" title="Full backup cron schedule">
+                                <input id="ic-${ds.name}-${diskId}" class="form-control" placeholder="Incr cron e.g. 0 3 * * *" value="${s.incremental_cron || ''}" title="Incremental backup cron schedule">
+                            </div>
+                            <div class="sched-actions">
+                                ${btn('full', 'Run a full backup of this dataset to this disk now (full snapshot-stream, resets the incremental chain)')}
+                                ${btn('incremental', 'Run an incremental backup of this dataset to this disk now (only changes since the last anchor)')}
+                                <button class="btn btn-secondary btn-sm" title="Save or update this disk's full/incremental cron schedule" onclick="saveSchedule('${ds.name}', ${diskId})">Save</button>
+                                <button class="btn btn-danger btn-sm" title="Delete this dataset's backup schedule on this disk (existing backup runs are kept)" onclick="removeSchedule('${ds.name}', ${diskId})">Remove</button>
+                            </div>
+                        </div>`;
+                    }).join('') : '<div class="text-muted">No backup disk assigned yet.</div>';
+
+                    const addControl = noDisks || !addOpts ? '' :
+                        `<div class="sched-add">
+                            <select id="newdisk-${ds.name}" class="form-control" title="Add another backup disk for grandfather-father-son retention">${addOpts}</select>
+                            <button class="btn btn-secondary btn-sm" title="Back up this dataset to an additional disk" onclick="addDiskSchedule('${ds.name}')">Add another disk</button>
+                        </div>`;
+
+                    return `<tr>
                         <td><code>${ds.name}</code></td>
-                        <td>
-                            <select id="bd-${ds.name}" class="form-control">${diskOpts}</select>
-                        </td>
-                        <td><input id="fc-${ds.name}" class="form-control" placeholder="e.g. 0 2 * * 0" value="${ds.full_cron || ''}"></td>
-                        <td><input id="ic-${ds.name}" class="form-control" placeholder="e.g. 0 3 * * *" value="${ds.incremental_cron || ''}"></td>
-                        <td>${formatBytes(ds.changed_since_full)} <small class="text-muted">(${ds.full_runs || 0} fulls; ${ds.last_type || '-'}/${ds.last_status || '-'})</small></td>
-                        <td style="white-space:nowrap;">
-                            <button class="btn btn-primary btn-sm" onclick="runDataset('${ds.name}', 'full')">Full</button>
-                            <button class="btn btn-secondary btn-sm" onclick="runDataset('${ds.name}', 'incremental')">Incr</button>
-                            <button class="btn btn-secondary btn-sm" onclick="saveSchedule('${ds.name}')">Save Sched</button>
-                            <button class="btn btn-danger btn-sm" onclick="removeSchedule('${ds.name}')">Remove Sched</button>
-                        </td>
-                    </tr>`
-                ).join('')}
+                        <td>${blocks}${addControl}</td>
+                        <td>${formatBytes(ds.changed_since_full)} <small class="text-muted">(${ds.full_runs || 0} backups)</small></td>
+                        <td>${scheduleRunBadge(ds.last_status)} <small class="text-muted">${ds.last_type || '-'} ${formatDate(ds.last_completed_at)}</small></td>
+                    </tr>`;
+                }).join('')}
             </tbody>
         </table>`;
 }
 
-async function runDataset(name, type) {
-    const bd = document.getElementById('bd-' + name).value;
-    if (!bd) { showAlert('Select a backup disk first', 'error'); return; }
+async function runDataset(name, diskId, type) {
+    if (!diskId) { showAlert('Select a backup disk first', 'error'); return; }
+    const key = name + '/' + diskId;
+    activeRuns.add(key);
+    renderBackupDatasets();
     try {
-        showAlert(`Starting ${type} backup...`, 'info');
-        await api.runBackup(name, parseInt(bd, 10), type);
-        showAlert(`${type} backup complete`, 'success');
-        await loadZfsBackup();
+        await api.runBackup(name, diskId, type);
+        showAlert(`${type} backup to disk ${diskId} complete`, 'success');
     } catch (e) {
         showAlert(`Backup failed: ${e.message}`, 'error');
-        await loadBackupRuns();
+    } finally {
+        activeRuns.delete(key);
+        await loadZfsBackup();
     }
 }
 
-async function saveSchedule(name) {
-    const bd = document.getElementById('bd-' + name).value;
-    const fc = document.getElementById('fc-' + name).value;
-    const ic = document.getElementById('ic-' + name).value;
-    if (!bd) { showAlert('Select a backup disk', 'error'); return; }
+async function addDiskSchedule(name) {
+    const select = document.getElementById('newdisk-' + name);
+    const diskId = parseInt(select.value, 10);
+    if (!diskId) { showAlert('No backup disk selected', 'error'); return; }
+    if ((backupDatasets.find(d => d.name === name).schedules || []).some(s => s.backup_disk_id === diskId)) {
+        showAlert('This dataset is already scheduled on that disk', 'error');
+        return;
+    }
     try {
         await api.upsertBackupSchedule({
-            dataset_name: name, backup_disk_id: parseInt(bd, 10),
+            dataset_name: name, backup_disk_id: diskId,
+            full_cron: null, incremental_cron: null, enabled: true
+        });
+        showAlert('Backup disk added for dataset', 'success');
+        await loadBackupDatasets();
+    } catch (e) {
+        showAlert('Could not add backup disk: ' + e.message, 'error');
+    }
+}
+
+async function saveSchedule(name, diskId) {
+    const fc = document.getElementById('fc-' + name + '-' + diskId).value;
+    const ic = document.getElementById('ic-' + name + '-' + diskId).value;
+    try {
+        await api.upsertBackupSchedule({
+            dataset_name: name, backup_disk_id: diskId,
             full_cron: fc || null, incremental_cron: ic || null, enabled: true
         });
         showAlert('Schedule saved', 'success');
+        await loadBackupDatasets();
     } catch (e) {
         showAlert('Schedule save failed: ' + e.message, 'error');
     }
 }
 
-async function removeSchedule(name) {
-    if (!confirm('Remove the backup schedule for this dataset?')) return;
+async function removeSchedule(name, diskId) {
+    if (!confirm('Remove the backup schedule for this dataset on this disk? (Existing backup runs are kept)')) return;
     try {
-        await api.deleteBackupSchedule(name);
+        await api.deleteBackupSchedule(name, diskId);
         showAlert('Schedule removed', 'success');
         await loadBackupDatasets();
     } catch (e) {
@@ -563,9 +810,35 @@ async function loadBackupRuns() {
     try {
         const runs = await api.listBackupRuns();
         renderBackupRuns(runs);
+        // Keep polling while any run is in progress so the running→success
+        // transition (scheduled or manual) shows up without a manual reload.
+        if (runs.some(r => r.status === 'running')) {
+            scheduleRunsPoll();
+        }
     } catch (e) {
         showError('backup-runs', 'Failed to load backup runs');
     }
+}
+
+let runsPollTimer = null;
+function scheduleRunsPoll() {
+    if (runsPollTimer) return;
+    runsPollTimer = setTimeout(async () => {
+        runsPollTimer = null;
+        const runs = await api.listBackupRuns().catch(() => []);
+        renderBackupRuns(runs);
+        if (runs.some(r => r.status === 'running')) {
+            scheduleRunsPoll();
+        } else {
+            await loadBackupDatasets();
+        }
+    }, 5000);
+}
+
+function runStatusBadge(status) {
+    if (status === 'success') return '<span class="status-online">success</span>';
+    if (status === 'running') return '<span class="status-running">running</span>';
+    return `<span class="status-faulted">${status}</span>`;
 }
 
 function renderBackupRuns(runs) {
@@ -585,12 +858,12 @@ function renderBackupRuns(runs) {
                     <tr>
                         <td><code>${r.dataset_name}</code></td>
                         <td><span class="badge">${r.backup_type}</span></td>
-                        <td><span class="status-${r.status === 'success' ? 'online' : 'faulted'}">${r.status}</span></td>
+                        <td title="${r.error || ''}">${runStatusBadge(r.status)}</td>
                         <td>${formatBytes(r.size_bytes)}</td>
                         <td>${formatBytes(r.changed_bytes)}</td>
                         <td><code title="${r.stream_file}">${r.snapshot}</code></td>
                         <td>${formatDate(r.completed_at || r.started_at)}</td>
-                        <td><button class="btn btn-danger btn-sm" onclick="restoreRun(${r.id}, '${r.dataset_name}')">Restore</button></td>
+                        <td>${r.status === 'running' ? '<span class="text-muted">—</span>' : `<button class="btn btn-danger btn-sm" onclick="restoreRun(${r.id}, '${r.dataset_name}')">Restore</button>`}</td>
                     </tr>`
                 ).join('')}
             </tbody>

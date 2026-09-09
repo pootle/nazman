@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
 import psutil
+import asyncio
 
 from ..database import get_db
 from ..auth import get_current_user
@@ -18,24 +21,66 @@ from ..managers.metrics_manager import (
     normalize_base_name,
 )
 
-router = APIRouter(prefix="/api/system", tags=["system"])
+router = APIRouter(prefix="/api/system", tags=["system"], dependencies=[Depends(get_current_user)])
 
 
-@router.get("/status")
+class SystemInfo(BaseModel):
+    cpu_percent: float
+    memory: Dict[str, Any]
+    disk: Dict[str, Any]
+
+
+class StorageInfo(BaseModel):
+    pool_count: int
+    disk_count: int
+
+
+class SystemStatusResponse(BaseModel):
+    timestamp: str
+    system: SystemInfo
+    storage: StorageInfo
+
+
+class CommandLogEntry(BaseModel):
+    ts: str
+    command: str
+    status: str
+    op: Optional[str] = None
+    category: Optional[str] = None
+    returncode: Optional[int] = None
+    stderr: Optional[str] = None
+    duration_ms: Optional[int] = None
+
+
+class CommandLogResponse(BaseModel):
+    entries: List[CommandLogEntry]
+    size: int
+    total: int
+
+# Health check is unauthenticated for load balancers/monitors
+health_router = APIRouter(tags=["system"])
+
+@health_router.get("/api/system/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@router.get("/status", response_model=SystemStatusResponse)
 async def get_system_status(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get system status overview."""
     try:
-        # Get CPU usage
-        cpu_percent = psutil.cpu_percent(interval=1)
+        # Get CPU usage (blocking call with interval=1)
+        cpu_percent = await asyncio.to_thread(psutil.cpu_percent, interval=1)
         
         # Get memory usage
-        memory = psutil.virtual_memory()
+        memory = await asyncio.to_thread(psutil.virtual_memory)
         
         # Get disk usage for OS partition
-        disk_usage = psutil.disk_usage('/')
+        disk_usage = await asyncio.to_thread(psutil.disk_usage, '/')
         
         # Get pool status
         pools = await zfs_manager.list_pools(db)
@@ -43,35 +88,35 @@ async def get_system_status(
         # Get disk count
         disks = await disk_manager.sync_disks_to_database(db)
         
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "system": {
-                "cpu_percent": cpu_percent,
-                "memory": {
+        return SystemStatusResponse(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            system=SystemInfo(
+                cpu_percent=cpu_percent,
+                memory={
                     "total": memory.total,
                     "available": memory.available,
                     "percent": memory.percent
                 },
-                "disk": {
+                disk={
                     "total": disk_usage.total,
                     "used": disk_usage.used,
                     "free": disk_usage.free,
                     "percent": disk_usage.percent
                 }
-            },
-            "storage": {
-                "pool_count": len(pools),
-                "disk_count": len(disks)
-            }
-        }
+            ),
+            storage=StorageInfo(
+                pool_count=len(pools),
+                disk_count=len(disks)
+            )
+        )
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/metrics")
 async def get_system_metrics(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Metrics for dashboard graphs: full recorded history + current values."""
     try:
@@ -114,7 +159,7 @@ async def get_system_metrics(
             except Exception:
                 pools_map[pool.name] = []
 
-        memory = psutil.virtual_memory()
+        memory = await asyncio.to_thread(psutil.virtual_memory)
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -138,7 +183,7 @@ async def get_system_metrics(
         return {"error": str(e)}
 
 
-@router.get("/command-log")
+@router.get("/command-log", response_model=CommandLogResponse)
 async def get_command_log(
     type: str | None = Query(
         None,
@@ -148,7 +193,7 @@ async def get_command_log(
         None,
         description="Filter by outcome status: success, failed, timeout, error. Comma-separated to combine.",
     ),
-    current_user: dict = Depends(get_current_user),
+
 ):
     """Return recent command executions (newest first).
 
@@ -189,14 +234,8 @@ async def get_command_log(
         limit=settings.command_log_size,
     )
 
-    return {
-        "entries": entries,
-        "size": settings.command_log_size,
-        "total": command_log_store.raw_count,
-    }
-
-
-@router.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return CommandLogResponse(
+        entries=entries,
+        size=settings.command_log_size,
+        total=command_log_store.raw_count,
+    )

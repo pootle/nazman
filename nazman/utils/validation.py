@@ -45,6 +45,40 @@ def validate_dataset_name(name: str) -> str:
     return name.lower()
 
 
+def validate_snapshot_component(name: str) -> str:
+    """Validate the part of a snapshot name after the '@'."""
+    if not name:
+        raise ValidationError("Snapshot name cannot be empty")
+
+    if len(name) > 256:
+        raise ValidationError("Snapshot name too long (max 256 characters)")
+
+    if not re.match(r'^[a-zA-Z0-9._:-]+$', name):
+        raise ValidationError(
+            "Snapshot name can only contain letters, numbers, hyphens, underscores, periods, and colons"
+        )
+
+    return name
+
+
+def validate_snapshot_name(name: str) -> str:
+    """Validate a full snapshot name of the form dataset@snapshot.
+
+    Rejecting anything without exactly one '@' is what stops a snapshot
+    endpoint from ever being pointed at a dataset.
+    """
+    if not name:
+        raise ValidationError("Snapshot name cannot be empty")
+
+    if name.count('@') != 1:
+        raise ValidationError("Snapshot name must be of the form dataset@snapshot")
+
+    dataset, snap = name.split('@', 1)
+    validate_dataset_name(dataset)
+    validate_snapshot_component(snap)
+    return name
+
+
 def validate_device_path(path: str) -> str:
     """Validate device path."""
     if not path:

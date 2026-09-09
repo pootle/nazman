@@ -4,7 +4,7 @@ from unittest.mock import patch, AsyncMock
 
 @pytest.mark.asyncio
 async def test_list_snapshots_empty(client):
-    with patch("nazman.api.snapshots.zfs_manager") as mock:
+    with patch("nazman.api.snapshots.snapshot_manager") as mock:
         mock.list_snapshots = AsyncMock(return_value=[])
         response = client.get("/api/snapshots/")
         assert response.status_code == 200
@@ -13,7 +13,7 @@ async def test_list_snapshots_empty(client):
 
 @pytest.mark.asyncio
 async def test_list_snapshots(client):
-    with patch("nazman.api.snapshots.zfs_manager") as mock:
+    with patch("nazman.api.snapshots.snapshot_manager") as mock:
         mock.list_snapshots = AsyncMock(return_value=[{
             "name": "testpool/data@auto-20240115",
             "dataset_name": "testpool/data",
@@ -32,7 +32,7 @@ async def test_list_snapshots(client):
 
 @pytest.mark.asyncio
 async def test_create_snapshot(client):
-    with patch("nazman.api.snapshots.zfs_manager") as mock:
+    with patch("nazman.api.snapshots.snapshot_manager") as mock:
         mock.create_snapshot = AsyncMock(return_value={
             "name": "testpool/data@daily-001",
             "dataset_name": "testpool/data",
@@ -49,8 +49,17 @@ async def test_create_snapshot(client):
 
 @pytest.mark.asyncio
 async def test_destroy_snapshot(client):
-    with patch("nazman.api.snapshots.zfs_manager") as mock:
+    with patch("nazman.api.snapshots.snapshot_manager") as mock:
         mock.destroy_snapshot = AsyncMock(return_value=None)
         response = client.delete("/api/snapshots/testpool/data@daily-001")
         assert response.status_code == 200
         assert "destroyed" in response.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_destroy_snapshot_requires_at_sign(client):
+    with patch("nazman.managers.snapshot_manager.run_zfs", new_callable=AsyncMock) as mock_zfs:
+        response = client.delete("/api/snapshots/testpool/data")
+    assert response.status_code == 400
+    assert "must be of the form" in response.json()["detail"]
+    mock_zfs.assert_not_called()

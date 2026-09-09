@@ -10,7 +10,7 @@ from .utils.exceptions import NAZManError
 from .api import (
     disks_router, pools_router, datasets_router,
     nfs_router, smb_router, snapshots_router, backup_router, zfs_backup_router,
-    system_router, metrics_router, auth_router,
+    system_router, health_router, metrics_router, auth_router,
 )
 
 # Get application settings
@@ -82,6 +82,7 @@ templates = Jinja2Templates(directory=str(templates_path))
 
 # Include API routers
 app.include_router(system_router)
+app.include_router(health_router)
 app.include_router(disks_router)
 app.include_router(pools_router)
 app.include_router(datasets_router)

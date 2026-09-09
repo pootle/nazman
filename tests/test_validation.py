@@ -2,6 +2,8 @@ import pytest
 from nazman.utils.validation import (
     validate_pool_name,
     validate_dataset_name,
+    validate_snapshot_name,
+    validate_snapshot_component,
     validate_device_path,
     validate_ip_cidr,
     validate_size_string,
@@ -56,6 +58,47 @@ class TestValidateDatasetName:
 
     def test_returns_lowercase(self):
         assert validate_dataset_name("Data/Sub") == "data/sub"
+
+
+class TestValidateSnapshotName:
+    def test_valid_snapshot_name(self):
+        assert validate_snapshot_name("tank/data@snap1") == "tank/data@snap1"
+        assert validate_snapshot_name("pool/ds/sub@backup-20260901") == "pool/ds/sub@backup-20260901"
+
+    def test_missing_at_sign(self):
+        with pytest.raises(ValidationError, match="must be of the form"):
+            validate_snapshot_name("tank/data")
+
+    def test_multiple_at_signs(self):
+        with pytest.raises(ValidationError, match="must be of the form"):
+            validate_snapshot_name("tank@data@snap")
+
+    def test_empty_name(self):
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            validate_snapshot_name("")
+
+    def test_invalid_dataset_part(self):
+        with pytest.raises(ValidationError, match="only contain"):
+            validate_snapshot_name("tank/data name@snap")
+
+    def test_invalid_snapshot_part(self):
+        with pytest.raises(ValidationError, match="only contain"):
+            validate_snapshot_name("tank/data@snap name")
+
+
+class TestValidateSnapshotComponent:
+    def test_valid_component(self):
+        assert validate_snapshot_component("snap1") == "snap1"
+        assert validate_snapshot_component("backup-20260901-120000") == "backup-20260901-120000"
+        assert validate_snapshot_component("auto-daily") == "auto-daily"
+
+    def test_empty_component(self):
+        with pytest.raises(ValidationError, match="cannot be empty"):
+            validate_snapshot_component("")
+
+    def test_invalid_characters(self):
+        with pytest.raises(ValidationError, match="only contain"):
+            validate_snapshot_component("snap name")
 
 
 class TestValidateDevicePath:

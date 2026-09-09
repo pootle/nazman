@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
 
 from ..database import get_db
 from ..auth import get_current_user
 from ..managers import zfs_manager
 from ..models.pool import Pool
 
-router = APIRouter(prefix="/api/pools", tags=["pools"])
+router = APIRouter(prefix="/api/pools", tags=["pools"], dependencies=[Depends(get_current_user)])
 
 
 class DeviceSpec(BaseModel):
@@ -17,16 +17,16 @@ class DeviceSpec(BaseModel):
 
 
 class VdevSpec(BaseModel):
-    role: str  # data, log, cache, special
-    topology: str  # stripe, mirror, raidz1, raidz2, raidz3
+    role: Literal["data", "log", "cache", "special"]
+    topology: Literal["stripe", "mirror", "raidz1", "raidz2", "raidz3"]
     devices: List[DeviceSpec]
-    ashift: Optional[int] = None  # per-vdev ashift; None = inherit global
+    ashift: Optional[int] = Field(default=None, ge=9, le=16)
 
 
 class PoolCreate(BaseModel):
     name: str
     vdevs: List[VdevSpec]
-    ashift: int = 12
+    ashift: int = Field(default=12, ge=9, le=16)
 
 
 class PoolResponse(BaseModel):
@@ -60,7 +60,7 @@ class PoolStatusResponse(BaseModel):
 @router.get("/", response_model=List[PoolResponse])
 async def list_pools(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """List all ZFS pools."""
     return await zfs_manager.list_pools(db)
@@ -69,7 +69,7 @@ async def list_pools(
 @router.get("/{pool_name}", response_model=PoolStatusResponse)
 async def get_pool_status(
     pool_name: str,
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get detailed pool status."""
     return await zfs_manager.get_pool_status(pool_name)
@@ -79,7 +79,7 @@ async def get_pool_status(
 async def create_pool(
     pool: PoolCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Create a new ZFS pool from inline vdev specs."""
     vdev_dicts = [v.model_dump() for v in pool.vdevs]
@@ -94,7 +94,7 @@ async def create_pool(
 @router.post("/{pool_name}/scrub")
 async def start_scrob(
     pool_name: str,
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Start a scrub on a pool."""
     await zfs_manager.scrub_pool(pool_name)
@@ -104,7 +104,7 @@ async def start_scrob(
 @router.post("/{pool_name}/export")
 async def export_pool(
     pool_name: str,
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Export a pool."""
     await zfs_manager.export_pool(pool_name)
@@ -114,7 +114,7 @@ async def export_pool(
 @router.post("/{pool_name}/import")
 async def import_pool(
     pool_name: str,
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Import a pool."""
     await zfs_manager.import_pool(pool_name)
@@ -125,7 +125,7 @@ async def import_pool(
 async def get_pool_destroy_info(
     pool_name: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get info shown in the pool-destroy confirmation (space + NFS impact)."""
     return await zfs_manager.get_pool_destroy_info(db, pool_name)
@@ -135,7 +135,7 @@ async def get_pool_destroy_info(
 async def destroy_pool(
     pool_name: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Destroy a pool (DESTRUCTIVE)."""
     await zfs_manager.destroy_pool(db, pool_name)
@@ -147,7 +147,7 @@ async def remove_device(
     pool_name: str,
     device_path: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Remove a device from a pool."""
     return await zfs_manager.remove_device(

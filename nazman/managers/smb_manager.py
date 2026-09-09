@@ -306,7 +306,7 @@ class SmbManager:
 
     async def delete_share(self, db: Session, dataset_name: str) -> None:
         """Remove the NAZMan-managed SMB share for a dataset."""
-        if not self._dataset_exists(dataset_name):
+        if not await self._dataset_exists(dataset_name):
             raise ValidationError(f"Dataset '{dataset_name}' not found")
         self._rewrite_region(self.conf_path(), remove_dataset=_normalize_dataset_name(dataset_name))
         await self._reload()

@@ -95,18 +95,29 @@ def init_db():
         except Exception:
             conn.rollback()
 
-        # Rebuild backup_schedules/backup_runs from the datasets-FK model to the
-        # dataset_name-string model.  Datasets are now keyed purely by their ZFS
-        # name (the datasets table no longer exists), so there is no surviving id
-        # to backfill from; any existing schedule/run rows are dropped.
+        # disks: serial is the stable identity fallback behind by_id.  Enforce
+        # uniqueness; rows sharing a serial are neutralised to NULL first
+        # (duplicate detection on one disk across NAME changes), keeping the
+        # oldest row so a repeated scan cannot create colliding identity keys.
         try:
-            inspector = inspect(engine)
-            sched_cols = [c["name"] for c in inspector.get_columns("backup_schedules")]
-            runs_cols = [c["name"] for c in inspector.get_columns("backup_runs")]
-            if "dataset_id" in sched_cols or "dataset_id" in runs_cols:
-                conn.execute(text("DROP TABLE IF EXISTS backup_runs"))
-                conn.execute(text("DROP TABLE IF EXISTS backup_schedules"))
-                conn.commit()
+            conn.execute(text(
+                "UPDATE disks SET serial = NULL "
+                "WHERE serial IS NOT NULL AND id NOT IN "
+                "(SELECT MIN(id) FROM disks WHERE serial IS NOT NULL GROUP BY serial)"
+            ))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS disks_serial_uq ON disks(serial)"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
+        # backup tables: the backup-disks model no longer stores device path,
+        # capacity or availability (all derived from `disks` + live probes).
+        # Backup data is not forward-migrated; declared disks are re-declared.
+        # Dropping here means create_all rebuilds them to the current schema.
+        try:
+            for tbl in ("backup_runs", "backup_schedules", "backup_disks"):
+                conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+            conn.commit()
         except Exception:
             conn.rollback()
 

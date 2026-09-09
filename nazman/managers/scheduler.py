@@ -3,31 +3,35 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import logging
 
 from ..models.scheduler import ScheduledTask, TaskHistory, TaskType
 from ..utils.commands import run_zpool, run_zfs
 from ..utils.validation import validate_schedule
 from ..utils.exceptions import NAZManError
 
+logger = logging.getLogger(__name__)
+
 
 class SchedulerManager:
     """Manages scheduled tasks for scrubs, snapshots, etc."""
     
     def __init__(self):
-        self.scheduler = AsyncIOScheduler()
+        self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._started = False
+        self._dataset_locks: Dict[str, Any] = {}
     
     async def start(self):
         """Start the scheduler."""
         if not self._started:
             self.scheduler.start()
             self._started = True
-            # Reload persistent schedule-driven jobs (e.g. ZFS backups) that
-            # are derived from backup_schedules rows.
+            # Reload all persistent tasks from the database
             from ..database import get_db_context
-            from .zfs_backup_manager import zfs_backup_manager
             with get_db_context() as db:
-                await zfs_backup_manager.sync_scheduled_tasks(db)
+                tasks = db.query(ScheduledTask).filter(ScheduledTask.enabled == True).all()
+                for task in tasks:
+                    await self._schedule_task(task)
     
     async def stop(self):
         """Stop the scheduler."""
@@ -120,9 +124,8 @@ class SchedulerManager:
     
     async def run_task_now(self, task_id: int) -> None:
         """Run a task immediately."""
-        # This would trigger the task execution
-        # For now, just log that it was triggered
-        print(f"Task {task_id} triggered manually")
+        logger.info(f"Task {task_id} triggered manually")
+        await self._execute_task(task_id)
     
     async def get_task_history(self, db: Session, task_id: Optional[int] = None) -> List[TaskHistory]:
         """Get task execution history."""
@@ -146,21 +149,24 @@ class SchedulerManager:
                 hour=hour,
                 day=day,
                 month=month,
-                day_of_week=day_of_week
+                day_of_week=day_of_week,
+                timezone=timezone.utc
             )
             
-            # Add job to scheduler
+            # Add job to scheduler with misfire handling
             self.scheduler.add_job(
                 self._execute_task,
                 trigger=trigger,
                 args=[task.id],
                 id=f"task_{task.id}",
                 name=task.name,
-                replace_existing=True
+                replace_existing=True,
+                misfire_grace_time=3600,  # 1 hour grace time for missed runs
+                coalesce=True  # Combine missed runs into one
             )
             
         except Exception as e:
-            print(f"Failed to schedule task {task.id}: {str(e)}")
+            logger.error(f"Failed to schedule task {task.id}: {str(e)}")
     
     async def _unschedule_task(self, task: ScheduledTask) -> None:
         """Remove a task from the scheduler."""
@@ -169,7 +175,7 @@ class SchedulerManager:
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
         except Exception as e:
-            print(f"Failed to unschedule task {task.id}: {str(e)}")
+            logger.error(f"Failed to unschedule task {task.id}: {str(e)}")
     
     async def _execute_task(self, task_id: int) -> None:
         """Execute a scheduled task."""
@@ -244,21 +250,22 @@ class SchedulerManager:
             await self._apply_retention(dataset_name, config["retention"])
     
     async def _apply_retention(self, dataset_name: str, retention: int) -> None:
-        """Apply snapshot retention policy."""
-        # List snapshots for dataset
+        """Apply snapshot retention policy.
+
+        Only destroys snapshots with the ``auto-`` prefix (created by this scheduler).
+        User-created snapshots and ``backup-*`` anchors are never touched.
+        """
         stdout, stderr, returncode = await run_zfs(
-            "list", "-H", "-o", "name", "-t", "snapshot", "-r", dataset_name, op="read",
+            "list", "-H", "-o", "name", "-t", "snapshot", dataset_name, op="read",
         )
-        
+
         if returncode == 0:
             snapshots = [s for s in stdout.strip().split('\n') if s]
-            
-            # Sort by creation time (newest first)
-            snapshots.sort(reverse=True)
-            
-            # Delete old snapshots
-            for snapshot in snapshots[retention:]:
-                await run_zfs("destroy", snapshot, timeout=60)
+            auto_snaps = [s for s in snapshots if f"@auto-" in s]
+            auto_snaps.sort(reverse=True)
+
+            for snapshot in auto_snaps[retention:]:
+                await run_zfs("destroy", snapshot, timeout=60, check=False)
     
     async def _execute_backup(self) -> None:
         """Execute a backup."""
@@ -272,6 +279,7 @@ class SchedulerManager:
         """Execute a ZFS data backup (dataset -> backup disk)."""
         from .zfs_backup_manager import zfs_backup_manager
         from ..database import get_db_context
+        import asyncio
 
         config = config or {}
         dataset_name = config.get("dataset_name")
@@ -280,13 +288,18 @@ class SchedulerManager:
         if not dataset_name or not backup_disk_id:
             raise NAZManError("ZFS backup task requires dataset_name and backup_disk_id")
 
-        with get_db_context() as db:
-            await zfs_backup_manager.run_backup(
-                db,
-                dataset_name=dataset_name,
-                backup_disk_id=backup_disk_id,
-                backup_type=backup_type,
-            )
+        # Per-dataset lock to prevent concurrent backups
+        if dataset_name not in self._dataset_locks:
+            self._dataset_locks[dataset_name] = asyncio.Lock()
+        
+        async with self._dataset_locks[dataset_name]:
+            with get_db_context() as db:
+                await zfs_backup_manager.run_backup(
+                    db,
+                    dataset_name=dataset_name,
+                    backup_disk_id=backup_disk_id,
+                    backup_type=backup_type,
+                )
 
     
     async def _execute_health_check(self, target: str) -> None:
@@ -302,8 +315,9 @@ class SchedulerManager:
         # Parse status and check for errors
         import json
         data = json.loads(stdout)
-        pool_info = data.get("pools", [{}])[0] if data.get("pools") else {}
-        
+        pools = data.get("pools", {})
+        pool_info = pools.get(target, {}) if isinstance(pools, dict) else {}
+
         if pool_info.get("state") != "ONLINE":
             raise NAZManError(f"Pool {target} is not ONLINE: {pool_info.get('state')}")
 

@@ -8,7 +8,7 @@ from ..auth import get_current_user
 from ..managers import backup_manager
 from ..models.backup import BackupCommit
 
-router = APIRouter(prefix="/api/backup", tags=["backup"])
+router = APIRouter(prefix="/api/backup", tags=["backup"], dependencies=[Depends(get_current_user)])
 
 
 class BackupCommitResponse(BaseModel):
@@ -35,7 +35,7 @@ class RestoreRequest(BaseModel):
 
 @router.get("/status", response_model=BackupStatusResponse)
 async def get_backup_status(
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get backup system status."""
     return await backup_manager.get_backup_status()
@@ -45,7 +45,7 @@ async def get_backup_status(
 async def get_backup_history(
     limit: int = 50,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Get backup commit history."""
     return await backup_manager.get_backup_history(db, limit)
@@ -55,7 +55,7 @@ async def get_backup_history(
 async def create_backup(
     message: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Create a new backup."""
     return await backup_manager.backup_configuration(db, message)
@@ -65,7 +65,7 @@ async def create_backup(
 async def restore_backup(
     request: RestoreRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Restore configuration from a specific commit."""
     success = await backup_manager.restore_configuration(db, request.commit_hash)

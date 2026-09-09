@@ -80,9 +80,8 @@ if [[ "$IS_RPI" -eq 1 ]]; then
     fi
 fi
 
-echo "Updating package lists and upgrading installed packages..."
+echo "Updating package lists..."
 apt-get update -y
-apt-get upgrade -y
 
 # On Debian-family (Raspberry Pi OS), ZFS requires DKMS source plus the kernel
 # headers to build the module locally. Install them explicitly before the
@@ -105,6 +104,8 @@ apt-get install -y \
     parted \
     gdisk \
     smartmontools \
+    nvme-cli \
+    sqlite3 \
     git \
     curl \
     wget \

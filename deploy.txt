@@ -18,6 +18,7 @@ nazman/managers/nfs_manager.py
 nazman/managers/backup_manager.py
 nazman/managers/zfs_backup_manager.py
 nazman/managers/scheduler.py
+nazman/managers/snapshot_manager.py
 nazman/managers/metrics_manager.py
 nazman/managers/metrics_store.py
 nazman/managers/smb_manager.py

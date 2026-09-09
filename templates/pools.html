@@ -135,7 +135,6 @@ let allDisks = [];
 let diskPartitions = {};
 
 let pickerVdevId = null;
-let pickerAlreadyUsed = new Set();  // "disk_id" or "disk_id:slot_uuid"
 
 document.addEventListener('DOMContentLoaded', function() {
     loadPoolsPage();
@@ -188,30 +187,30 @@ function renderPools() {
                 <table class="data-table pool-dataset-table">
                     <thead><tr><th>Dataset</th><th>Used</th><th>Referenced</th><th>Mountpoint</th></tr></thead>
                     <tbody>${pool.datasets.map(d => `<tr>
-                        <td><code>${d.name}</code></td>
-                        <td>${d.used || '-'}</td>
-                        <td>${d.referenced || '-'}</td>
-                        <td><small class="text-muted">${d.mountpoint || '-'}</small></td>
+                        <td><code>${escapeHtml(d.name)}</code></td>
+                        <td>${escapeHtml(d.used || '-')}</td>
+                        <td>${escapeHtml(d.referenced || '-')}</td>
+                        <td><small class="text-muted">${escapeHtml(d.mountpoint || '-')}</small></td>
                     </tr>`).join('')}</tbody>
                 </table>
             </div>` : '';
 
         return `
         <div class="pool-card">
-            <h3>${pool.name}</h3>
+            <h3>${escapeHtml(pool.name)}</h3>
             <div class="pool-info">
-                <span class="status status-${pool.status}">${pool.status}</span>
-                <span class="topology">${pool.topology}</span>
+                <span class="status status-${escapeHtml(pool.status)}">${escapeHtml(pool.status)}</span>
+                <span class="topology">${escapeHtml(pool.topology)}</span>
                 ${usable > 0 ? `<span>Usable: ${formatBytes(usable)}</span>` : ''}
                 ${ratioHtml}
             </div>
             ${usageHtml}
             ${datasetHtml}
             <div class="pool-actions">
-                <button class="btn btn-sm btn-secondary" onclick="viewPoolStatus('${pool.name}')">
+                <button class="btn btn-sm btn-secondary" onclick="viewPoolStatus('${escapeHtml(pool.name)}')">
                     <i class="fas fa-info-circle"></i> Details
                 </button>
-                <button class="btn btn-sm btn-danger" onclick="destroyPool('${pool.name}')">
+                <button class="btn btn-sm btn-danger" onclick="destroyPool('${escapeHtml(pool.name)}')">
                     <i class="fas fa-trash"></i> Destroy
                 </button>
             </div>
@@ -224,7 +223,7 @@ function updatePoolSelects() {
     ['scrub-pool-select', 'export-pool-select', 'import-pool-select', 'metric-log-pool-select'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = '<option value="">-- Select Pool --</option>' +
-            pools.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+            pools.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('');
     });
 }
 
@@ -363,74 +362,33 @@ function getUsedDeviceKeys(excludeVdevId) {
 
 function openDevicePicker(vdevId) {
     pickerVdevId = vdevId;
-    pickerAlreadyUsed = getUsedDeviceKeys(vdevId);
+
+    const used = getUsedDeviceKeys(vdevId);
+    const disabledWhole = new Set();
+    const disabledPartitions = {};
+    for (const key of used) {
+        const [diskId, slot] = key.split(':');
+        if (slot) {
+            if (!disabledPartitions[diskId]) disabledPartitions[diskId] = new Set();
+            disabledPartitions[diskId].add(slot);
+        } else {
+            disabledWhole.add(diskId);
+        }
+    }
 
     const block = document.getElementById(`vdev-${vdevId}`);
     const role = block.querySelector('.vdev-role').value;
     document.getElementById('device-picker-title').textContent = `Select Device — ${role}`;
 
-    const container = document.getElementById('device-picker-list');
-    let html = '';
-
-    for (const disk of allDisks) {
-        if (disk.status === 'dead') continue;
-        const parts = diskPartitions[disk.id] || [];
-
-        if (disk.is_os_disk) {
-            // OS disks (e.g. they host the root raid) are only offered as
-            // individual partitions, never as a whole disk.  OS-reserved
-            // partitions (boot/EFI/md members) are disabled.
-            for (const p of parts) {
-                const key = `${disk.id}:${p.slot_uuid}`;
-                const disabled = pickerAlreadyUsed.has(key) || p.reserved;
-                const hint = p.reserved ? ' reserved (OS)' : '';
-                html += `
-                    <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
-                        <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
-                        <span style="flex:1">
-                            ${disk.device_name} <small class="text-muted">p${p.number}</small>
-                            <small class="text-muted" style="margin-left:8px">${formatSize(p.size_bytes)}</small>
-                        </span>
-                        <small class="text-muted">${p.reserved ? hint : p.slot_uuid.substring(0, 8) + '...'}</small>
-                    </label>`;
-            }
-            continue;
-        }
-
-        if (parts.length > 0) {
-            for (const p of parts) {
-                const key = `${disk.id}:${p.slot_uuid}`;
-                const disabled = pickerAlreadyUsed.has(key);
-                html += `
-                    <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
-                        <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
-                        <span style="flex:1">
-                            ${disk.device_name} <small class="text-muted">p${p.number}</small>
-                            <small class="text-muted" style="margin-left:8px">${formatSize(p.size_bytes)}</small>
-                        </span>
-                        <small class="text-muted">${p.slot_uuid.substring(0, 8)}...</small>
-                    </label>`;
-            }
-        } else {
-            const key = `${disk.id}`;
-            const disabled = pickerAlreadyUsed.has(key);
-            html += `
-                <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
-                    <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
-                    <span style="flex:1">
-                        ${disk.device_name}
-                        <small class="text-muted" style="margin-left:8px">${formatSize(disk.size_bytes)} ${disk.disk_type}</small>
-                    </span>
-                    <small class="text-muted">whole disk</small>
-                </label>`;
-        }
-    }
-
-    if (!html) {
-        html = '<p class="empty-state">No available devices. Partition disks first on the Disks page.</p>';
-    }
-
-    container.innerHTML = html;
+    DevicePicker.render(document.getElementById('device-picker-list'), {
+        disks: allDisks,
+        partitionsByDisk: diskPartitions,
+        single: false,
+        excludeOsDisks: false,
+        alwaysAllowWholeDisk: false,
+        disabledWhole,
+        disabledPartitions,
+    });
     document.getElementById('device-picker-modal').style.display = 'flex';
 }
 
@@ -440,7 +398,7 @@ function hideDevicePicker() {
 }
 
 function confirmDevicePicker() {
-    const checked = [...document.querySelectorAll('.device-pick-cb:checked')].map(cb => cb.value);
+    const checked = DevicePicker.selectedKeys(document.getElementById('device-picker-list'));
     if (checked.length === 0) {
         showAlert('Select at least one device', 'error');
         return;

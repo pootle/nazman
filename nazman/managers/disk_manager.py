@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
@@ -580,7 +581,12 @@ class DiskManager:
         if disk.is_os_disk:
             raise DiskError("Cannot wipe OS disk")
 
-        device_path = get_device_path(disk)
+        from .zfs_manager import zfs_manager
+        pool_name = await zfs_manager.is_disk_in_pool(disk.by_id)
+        if pool_name:
+            raise DiskError(f"Disk is a member of pool '{pool_name}'; remove it from the pool first")
+
+        device_path = resolve_by_id(disk.by_id) if disk.by_id else None
         if not device_path:
             raise DiskError(f"Disk {get_device_name(disk) or disk.serial or disk.id} is not currently present")
         method = None
@@ -645,6 +651,148 @@ class DiskManager:
         if device.get("rota") == 0 or "ssd" in model:
             return "ssd"
         return "hdd"
+
+    def _live_device_path(self, disk: Disk, action: str = "this operation") -> str:
+        """Resolve the current ephemeral kernel path for a disk, or raise DiskError."""
+        path = get_device_path(disk)
+        if not path:
+            raise DiskError(
+                f"Disk {get_device_name(disk) or disk.serial or disk.id} is not currently present; cannot {action}"
+            )
+        return path
+
+    async def wipe_disk(self, db: Session, disk_id: int) -> Dict[str, Any]:
+        """Wipe all partition tables from a disk."""
+        from .zfs_manager import zfs_manager
+
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise DiskError(f"Disk with id {disk_id} not found")
+
+        if disk.is_os_disk:
+            raise DiskError("Cannot modify the OS disk")
+
+        pool_name = await zfs_manager.is_disk_in_pool(disk.by_id)
+        if pool_name:
+            raise DiskError(f"Disk is a member of pool '{pool_name}'; remove it from the pool first")
+
+        device_path = self._live_device_path(disk, action="wipe")
+        await run_command(["wipefs", "-a", device_path], timeout=60)
+        await run_command(["parted", "-s", device_path, "mklabel", "gpt"], timeout=60)
+
+        return {"message": f"Wiped partition table from {get_device_name(disk) or disk.model or disk.serial}"}
+
+    async def partition_disk(
+        self, db: Session, disk_id: int, partitions_spec: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Partition a disk. Generates slot UUIDs and writes them to GPT names."""
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise DiskError(f"Disk with id {disk_id} not found")
+
+        if disk.is_os_disk:
+            raise DiskError("Cannot modify the OS disk")
+
+        device_path = self._live_device_path(disk, action="partition")
+
+        await run_command(["wipefs", "-a", device_path], timeout=60)
+        await run_command(["parted", "-s", device_path, "mklabel", "gpt"], timeout=60)
+
+        partition_number = 1
+        current_sector = 2048
+
+        for spec in partitions_spec:
+            size_mb = spec.get("size_mb")
+
+            start_sector = current_sector
+            if size_mb:
+                end_sector = start_sector + (size_mb * 2048)
+            else:
+                end_sector = -1
+
+            if end_sector == -1:
+                await run_command([
+                    "parted", "-s", device_path, "mkpart", "primary",
+                    f"{start_sector}s", "100%"
+                ], timeout=60)
+            else:
+                await run_command([
+                    "parted", "-s", device_path, "mkpart", "primary",
+                    f"{start_sector}s", f"{end_sector}s"
+                ], timeout=60)
+
+            slot_uuid = str(uuid.uuid4())
+            await write_slot_uuid(device_path, partition_number, slot_uuid)
+
+            if end_sector != -1:
+                current_sector = end_sector + 1
+
+            partition_number += 1
+
+        return {"disk_id": disk.id, "device_name": get_device_name(disk) or disk.model or disk.serial, "success": True}
+
+    async def batch_wipe_disks(self, db: Session, disk_ids: List[int]) -> List[Dict[str, Any]]:
+        """Wipe partition tables from multiple disks (no new partitions created)."""
+        results = []
+        for disk_id in disk_ids:
+            disk = db.query(Disk).filter(Disk.id == disk_id).first()
+            if not disk:
+                results.append({"disk_id": disk_id, "success": False, "error": "Disk not found"})
+                continue
+            if disk.is_os_disk:
+                results.append({"disk_id": disk_id, "success": False, "error": "Cannot modify OS disk"})
+                continue
+            try:
+                device_path = self._live_device_path(disk, action="wipe")
+                await run_command(["wipefs", "-a", device_path], timeout=60)
+                await run_command(["parted", "-s", device_path, "mklabel", "gpt"], timeout=60)
+                results.append({"disk_id": disk.id, "device_name": get_device_name(disk) or disk.model or disk.serial, "success": True})
+            except Exception as e:
+                results.append({"disk_id": disk_id, "success": False, "error": str(e)})
+        return results
+
+    async def update_disk(self, db: Session, disk_id: int, updates: Dict[str, Any]) -> Disk:
+        """Update disk fields (status, etc.)."""
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise DiskError(f"Disk with id {disk_id} not found")
+
+        allowed = {"status"}
+        for key, value in updates.items():
+            if key in allowed:
+                setattr(disk, key, value)
+
+        db.commit()
+        db.refresh(disk)
+        return disk
+
+    async def drop_disk(self, db: Session, disk_id: int) -> Dict[str, Any]:
+        """Permanently remove a disk row that is no longer present."""
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise DiskError(f"Disk with id {disk_id} not found")
+
+        if get_device_path(disk):
+            raise DiskError(
+                f"Disk {get_device_name(disk) or disk.serial or disk.id} is currently present; cannot drop it"
+            )
+
+        label = get_device_name(disk) or disk.serial or disk.by_id or disk.id
+        db.query(Disk).filter(Disk.id == disk_id).delete()
+        db.commit()
+        return {"message": f"Dropped disk record for {label}"}
+
+    async def resurrect_disk(self, db: Session, disk_id: int) -> Dict[str, Any]:
+        """Reactivate a dead disk."""
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise DiskError(f"Disk with id {disk_id} not found")
+        if disk.status != "dead":
+            raise DiskError("Disk is not dead")
+        disk.status = "active"
+        db.commit()
+        db.refresh(disk)
+        return {"message": f"Disk {get_device_name(disk) or disk.model or disk.serial} resurrected"}
 
 
 # Singleton instance

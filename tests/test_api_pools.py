@@ -80,6 +80,41 @@ async def test_create_pool(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_create_pool_invalid_topology(client):
+    with patch("nazman.api.pools.zfs_manager") as mock:
+        mock.create_pool = AsyncMock()
+        response = client.post("/api/pools/", json={
+            "name": "newpool",
+            "vdevs": [
+                {"role": "data", "topology": "invalid-topology", "devices": [
+                    {"disk_id": 1},
+                ]},
+            ],
+            "ashift": 12,
+        })
+        assert response.status_code == 422
+        mock.create_pool.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_pool_ashift_out_of_bounds(client):
+    with patch("nazman.api.pools.zfs_manager") as mock:
+        mock.create_pool = AsyncMock()
+        response = client.post("/api/pools/", json={
+            "name": "newpool",
+            "vdevs": [
+                {"role": "data", "topology": "mirror", "devices": [
+                    {"disk_id": 1},
+                    {"disk_id": 2},
+                ]},
+            ],
+            "ashift": 20,
+        })
+        assert response.status_code == 422
+        mock.create_pool.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_scrub_pool(client):
     with patch("nazman.api.pools.zfs_manager") as mock:
         mock.scrub_pool = AsyncMock(return_value=None)

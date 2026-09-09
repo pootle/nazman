@@ -5,9 +5,9 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import zfs_manager
+from ..managers import snapshot_manager
 
-router = APIRouter(prefix="/api/snapshots", tags=["snapshots"])
+router = APIRouter(prefix="/api/snapshots", tags=["snapshots"], dependencies=[Depends(get_current_user)])
 
 
 class SnapshotCreate(BaseModel):
@@ -28,20 +28,20 @@ class SnapshotResponse(BaseModel):
 async def list_snapshots(
     dataset_name: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """List all snapshots from ZFS (live query)."""
-    return await zfs_manager.list_snapshots(db, dataset_name)
+    return await snapshot_manager.list_snapshots(db, dataset_name)
 
 
 @router.post("/", response_model=SnapshotResponse)
 async def create_snapshot(
     snapshot: SnapshotCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Create a new snapshot."""
-    return await zfs_manager.create_snapshot(
+    return await snapshot_manager.create_snapshot(
         db,
         dataset_name=snapshot.dataset_name,
         snapshot_name=snapshot.snapshot_name
@@ -52,8 +52,8 @@ async def create_snapshot(
 async def destroy_snapshot(
     snapshot_name: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+
 ):
     """Destroy a snapshot (DESTRUCTIVE)."""
-    await zfs_manager.destroy_snapshot(db, snapshot_name)
+    await snapshot_manager.destroy_snapshot(db, snapshot_name)
     return {"message": f"Snapshot {snapshot_name} destroyed"}

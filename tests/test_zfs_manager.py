@@ -29,6 +29,32 @@ async def test_get_pool_status_parses_json():
 
 
 @pytest.mark.asyncio
+async def test_get_pool_members_parses_partitioned_by_id_vdevs():
+    """zpool status -j on zfs>=2 reports vdev_type=disk, not type=disk, and
+    partition members hold by-id -partN paths."""
+    status_json = (
+        '{"pools": {"allhdd": {"state": "ONLINE", "vdevs": {"allhdd": '
+        '{"name": "allhdd", "vdev_type": "root", "vdevs": {"raidz1-0": '
+        '{"name": "raidz1-0", "vdev_type": "raidz1", "vdevs": '
+        '{"ata-X": {"name": "ata-X", "vdev_type": "disk", '
+        '"path": "/dev/disk/by-id/ata-X-part1"}, '
+        '"ata-Y": {"name": "ata-Y", "vdev_type": "disk", '
+        '"path": "/dev/disk/by-id/ata-Y-part1"}}}}}}}}}'
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        return (status_json, "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        members = await zfs_manager.get_pool_members()
+
+    assert members == {
+        "/dev/disk/by-id/ata-X-part1": "allhdd",
+        "/dev/disk/by-id/ata-Y-part1": "allhdd",
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_pool_status_root_direct_disks():
     """A simple stripe where the root directly holds bare disks must surface a data vdev."""
     status_json = (

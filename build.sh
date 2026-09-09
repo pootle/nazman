@@ -154,6 +154,9 @@ fi
 "$DEST/venv/bin/pip" install -r "$DEST/requirements.txt"
 
 echo "5/7 Writing default configuration (/etc/nazman/nazman.conf)..."
+if [[ -f /etc/nazman/nazman.conf ]]; then
+    echo "  existing /etc/nazman/nazman.conf found; leaving it unchanged."
+else
 cat > /etc/nazman/nazman.conf << 'EOF'
 # NAZMan configuration (pydantic-settings, flat key = value format)
 
@@ -182,6 +185,12 @@ LOGGING_FILE = /var/log/nazman/nazman.log
 APP_HOST = 0.0.0.0
 APP_PORT = 8080
 EOF
+fi
+# The conf holds the admin password hash and the state dir holds the DB and
+# JWT secret; neither should be world-readable.
+chmod 600 /etc/nazman/nazman.conf
+chmod 700 /var/lib/nazman
+[[ -f /etc/nazman/auth.secret ]] && chmod 600 /etc/nazman/auth.secret
 
 echo "6/7 Creating shared anonymous user/group (nfsanon, 65533) for NFS & SMB..."
 if ! getent group nfsanon &>/dev/null; then
@@ -203,11 +212,26 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/nazman
-ExecStart=/opt/nazman/venv/bin/uvicorn nazman.main:app --host 0.0.0.0 --port 8080
+EnvironmentFile=/etc/nazman/nazman.conf
+ExecStart=/opt/nazman/venv/bin/uvicorn nazman.main:app --host ${APP_HOST:-0.0.0.0} --port ${APP_PORT:-8080}
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+
+# Systemd hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/nazman /var/log/nazman /etc/nazman
+ReadOnlyPaths=/etc/zfs /etc/exports /etc/samba/smb.conf
 
 [Install]
 WantedBy=multi-user.target

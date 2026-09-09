@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Index
 from datetime import datetime, timezone
 from ..database import Base
 
@@ -18,6 +18,9 @@ class Disk(Base):
     """
 
     __tablename__ = "disks"
+    __table_args__ = (
+        Index("disks_serial_uq", "serial", unique=True),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     by_id = Column(String, unique=True, nullable=False, index=True)

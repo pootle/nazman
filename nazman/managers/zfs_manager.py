@@ -14,7 +14,9 @@ from ..managers.disk_manager import (
 )
 from ..utils.commands import run_zpool, run_zfs, run_command
 from ..utils.exceptions import PoolError, DatasetError, ValidationError
-from ..utils.validation import validate_pool_name, validate_dataset_name
+from ..utils.validation import (
+    validate_pool_name, validate_dataset_name,
+)
 
 
 def _parse_size_bytes(size_str: str) -> float:
@@ -105,7 +107,7 @@ class ZfsManager:
         """List all ZFS pools with live status from ZFS."""
         try:
             stdout, stderr, returncode = await run_zpool(
-                "list", "-P", "-H", "-o", "name,size,allocated,free,capacity,health",
+                "list", "-p", "-H", "-o", "name,size,allocated,free,capacity,health",
                 op="read",
             )
 
@@ -161,6 +163,81 @@ class ZfsManager:
             if isinstance(e, PoolError):
                 raise
             raise PoolError(f"Error listing pools: {str(e)}")
+
+    async def is_disk_in_pool(self, by_id: str) -> Optional[str]:
+        """Check if a disk (by its /dev/disk/by-id path) is a member of any imported pool.
+
+        Returns the pool name if found, None otherwise.
+        """
+        if not by_id or not by_id.startswith("/dev/disk/by-id/"):
+            return None
+
+        try:
+            stdout, _, rc = await run_zpool(
+                "status", "-j", check=False, op="read",
+            )
+            if rc != 0:
+                return None
+
+            data = json.loads(stdout)
+            pools = data.get("pools", {})
+            if not isinstance(pools, dict):
+                return None
+
+            for pool_name, pool_data in pools.items():
+                vdevs = pool_data.get("vdevs", {})
+                for vdev in vdevs.values():
+                    if self._vdev_contains_disk(vdev, by_id):
+                        return pool_name
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _iter_vdev_disks(vdev: Dict[str, Any]):
+        """Yield (path, name) for every leaf disk entry in a vdev tree."""
+        kind = vdev.get("type") or vdev.get("vdev_type")
+        if kind == "disk":
+            yield vdev.get("path"), vdev.get("name")
+        children = vdev.get("vdevs", {})
+        if isinstance(children, dict):
+            for child in children.values():
+                yield from ZfsManager._iter_vdev_disks(child)
+        elif isinstance(children, list):
+            for child in children:
+                yield from ZfsManager._iter_vdev_disks(child)
+
+    def _vdev_contains_disk(self, vdev: Dict[str, Any], by_id: str) -> bool:
+        """Recursively check if a vdev tree contains the given disk."""
+        for path, name in self._iter_vdev_disks(vdev):
+            if path == by_id or name == by_id:
+                return True
+        return False
+
+    async def get_pool_members(self) -> Dict[str, str]:
+        """Map every leaf device used by imported pools to its pool name.
+
+        Keys are the device paths reported by ``zpool status -j`` (stable
+        by-id whole-disk paths or ``-partN`` partition paths), so partitioned
+        pool members are matched exactly rather than via whole-disk identity.
+        """
+        members: Dict[str, str] = {}
+        try:
+            stdout, _, rc = await run_zpool("status", "-j", check=False, op="read")
+            if rc != 0:
+                return members
+            data = json.loads(stdout)
+            pools = data.get("pools", {})
+            if not isinstance(pools, dict):
+                return members
+            for pool_name, pool_data in pools.items():
+                vdevs = pool_data.get("vdevs", {})
+                for vdev in vdevs.values():
+                    for path, name in self._iter_vdev_disks(vdev):
+                        members.setdefault(path or name, pool_name)
+            return members
+        except Exception:
+            return {}
 
     async def get_pool_status(self, pool_name: str) -> Dict[str, Any]:
         """Get detailed pool status from ZFS."""
@@ -585,7 +662,7 @@ class ZfsManager:
         size_bytes = used_bytes = free_bytes = None
         try:
             stdout, stderr, rc = await run_zpool(
-                "list", "-P", "-H", "-o", "name,size,allocated,free", pool_name,
+                "list", "-p", "-H", "-o", "name,size,allocated,free", pool_name,
                 check=False, op="read",
             )
             if rc == 0 and stdout.strip():
@@ -1052,84 +1129,60 @@ class ZfsManager:
         if returncode != 0:
             raise DatasetError(f"Failed to destroy dataset: {stderr}")
 
-    # ── Snapshot operations ────────────────────────────────────────────
-
-    async def create_snapshot(
+    async def update_dataset(
         self,
-        db: Session,
         dataset_name: str,
-        snapshot_name: str
+        compression: Optional[str] = None,
+        recordsize: Optional[str] = None,
+        sync_mode: Optional[str] = None,
+        quota: Optional[str] = None,
+        special_small_blocks: Optional[str] = None,
+        atime: Optional[str] = None,
+        canmount: Optional[str] = None,
+        readonly: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Create a snapshot of a dataset (no DB persistence)."""
-        list_out, _, list_rc = await run_zfs(
-            "list", "-H", "-o", "name", dataset_name, check=False, op="read"
-        )
-        if list_rc != 0 or dataset_name not in list_out.split():
+        """Update dataset properties via zfs set."""
+        validate_dataset_name(dataset_name)
+
+        # Check dataset exists
+        if not await self._dataset_live_exists(dataset_name):
             raise DatasetError(f"Dataset '{dataset_name}' not found")
 
-        full_snapshot_name = f"{dataset_name}@{snapshot_name}"
+        # Apply property changes via zfs set
+        if compression is not None:
+            await run_zfs("set", f"compression={compression}", dataset_name)
 
-        stdout, stderr, returncode = await run_zfs(
-            "snapshot", full_snapshot_name,
-            timeout=300, check=False
-        )
+        if recordsize is not None:
+            await run_zfs("set", f"recordsize={recordsize}", dataset_name)
 
-        if returncode != 0:
-            raise DatasetError(f"Failed to create snapshot: {stderr}")
+        if sync_mode is not None:
+            await run_zfs("set", f"sync={sync_mode}", dataset_name)
 
+        if quota is not None:
+            if quota:
+                await run_zfs("set", f"quota={quota}", dataset_name)
+            else:
+                await run_zfs("set", "quota=none", dataset_name)
+
+        if special_small_blocks is not None:
+            val = special_small_blocks.strip()
+            await run_zfs("set", f"special_small_blocks={val or '0'}", dataset_name)
+
+        if atime is not None:
+            for tok in _atime_to_params(atime):
+                await run_zfs("set", tok, dataset_name)
+
+        if canmount is not None:
+            await run_zfs("set", f"canmount={canmount}", dataset_name)
+
+        if readonly is not None:
+            await run_zfs("set", f"readonly={readonly}", dataset_name)
+
+        # Return dataset with live ZFS properties
+        live_props = await self._get_dataset_properties(dataset_name)
         return {
-            "name": full_snapshot_name,
-            "dataset_name": dataset_name,
-            "snapshot_name": snapshot_name,
+            "name": dataset_name,
+            **live_props,
         }
-
-    async def list_snapshots(self, db: Session, dataset_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List snapshots from ZFS (no DB)."""
-        try:
-            cmd = ["list", "-H", "-o", "name,used,referenced,creation", "-t", "snapshot"]
-            if dataset_name:
-                cmd.extend(["-r", dataset_name])
-
-            stdout, stderr, returncode = await run_zfs(*cmd, check=False, op="read")
-
-            if returncode != 0:
-                raise DatasetError(f"Failed to list snapshots: {stderr}")
-
-            snapshots = []
-            for line in stdout.strip().split('\n'):
-                if not line:
-                    continue
-
-                parts = line.split('\t')
-                if len(parts) >= 3:
-                    full_name = parts[0]
-                    if '@' in full_name:
-                        ds_name, snap_name = full_name.split('@', 1)
-                        snapshots.append({
-                            "name": full_name,
-                            "dataset_name": ds_name,
-                            "snapshot_name": snap_name,
-                            "used": parts[1] if parts[1] != '-' else None,
-                            "referenced": parts[2] if parts[2] != '-' else None,
-                            "creation": parts[3] if len(parts) > 3 and parts[3] != '-' else None,
-                        })
-
-            return snapshots
-
-        except Exception as e:
-            if isinstance(e, DatasetError):
-                raise
-            raise DatasetError(f"Error listing snapshots: {str(e)}")
-
-    async def destroy_snapshot(self, db: Session, snapshot_name: str) -> None:
-        """Destroy a snapshot (DESTRUCTIVE). No DB record to remove."""
-        stdout, stderr, returncode = await run_zfs(
-            "destroy", snapshot_name,
-            timeout=300, check=False
-        )
-
-        if returncode != 0:
-            raise DatasetError(f"Failed to destroy snapshot: {stderr}")
-
 
 zfs_manager = ZfsManager()

@@ -1,7 +1,11 @@
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from pathlib import Path
+import asyncio
+import json
+import os
 import re
+import time
 import uuid
 
 from sqlalchemy.orm import Session
@@ -9,7 +13,11 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..utils.commands import run_command, run_zfs, run_zpool, run_pipeline
 from ..utils.exceptions import BackupError, ValidationError
-from ..managers.disk_manager import get_device_path
+from ..utils.validation import validate_dataset_name
+from ..managers.disk_manager import (
+    get_device_path, read_slot_uuids, resolve_slot_to_device, partition_by_id,
+    get_os_reserved_partition_names,
+)
 from ..models.disk import Disk
 from ..models.backup_zfs import BackupDisk, BackupSchedule, BackupRun
 from ..models.scheduler import ScheduledTask, TaskType
@@ -25,6 +33,15 @@ def _ts() -> str:
 
 def _zfspath(*parts: str) -> str:
     return "/".join(p for p in parts if p)
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    """Check if child path is under parent (both resolved to absolute)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 class ZfsBackupManager:
@@ -48,35 +65,106 @@ class ZfsBackupManager:
         base.mkdir(parents=True, exist_ok=True)
         return base
 
-    async def list_backup_disks(self, db: Session) -> List[BackupDisk]:
-        disks = db.query(BackupDisk).order_by(BackupDisk.id).all()
-        for d in disks:
-            await self._refresh_free_space(d)
-        db.commit()
-        return disks
+    def _dev_path(self, rec: BackupDisk) -> Optional[str]:
+        """Derive the partition's by-id path from the physical disk identity.
 
-    async def _refresh_free_space(self, disk: BackupDisk) -> None:
-        """Update total/free bytes from statvfs if the disk is mounted."""
-        mp = Path(disk.mount_point)
-        if mp.is_mount():
+        The path is never stored; it follows from ``disks.by_id`` (the OS
+        identity) plus the recorded partition number.  Falls back to None when
+        the disk has no by-id, which makes a probe report the disk ``offline``.
+        """
+        if not rec.disk:
+            return None
+        return partition_by_id(rec.disk.by_id, rec.partition_number or 1)
+
+    async def _probe_state(self, rec: BackupDisk) -> Dict[str, Any]:
+        """Compute availability + capacity live (nothing is persisted).
+
+        Availability: ``mounted`` / ``full`` / ``unmounted`` / ``mismatch`` /
+        ``offline``.  Capacity is taken from the mounted filesystem when
+        mounted, otherwise the physical disk size with free=0.
+        """
+        state = await self._probe_device(rec)
+        total = free = 0
+        if state == "mounted":
             try:
-                import os
-                st = os.statvfs(str(mp))
+                st = os.statvfs(rec.mount_point)
                 total = st.f_frsize * st.f_blocks
                 free = st.f_frsize * st.f_bavail
-                disk.total_bytes = total
-                disk.free_bytes = free
-                disk.status = "mounted"
-            except Exception:
-                pass
+                if free < (1 << 20):
+                    state = "full"
+            except OSError:
+                state = "mounted"
+        elif rec.disk and rec.disk.size_bytes:
+            total = rec.disk.size_bytes
+        return {"status": state, "total_bytes": total, "free_bytes": free}
+
+    async def _serialize_now(self, rec: BackupDisk) -> Dict[str, Any]:
+        """Full response view of a backup disk with freshly computed state."""
+        return {**self._to_dict(rec), **await self._probe_state(rec)}
+
+    def _to_dict(self, rec: BackupDisk) -> Dict[str, Any]:
+        return {
+            "id": rec.id,
+            "disk_id": rec.disk_id,
+            "slot_uuid": rec.slot_uuid,
+            "partition_number": rec.partition_number,
+            "device_path": self._dev_path(rec),
+            "label": rec.label,
+            "fs_type": rec.fs_type,
+            "mount_point": rec.mount_point,
+            "fs_uuid": rec.fs_uuid,
+            "unmount_after_backup": rec.unmount_after_backup,
+        }
+
+    async def list_backup_disks(self, db: Session) -> List[Dict[str, Any]]:
+        disks = db.query(BackupDisk).order_by(BackupDisk.id).all()
+        return [await self._serialize_now(d) for d in disks]
+
+    async def _probe_device(self, rec: BackupDisk) -> str:
+        """Determine the disk's current state without mounting it.
+
+        Returns one of: ``mounted``, ``unmounted``, ``offline``, ``mismatch``.
+        ``offline`` means the by-id device path is gone (unplugged); ``mismatch``
+        means a different device is present at that path than the declared
+        filesystem UUID.
+        """
+        if Path(rec.mount_point).is_mount():
+            return "mounted"
+        dev = self._dev_path(rec)
+        if not dev or not os.path.exists(dev):
+            return "offline"
+        if rec.fs_uuid:
+            current = await self._fs_uuid(dev)
+            if not current or current != rec.fs_uuid:
+                return "mismatch"
+        return "unmounted"
+
+    async def _unmount_rec(self, rec: BackupDisk) -> bool:
+        """Unmount the disk if currently mounted; True if it ends unmounted."""
+        if not Path(rec.mount_point).is_mount():
+            return True
+        await run_command(["umount", rec.mount_point], timeout=60, check=False, op="write", category="disk")
+        return not Path(rec.mount_point).is_mount()
+
+    async def _restore_idle_state(self, rec: BackupDisk) -> None:
+        """Unmount the disk after a backup/restore/list cycle when configured."""
+        if not rec or not rec.unmount_after_backup:
+            return
+        await self._unmount_rec(rec)
 
     async def declare_backup_disk(
-        self, db: Session, disk_id: int, confirm: bool = False
-    ) -> BackupDisk:
-        """Declare a disk as a backup target: validate, wipe, format ext4, mount.
+        self, db: Session, disk_id: int, confirm: bool = False,
+        slot_uuid: Optional[str] = None, label: Optional[str] = None,
+        wipe_raid: bool = False,
+    ) -> Dict[str, Any]:
+        """Declare a disk or partition as a backup target: validate, format, mount.
 
         ``confirm`` mirrors the destructive-action guard used elsewhere in the
         UI (the caller must send confirm=True to allow the wipe+format).
+        With ``slot_uuid`` the named ZFS-style partition is formatted in place
+        (its GPT PARTLABEL survives); without it the whole disk is wiped to a
+        single ext4 partition.  ``wipe_raid`` authorises stopping software RAID
+        arrays and zeroing their superblocks on the target device(s).
         """
         disk = db.query(Disk).filter(Disk.id == disk_id).first()
         if not disk:
@@ -86,47 +174,97 @@ class ZfsBackupManager:
         if not confirm:
             raise ValidationError("Destructive action requires confirmation")
 
-        dev = get_device_path(disk)
-        if not dev:
-            raise ValidationError("Disk is not currently present")
+        from .zfs_manager import zfs_manager
+        pool_members = await zfs_manager.get_pool_members()
+        member_pool = self._pool_member_for_disk(pool_members, disk)
+        if member_pool:
+            raise ValidationError(f"Disk is a member of pool '{member_pool}'; remove it from the pool first")
 
         if db.query(BackupDisk).filter(BackupDisk.disk_id == disk_id).first():
             raise ValidationError("Disk is already declared as a backup disk")
 
-        # Wipe and create a single GPT partition covering the whole disk.
-        await run_command(["wipefs", "-a", dev], timeout=120, check=False, op="write", category="disk")
-        await run_command(["parted", "-s", dev, "mklabel", "gpt"], timeout=120, check=False, op="write", category="disk")
-        await run_command(["parted", "-s", dev, "mkpart", "primary", "0%", "100%"], timeout=120, check=False, op="write", category="disk")
-        # Let the kernel see the new partition.
-        await run_command(["partprobe", dev], timeout=120, check=False, op="write", category="disk")
+        if slot_uuid:
+            part_dev = await self._resolve_partition(disk, slot_uuid)
+            member_pool = self._pool_member_for_device(pool_members, part_dev)
+            if member_pool:
+                raise ValidationError(f"Partition is a member of pool '{member_pool}'; remove it from the pool first")
+            await self._handle_raid([part_dev], wipe_raid)
+            await self._ensure_unused(part_dev)
+            # Format only the partition; keep the GPT so the slot UUID survives.
+            await self._run_destructive(["wipefs", "-a", part_dev], 120, "wipe the partition")
+            await self._run_destructive(["mkfs.ext4", "-F", part_dev], 600, "format the partition")
+            device_path = part_dev
+            partition_number = self._partition_number(part_dev)
+        else:
+            dev = get_device_path(disk)
+            if not dev:
+                raise ValidationError("Disk is not currently present")
 
-        part_dev = self._whole_partition_device(disk, dev)
-        await run_command(["mkfs.ext4", "-F", part_dev], timeout=600, check=False, op="write", category="disk")
+            devices = [dev] + await self._disk_partition_paths(dev)
+            await self._handle_raid(devices, wipe_raid)
+            await self._ensure_unused(dev)
+            # Wipe and create a single GPT partition covering the whole disk.
+            await self._run_destructive(["wipefs", "-a", dev], 120, "wipe existing signatures")
+            await self._run_destructive(["parted", "-s", dev, "mklabel", "gpt"], 120, "create the GPT partition table")
+            await self._run_destructive(["parted", "-s", dev, "mkpart", "primary", "0%", "100%"], 120, "create the partition")
+            # Let the kernel see the new partition.
+            await self._run_destructive(["partprobe", dev], 120, "rescan the partition table")
+
+            device_path = self._whole_partition_device(disk, dev)
+            await self._run_destructive(["mkfs.ext4", "-F", device_path], 600, "format the partition")
+            partition_number = 1
 
         # Read back the filesystem UUID for deterministic remounting.
-        fs_uuid = await self._fs_uuid(part_dev)
+        fs_uuid = await self._fs_uuid(device_path)
         if not fs_uuid:
             raise BackupError("Could not read filesystem UUID after formatting")
 
         mount_base = await self.get_mount_base()
         mount_point = str(mount_base / fs_uuid)
         Path(mount_point).mkdir(parents=True, exist_ok=True)
-        await run_command(["mount", part_dev, mount_point], timeout=60, check=False, op="write", category="disk")
+        await run_command(["mount", device_path, mount_point], timeout=60, check=False, op="write", category="disk")
 
         rec = BackupDisk(
             disk_id=disk_id,
-            device_path=part_dev,
+            slot_uuid=slot_uuid,
+            partition_number=partition_number,
+            label=label,
             fs_type="ext4",
             mount_point=mount_point,
             fs_uuid=fs_uuid,
-            status="mounted",
         )
         db.add(rec)
         db.commit()
         db.refresh(rec)
-        await self._refresh_free_space(rec)
-        db.commit()
-        return rec
+        if rec.unmount_after_backup:
+            await self._unmount_rec(rec)
+        return await self._serialize_now(rec)
+
+    def _partition_number(self, dev: str) -> int:
+        """Parse the partition number from a by-id (-partN) or kernel path."""
+        m = re.search(r"-part(\d+)$", dev)
+        if m:
+            return int(m.group(1))
+        name = Path(dev).name
+        m = re.search(r"(?:p?)(\d+)$", name)
+        if m:
+            return int(m.group(1))
+        return 1
+
+    async def _resolve_partition(self, disk: Disk, slot_uuid: str) -> str:
+        """Resolve a slot UUID to the partition's by-id device path.
+
+        Raises ValidationError if the disk is absent or the partition is gone.
+        """
+        dev = get_device_path(disk)
+        if not dev:
+            raise ValidationError("Disk is not currently present")
+        info = await read_slot_uuids([dev])
+        parts = info.get(dev, {}).get("partitions", [])
+        part_dev = resolve_slot_to_device(disk.by_id, slot_uuid, parts)
+        if not part_dev:
+            raise ValidationError(f"Partition with slot UUID {slot_uuid} not found on disk")
+        return part_dev
 
     def _whole_partition_device(self, disk: Disk, dev: str) -> str:
         """Return the by-id path of partition 1 of ``dev`` if resolvable."""
@@ -142,45 +280,359 @@ class ZfsBackupManager:
             return f"{by_id}-part1"
         return f"/dev/{part_name}"
 
+    @staticmethod
+    def _pool_member_for_disk(pool_members: Dict[str, str], disk: Disk) -> Optional[str]:
+        """Return the pool that owns ``disk`` (whole-disk or any partition)."""
+        if not disk.by_id:
+            return None
+        by_id = disk.by_id
+        basename = by_id.rsplit("/", 1)[-1]
+        for key in (by_id, basename):
+            if key in pool_members:
+                return pool_members[key]
+        for dev, pool in pool_members.items():
+            if dev.startswith((f"{by_id}-part", f"{basename}-part")):
+                return pool
+        return None
+
+    @staticmethod
+    def _pool_member_for_device(pool_members: Dict[str, str], dev: str) -> Optional[str]:
+        """Return the pool that owns the exact device ``dev`` (path or basename)."""
+        for key in (dev, dev.rsplit("/", 1)[-1]):
+            if key in pool_members:
+                return pool_members[key]
+        return None
+
+    async def _ensure_unused(self, dev: str) -> None:
+        """Refuse to destroy a device whose partitions are live (md/mount/swap).
+
+        ``dev`` is the whole-disk or partition device about to be wiped.  A
+        device can only be formatted once nothing (software RAID, a mount, or
+        swap) is holding it; stopping the holder is the caller's job.
+        """
+        stdout, _, rc = await run_command(
+            ["lsblk", "-J", "-o", "NAME,TYPE,PKNAME,MOUNTPOINT", dev], timeout=10,
+            check=False, op="read", category="disk",
+        )
+        if rc != 0 or not stdout.strip():
+            # Cannot inspect the device; let the destructive command fail loudly.
+            return
+        try:
+            data = json.loads(stdout)
+        except ValueError:
+            return
+
+        holders: List[str] = []
+        seen: set = set()
+
+        def walk(devices: List[Dict[str, Any]]) -> None:
+            for node in devices:
+                name = node.get("name") or ""
+                if name in seen:
+                    continue
+                seen.add(name)
+                if node.get("type") == "md":
+                    holders.append(f"software RAID {name}")
+                mp = node.get("mountpoint")
+                if mp:
+                    holders.append(f"mounted at {mp}")
+                walk(node.get("children", []))
+
+        walk(data.get("blockdevices", []))
+        if holders:
+            raise ValidationError(
+                f"{dev} is in use ({', '.join(sorted(set(holders)))}); "
+                "stop the holder and retry"
+            )
+
+    async def _disk_partition_paths(self, dev: str) -> List[str]:
+        """Return the kernel device paths of all partitions on ``dev``."""
+        info = await read_slot_uuids([dev])
+        return [f"/dev/{p['name']}" for p in info.get(dev, {}).get("partitions", [])]
+
+    async def _handle_raid(self, devices: List[str], wipe_raid: bool) -> None:
+        """Deal with software RAID metadata on the devices about to be wiped.
+
+        Refuses (with an explicit pointer to the ``wipe_raid`` option) when a
+        superblock is present but the caller has not authorised wiping it.
+        Otherwise stops the owning arrays and zeroes every superblock so the
+        device is genuinely free (including stale superblocks of another
+        version, which would otherwise reassemble after a reboot).
+        """
+        superblocks = await self._md_superblocks(devices)
+        if not superblocks:
+            return
+        detail = "; ".join(
+            f"{s['device']} (array {s['name'] or 'unknown'}, version {s['version'] or '?'})"
+            for s in superblocks
+        )
+        if not wipe_raid:
+            raise ValidationError(
+                f"{devices[0]} carries software RAID metadata ({detail}); "
+                "confirm wiping the RAID info to proceed"
+            )
+        await self._wipe_raid_metadata(devices, superblocks)
+
+    async def _md_superblocks(self, devices: List[str]) -> List[Dict[str, Any]]:
+        """Probe ``mdadm --examine`` for every device; return matching entries."""
+        os_names = await get_os_reserved_partition_names()
+        found = []
+        for dev in devices:
+            stdout, _, rc = await run_command(
+                ["mdadm", "--examine", dev], timeout=15, check=False,
+                op="read", category="disk",
+            )
+            if rc != 0 or not stdout.strip():
+                continue
+            info = self._parse_mdadm_examine(stdout)
+            if not info:
+                continue
+            info["device"] = dev
+            info["os_backing"] = Path(dev).name in os_names
+            found.append(info)
+        return found
+
+    @staticmethod
+    def _parse_mdadm_examine(stdout: str) -> Optional[Dict[str, str]]:
+        """Extract key/value lines from ``mdadm --examine`` output."""
+        fields: Dict[str, str] = {}
+        for line in stdout.splitlines():
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            val = val.strip()
+            if val:
+                fields[key.strip()] = val
+        if not fields:
+            return None
+        return {
+            "name": fields.get("Name") or fields.get("Raid Device"),
+            "version": fields.get("Version"),
+        }
+
+    async def _wipe_raid_metadata(
+        self, devices: List[str], superblocks: List[Dict[str, Any]]
+    ) -> None:
+        """Stop arrays on ``devices`` and zero their superblocks.
+
+        Arrays that back the OS are never touched; stopping them would take
+        the system down.
+        """
+        for sb in superblocks:
+            if sb.get("os_backing"):
+                raise ValidationError(
+                    f"Cannot wipe RAID metadata on {sb['device']} (array "
+                    f"{sb.get('name') or 'unknown'}): it is part of the OS and "
+                    f"must be handled manually"
+                )
+
+        md_names = await self._md_children(devices)
+        for md_name in md_names:
+            # The array may already be stopped (stale superblock); ignore rc.
+            await run_command(
+                ["mdadm", "--stop", f"/dev/{md_name}"], timeout=30, check=False,
+                op="write", category="disk",
+            )
+        for sb in superblocks:
+            await self._run_destructive(
+                ["mdadm", "--zero-superblock", sb["device"]], 30, "wipe RAID metadata"
+            )
+
+    async def _md_children(self, devices: List[str]) -> List[str]:
+        """Return the names of any md arrays built on ``devices`` (lsblk)."""
+        md_names = set()
+        for dev in devices:
+            stdout, _, rc = await run_command(
+                ["lsblk", "-J", "-o", "NAME,TYPE", dev], timeout=10, check=False,
+                op="read", category="disk",
+            )
+            if rc != 0 or not stdout.strip():
+                continue
+            try:
+                data = json.loads(stdout)
+            except ValueError:
+                continue
+
+            def walk(nodes: List[Dict[str, Any]]) -> None:
+                for node in nodes:
+                    if node.get("type") == "md":
+                        md_names.add(node.get("name") or "")
+                    walk(node.get("children", []))
+
+            walk(data.get("blockdevices", []))
+        return sorted(m for m in md_names if m)
+
+    async def get_raid_info(
+        self, db: Session, disk_id: int, slot_uuid: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Software RAID metadata found on a disk/partition (for the UI probe)."""
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise ValidationError("Disk not found")
+        if slot_uuid:
+            dev = await self._resolve_partition(disk, slot_uuid)
+            devices = [dev]
+        else:
+            dev = get_device_path(disk)
+            if not dev:
+                raise ValidationError("Disk is not currently present")
+            devices = [dev] + await self._disk_partition_paths(dev)
+        return {"device": dev, "md": await self._md_superblocks(devices)}
+
+    async def _run_destructive(self, cmd: List[str], timeout: int, action: str) -> None:
+        """Run a destructive/changing command, failing loudly with stderr."""
+        try:
+            await run_command(cmd, timeout=timeout, op="write", category="disk")
+        except Exception as e:
+            raise BackupError(f"Could not {action}: {e}")
+
     async def _fs_uuid(self, dev: str) -> Optional[str]:
         stdout, _, rc = await run_command(
             ["blkid", "-s", "UUID", "-o", "value", dev], timeout=30, check=False, op="read", category="disk"
         )
         return stdout.strip() or None
 
-    async def mount_backup_disk(self, db: Session, backup_disk_id: int) -> BackupDisk:
+    # -- device wake -------------------------------------------------------
+
+    def _mounted_block_devices(self) -> set:
+        """Kernel base names of every block device currently holding a mount."""
+        mounted = set()
+        try:
+            for line in Path("/proc/mounts").read_text().splitlines():
+                dev = line.split(" ")[0] or ""
+                if dev.startswith("/dev/"):
+                    mounted.add(os.path.basename(dev))
+        except OSError:
+            pass
+        return mounted
+
+    def _usb_storage_bridges(self) -> List[Path]:
+        """USB device dirs that expose a mass-storage bridge and host no mount."""
+        usb = Path("/sys/bus/usb/devices")
+        if not usb.is_dir():
+            return []
+        mounted = self._mounted_block_devices()
+        bridges = []
+        for path in usb.iterdir():
+            if not path.is_dir() or not (path / "authorized").exists():
+                continue
+            try:
+                vendor = (path / "idVendor").read_text().strip().lower()
+            except OSError:
+                continue
+            if vendor != "152d" and vendor != "0bda":
+                continue
+            # Skip bridges currently steering a mounted filesystem: re-plugging
+            # one would yank it out from under a live mount.
+            if self._bridge_has_mounted_device(path, mounted):
+                continue
+            bridges.append(path)
+        return bridges
+
+    def _bridge_has_mounted_device(self, bus_dir: Path, mounted: set) -> bool:
+        for root, dirs, files in os.walk(str(bus_dir)):
+            if os.path.basename(root) == "block":
+                for entry in dirs:
+                    if entry in mounted:
+                        return True
+        return False
+
+    async def _wake_backup_disk(self, rec: BackupDisk) -> bool:
+        """Try to bring a missing backup disk back without a power cycle.
+
+        1. Drive present (device path resolves): it is only asleep at the ATA
+           level, so poke it with ``hdparm -C`` and wait for spin-up.
+        2. Drive missing but its USB bridge is still on the bus: toggle the
+           bridge's ``authorized`` file to force a kernel-side re-enumeration
+           (a software replug), then poll for the device to reappear.
+        3. Bridge not on the bus at all: nothing to talk to; return False so
+           the caller reports that a power cycle is required.
+        """
+        dev = self._dev_path(rec)
+        if dev and os.path.exists(dev):
+            await run_command(["hdparm", "-C", dev], timeout=30,
+                              check=False, op="read", category="disk")
+            await asyncio.sleep(2)
+            return bool(dev and os.path.exists(dev))
+
+        toggled = False
+        for bus_dir in self._usb_storage_bridges():
+            authorized = bus_dir / "authorized"
+            try:
+                authorized.write_text("0")
+                await asyncio.sleep(1)
+                authorized.write_text("1")
+                toggled = True
+            except OSError:
+                continue
+        if not toggled:
+            return False
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if dev and os.path.exists(dev):
+                await asyncio.sleep(2)
+                return True
+            await asyncio.sleep(1)
+        return False
+
+    async def wake_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
+        """Public wake/replug action: force the disk present again and re-probe."""
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
         if not rec:
             raise ValidationError("Backup disk not found")
+        state = await self._probe_device(rec)
+        if state == "offline":
+            if not await self._wake_backup_disk(rec):
+                raise BackupError(
+                    "Backup disk could not be woken by software; power-cycle its enclosure"
+                )
+        return await self._serialize_now(rec)
+
+    async def mount_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
+        rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
+        if not rec:
+            raise ValidationError("Backup disk not found")
+        state = await self._probe_device(rec)
+        if state == "mounted":
+            return await self._serialize_now(rec)
+        if state == "offline":
+            # The disk may be asleep or its bridge idle-but-enumerated; try to
+            # bring it back before giving up so scheduled/manual backups can
+            # proceed without the user touching the enclosure.
+            await self._wake_backup_disk(rec)
+            state = await self._probe_device(rec)
+        if state == "offline":
+            raise BackupError(
+                "Backup disk is not connected; a software wake was attempted. "
+                "If the enclosure is fitted, power-cycle it."
+            )
+        if state == "mismatch":
+            raise BackupError(
+                "Filesystem changed: the disk present is not the declared backup "
+                "filesystem (UUID differs). Re-scan or re-declare."
+            )
         Path(rec.mount_point).mkdir(parents=True, exist_ok=True)
-        if not Path(rec.mount_point).is_mount():
-            await run_command(["mount", rec.device_path, rec.mount_point], timeout=60, check=False, op="write", category="disk")
-        rec.status = "mounted"
-        await self._refresh_free_space(rec)
-        db.commit()
-        return rec
+        _, _, rc = await run_command(
+            ["mount", self._dev_path(rec), rec.mount_point], timeout=60, check=False, op="write", category="disk"
+        )
+        if rc != 0 or not Path(rec.mount_point).is_mount():
+            raise BackupError("Failed to mount backup disk")
+        return await self._serialize_now(rec)
 
-    async def unmount_backup_disk(self, db: Session, backup_disk_id: int) -> BackupDisk:
+    async def unmount_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
         if not rec:
             raise ValidationError("Backup disk not found")
-        if Path(rec.mount_point).is_mount():
-            await run_command(["umount", rec.mount_point], timeout=60, check=False, op="write", category="disk")
-        rec.status = "unmounted"
-        db.commit()
-        return rec
+        if not await self._unmount_rec(rec):
+            raise BackupError("Failed to unmount backup disk")
+        return await self._serialize_now(rec)
 
-    async def scan_backup_disk(self, db: Session, backup_disk_id: int) -> BackupDisk:
+    async def scan_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
         if not rec:
             raise ValidationError("Backup disk not found")
-        await self._refresh_free_space(rec)
-        if rec.total_bytes and rec.free_bytes is not None and rec.free_bytes < (1 << 20):
-            rec.status = "full"
-        else:
-            rec.status = "mounted"
-        db.commit()
-        return rec
+        return await self._serialize_now(rec)
 
     async def deregister_backup_disk(self, db: Session, backup_disk_id: int) -> None:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
@@ -192,7 +644,8 @@ class ZfsBackupManager:
             except Exception:
                 pass
         # The runs/schedules for this disk reference stream files stored on it;
-        # with the disk deregistered those records are meaningless, so remove them.
+        # with the disk deregistered those records are meaningless, so remove
+        # them (the FK cascade also covers this when foreign_keys is enabled).
         db.query(BackupRun).filter(BackupRun.backup_disk_id == backup_disk_id).delete()
         db.query(BackupSchedule).filter(BackupSchedule.backup_disk_id == backup_disk_id).delete()
         db.delete(rec)
@@ -239,10 +692,11 @@ class ZfsBackupManager:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
         if not rec:
             raise ValidationError("Backup disk not found")
-        await self._refresh_free_space(rec)
-        if not rec.free_bytes:
+        if not Path(rec.mount_point).is_mount():
             raise BackupError("Backup disk is not mounted; cannot check capacity")
-        return rec.free_bytes >= needed_bytes
+        st = os.statvfs(rec.mount_point)
+        free = st.f_frsize * st.f_bavail
+        return free >= needed_bytes
 
     # ── Backup engine -------------------------------------------------------
     async def run_backup(
@@ -276,9 +730,9 @@ class ZfsBackupManager:
         db.commit()
         db.refresh(run)
 
+        snap = None
         try:
-            if not Path(rec.mount_point).is_mount():
-                await self.mount_backup_disk(db, backup_disk_id)
+            await self.mount_backup_disk(db, backup_disk_id)
 
             snap = f"{dataset_name}@{BACKUP_SNAP_PREFIX}{_ts()}"
             await run_zfs("snapshot", "-r", snap, timeout=120, check=True)
@@ -298,10 +752,10 @@ class ZfsBackupManager:
             suffix = "zfs.gz"
             if backup_type == "full":
                 file_name = f"full-{self._snap_ts(snap)}.{suffix}"
-                src = snap
+                send_cmd = ["zfs", "send", "-R", snap]
             else:
                 file_name = f"incr-{self._snap_ts(snap)}.{suffix}"
-                src = f"-i {base_snapshot} {snap}"
+                send_cmd = ["zfs", "send", "-R", "-i", base_snapshot, snap]
             stream_file = str(dest_dir / file_name)
 
             # Capacity guard: estimate needed space vs free space.
@@ -311,17 +765,21 @@ class ZfsBackupManager:
             else:
                 needed = await self.estimate_incremental_size(db, dataset_name)
             if not await self.check_capacity(db, backup_disk_id, needed):
-                await run_zfs("destroy", snap, timeout=60, check=False)
+                await run_zfs("destroy", "-r", snap, timeout=60, check=False)
                 run.status = "failed"
                 run.error = "Insufficient free space on backup disk"
                 db.commit()
                 return run
 
-            gzip_level = self.settings.backup_gzip_level
-            cmd = f"zfs send -R {src} | gzip -{gzip_level} > {shquote(stream_file)}"
-            _, stderr, rc = await run_pipeline(cmd, timeout=86400, check=False)
+            gzip_level = int(self.settings.backup_gzip_level)
+            _, stderr, rc = await run_pipeline(
+                [send_cmd, ["gzip", f"-{gzip_level}"]],
+                stdout_path=stream_file,
+                timeout=86400, check=False, op="write", category="zfs",
+            )
             if rc != 0:
-                await run_zfs("destroy", snap, timeout=60, check=False)
+                Path(stream_file).unlink(missing_ok=True)
+                await run_zfs("destroy", "-r", snap, timeout=60, check=False)
                 run.status = "failed"
                 run.error = stderr or "zfs send failed"
                 db.commit()
@@ -350,11 +808,15 @@ class ZfsBackupManager:
             return run
 
         except Exception as e:
+            if snap and not run.snapshot:
+                await run_zfs("destroy", "-r", snap, timeout=60, check=False)
             run.status = "failed"
             run.error = str(e)
             run.completed_at = datetime.now(timezone.utc)
             db.commit()
             return run
+        finally:
+            await self._restore_idle_state(rec)
 
     async def estimate_needed(self, dataset_name: str) -> int:
         """Needed bytes for a full backup of a dataset (with safety margin)."""
@@ -372,8 +834,9 @@ class ZfsBackupManager:
         return snaps[0] if snaps else None
 
     async def _list_backup_snapshots(self, dataset_name: str) -> List[str]:
+        """List backup-* snapshots of the dataset itself (not children)."""
         stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", "-t", "snapshot", "-r", dataset_name, check=False, op="read",
+            "list", "-H", "-o", "name", "-t", "snapshot", dataset_name, check=False, op="read",
         )
         if rc != 0:
             return []
@@ -382,7 +845,12 @@ class ZfsBackupManager:
             line = line.strip()
             if not line:
                 continue
-            if "@" in line and f"@{BACKUP_SNAP_PREFIX}" in line:
+            if "@" not in line:
+                continue
+            ds, snap = line.split("@", 1)
+            if ds != dataset_name:
+                continue
+            if snap.startswith(BACKUP_SNAP_PREFIX):
                 names.append(line)
         names.sort()
         return names
@@ -415,7 +883,7 @@ class ZfsBackupManager:
         """
         from .scheduler import scheduler_manager
 
-        # Names map uniquely back to their schedule row (dataset + type).
+        # Names map uniquely back to their schedule row (dataset + disk + type).
         schedules = db.query(BackupSchedule).all()
         desired: Dict[str, Dict] = {}
         for s in schedules:
@@ -427,11 +895,11 @@ class ZfsBackupManager:
                 "type": "full",
             }
             if s.full_cron:
-                desired[f"zfs-full-{s.dataset_name}"] = {**base_cfg, "cron": s.full_cron,
-                                                         "type": "full", "retention": s.full_retention}
+                desired[f"zfs-full-{s.dataset_name}-{s.backup_disk_id}"] = {
+                    **base_cfg, "cron": s.full_cron, "type": "full", "retention": s.full_retention}
             if s.incremental_cron:
-                desired[f"zfs-incr-{s.dataset_name}"] = {**base_cfg, "cron": s.incremental_cron,
-                                                         "type": "incremental", "retention": s.incremental_retention}
+                desired[f"zfs-incr-{s.dataset_name}-{s.backup_disk_id}"] = {
+                    **base_cfg, "cron": s.incremental_cron, "type": "incremental", "retention": s.incremental_retention}
 
         existing = {t.name: t for t in db.query(ScheduledTask).filter(
             ScheduledTask.task_type == TaskType.ZFS_BACKUP.value).all()}
@@ -462,32 +930,78 @@ class ZfsBackupManager:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
         if not rec:
             raise ValidationError("Backup disk not found")
-        if not Path(rec.mount_point).is_mount():
-            await self.mount_backup_disk(db, backup_disk_id)
-        base = Path(rec.mount_point) / "data"
-        files = []
-        if base.exists():
-            for p in sorted(base.rglob("*.zfs.gz")):
-                files.append({
-                    "path": str(p),
-                    "dataset": str(p.relative_to(base)).split("/")[0],
-                    "size_bytes": p.stat().st_size,
-                })
-        return files
+        try:
+            if not Path(rec.mount_point).is_mount():
+                await self.mount_backup_disk(db, backup_disk_id)
+            base = Path(rec.mount_point) / "data"
+            files = []
+            if base.exists():
+                for p in sorted(base.rglob("*.zfs.gz")):
+                    files.append({
+                        "path": str(p),
+                        "dataset": str(p.relative_to(base)).split("/")[0],
+                        "size_bytes": p.stat().st_size,
+                    })
+            return files
+        finally:
+            await self._restore_idle_state(rec)
 
-    async def restore_dataset(self, stream_file: str, dataset_name: str) -> Dict[str, Any]:
-        """Restore a dataset from a stream file (full or applying incrementals).
+    async def restore_dataset(
+        self, db: Session, stream_file: str, target_dataset: str, force: bool = False
+    ) -> Dict[str, Any]:
+        """Restore a dataset from a stream file.
 
-        Replays the full stream, then any matching incremental streams in order.
+        The stream file must reside under a registered backup disk's data directory.
+        By default the target dataset must not exist; pass ``force=True`` to allow
+        overwriting an existing dataset (equivalent to ``zfs receive -F``).
         """
-        fp = Path(stream_file)
+        validate_dataset_name(target_dataset)
+
+        fp = Path(stream_file).resolve()
+
+        # Locate the registered backup disk whose data directory owns this path.
+        owner = None
+        for rec in db.query(BackupDisk).all():
+            data_dir = (Path(rec.mount_point) / "data").resolve()
+            if _is_under(fp, data_dir):
+                owner = rec
+                break
+        if owner is None:
+            raise BackupError(
+                "Stream file must reside under a registered backup disk's data directory"
+            )
+
+        if not Path(owner.mount_point).is_mount():
+            await self.mount_backup_disk(db, owner.id)
         if not fp.exists():
             raise BackupError(f"Stream file not found: {stream_file}")
-        cmd = f"gunzip -c {shquote(str(fp))} | zfs receive -F {shquote(dataset_name)}"
-        _, stderr, rc = await run_pipeline(cmd, timeout=86400, check=False)
+
+        allowed_bases = []
+        for rec in db.query(BackupDisk).all():
+            data_dir = Path(rec.mount_point) / "data"
+            if data_dir.exists():
+                allowed_bases.append(data_dir.resolve())
+
+        if not any(_is_under(fp, base) for base in allowed_bases):
+            raise BackupError(
+                f"Stream file must reside under a registered backup disk's data directory"
+            )
+
+        receive_cmd = ["zfs", "receive"]
+        if force:
+            receive_cmd.append("-F")
+        receive_cmd.append(target_dataset)
+
+        try:
+            _, stderr, rc = await run_pipeline(
+                [["gunzip", "-c", str(fp)], receive_cmd],
+                timeout=86400, check=False, op="write", category="zfs",
+            )
+        finally:
+            await self._restore_idle_state(owner)
         if rc != 0:
             raise BackupError(f"Restore failed: {stderr}")
-        return {"dataset": dataset_name, "source": str(fp)}
+        return {"dataset": target_dataset, "source": str(fp), "force": force}
 
 
 def shquote(s: str) -> str:

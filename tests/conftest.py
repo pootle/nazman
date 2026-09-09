@@ -13,6 +13,31 @@ from nazman.database import Base, get_db, get_db_context
 from nazman.main import app
 from nazman.config import Settings
 from nazman.auth import get_current_user
+from nazman.managers.scheduler import scheduler_manager
+
+
+@pytest.fixture(autouse=True)
+def reset_scheduler():
+    """Reset scheduler state before and after each test."""
+    # Stop scheduler if it's running (check both _started flag and actual running state)
+    try:
+        if scheduler_manager.scheduler.running:
+            scheduler_manager.scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    scheduler_manager._started = False
+    scheduler_manager._dataset_locks.clear()
+    
+    yield
+    
+    # Cleanup after test - ensure scheduler is stopped
+    try:
+        if scheduler_manager.scheduler.running:
+            scheduler_manager.scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    scheduler_manager._started = False
+    scheduler_manager._dataset_locks.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +85,14 @@ def db_session(db_engine):
 @pytest.fixture()
 def client(db_engine, override_settings):
     """Create a test client with overridden database and settings."""
+    # Ensure scheduler is stopped before creating client
+    try:
+        if scheduler_manager.scheduler.running:
+            scheduler_manager.scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    scheduler_manager._started = False
+    
     TestSession = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
 
     def override_get_db():
@@ -84,11 +117,22 @@ def client(db_engine, override_settings):
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: {"username": "admin", "authenticated": True}
 
-    with patch("nazman.database.engine", db_engine):
-        with patch("nazman.database.SessionLocal", TestSession):
-            with patch("nazman.database.get_db_context", override_get_db_context):
-                with TestClient(app, raise_server_exceptions=False) as c:
-                    yield c
+    # Mock scheduler start/stop to prevent it from actually running during tests
+    with patch("nazman.managers.scheduler.scheduler_manager.start", new_callable=AsyncMock), \
+         patch("nazman.managers.scheduler.scheduler_manager.stop", new_callable=AsyncMock), \
+         patch("nazman.database.engine", db_engine), \
+         patch("nazman.database.SessionLocal", TestSession), \
+         patch("nazman.database.get_db_context", override_get_db_context):
+        with TestClient(app, raise_server_exceptions=False) as c:
+            yield c
+
+    # Stop scheduler after client is done
+    try:
+        if scheduler_manager.scheduler.running:
+            scheduler_manager.scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    scheduler_manager._started = False
 
     app.dependency_overrides.clear()
 

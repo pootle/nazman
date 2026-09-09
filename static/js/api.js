@@ -280,12 +280,22 @@ class NasManAPI {
         return this.request('GET', '/api/backup-zfs/disks');
     }
 
-    async backupDiskCandidates() {
-        return this.request('GET', '/api/backup-zfs/disks/candidates');
+    async backupDiskUsed() {
+        return this.request('GET', '/api/backup-zfs/disks/used');
     }
 
-    async declareBackupDisk(diskId, confirm) {
-        return this.request('POST', `/api/backup-zfs/disks/${diskId}/declare`, { confirm });
+    async declareBackupDisk(diskId, confirm, slotUuid, label, wipeRaid) {
+        return this.request('POST', `/api/backup-zfs/disks/${diskId}/declare`, {
+            confirm,
+            slot_uuid: slotUuid || null,
+            label: label || null,
+            wipe_raid: !!wipeRaid,
+        });
+    }
+
+    async backupDiskRaidInfo(diskId, slotUuid) {
+        const params = slotUuid ? `?slot_uuid=${encodeURIComponent(slotUuid)}` : '';
+        return this.request('GET', `/api/backup-zfs/disks/${diskId}/raid-info${params}`);
     }
 
     async mountBackupDisk(id) {
@@ -298,6 +308,14 @@ class NasManAPI {
 
     async scanBackupDisk(id) {
         return this.request('POST', `/api/backup-zfs/disks/${id}/scan`);
+    }
+
+    async wakeBackupDisk(id) {
+        return this.request('POST', `/api/backup-zfs/disks/${id}/wake`);
+    }
+
+    async updateBackupDisk(id, payload) {
+        return this.request('PATCH', `/api/backup-zfs/disks/${id}`, payload);
     }
 
     async deleteBackupDisk(id) {
@@ -326,8 +344,9 @@ class NasManAPI {
         return this.request('POST', '/api/backup-zfs/schedules', payload);
     }
 
-    async deleteBackupSchedule(datasetName) {
-        return this.request('DELETE', `/api/backup-zfs/schedules/${encodeURIComponent(datasetName)}`);
+    async deleteBackupSchedule(datasetName, backupDiskId) {
+        const params = backupDiskId ? `?backup_disk_id=${backupDiskId}` : '';
+        return this.request('DELETE', `/api/backup-zfs/schedules/${encodeURIComponent(datasetName)}${params}`);
     }
 
     async listDiskStreams(backupDiskId) {

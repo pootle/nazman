@@ -383,6 +383,44 @@ body {
 .status-failing { background-color: #e74c3c; color: white; }
 .status-unknown { background-color: #95a5a6; color: white; }
 
+@keyframes status-amber-pulse {
+    0%, 100% { background-color: #f39c12; }
+    50% { background-color: #f1c40f; }
+}
+.status-running { background-color: #f39c12; color: white; animation: status-amber-pulse 1.5s infinite; }
+
+/* Per-(dataset, disk) backup schedule blocks */
+.sched-block {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: #fafafa;
+}
+.sched-block:last-child { margin-bottom: 8px; }
+.sched-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.sched-head span { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+.sched-crons {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.sched-crons .form-control { flex: 1; font-size: 12px; padding: 4px 6px; }
+.sched-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.sched-add {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 2px;
+}
+.sched-add .form-control { max-width: 220px; font-size: 12px; padding: 4px 6px; }
+
 /* Forms */
 .form-group {
     margin-bottom: 14px;

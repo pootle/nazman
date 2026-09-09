@@ -19,7 +19,7 @@ from ..managers import metrics_store as _metrics_store
 from ..models.pool import Pool
 from ..utils.validation import validate_pool_name
 
-router = APIRouter(prefix="/api/monitoring", tags=["monitoring"])
+router = APIRouter(prefix="/api/monitoring", tags=["monitoring"], dependencies=[Depends(get_current_user)])
 
 
 def _store():
@@ -36,7 +36,7 @@ def _pool_names(db: Session) -> list:
 @router.get("/summary")
 async def get_monitoring_summary(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+
 ):
     """Live overview: cpu/memory/net latest + in-memory series + per-pool disks."""
     try:
@@ -103,7 +103,7 @@ def _selected_iface():
 @router.get("/logging")
 async def get_logging_state(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+
 ):
     """Return per-pool logging state plus general information."""
     return _logging_state_dict(db)
@@ -114,7 +114,7 @@ async def set_logging_state(
     pool: str = Query(...),
     enabled: bool = Query(...),
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+
 ):
     """Enable/disable disk metrics logging for a single pool."""
     try:
@@ -142,7 +142,7 @@ async def get_history(
     metric: str = Query("disk", pattern="^(cpu|memory|net|disk)$"),
     device: Optional[str] = Query(None),
     days: int = Query(7, ge=1, le=30),
-    current_user: dict = Depends(get_current_user),
+
 ):
     """Return historical samples for a pool from the metrics store.
 

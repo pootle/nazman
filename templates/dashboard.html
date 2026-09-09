@@ -232,10 +232,10 @@ async function loadPoolsOverview() {
             const unhealthy = pool.health && pool.health.toUpperCase() !== 'ONLINE';
             return `
                 <div class="pool-card${unhealthy ? ' card-unhealthy' : ''}">
-                    <h3>${pool.name}</h3>
+                    <h3>${escapeHtml(pool.name)}</h3>
                     <div class="pool-info">
-                        <span class="status status-${pool.status}">${pool.status}</span>
-                        <span class="topology">${pool.topology}</span>
+                        <span class="status status-${escapeHtml(pool.status)}">${escapeHtml(pool.status)}</span>
+                        <span class="topology">${escapeHtml(pool.topology)}</span>
                     </div>
                     ${usageHtml}
                     <div class="overview-meta-row">

@@ -6,7 +6,7 @@ from .smb import router as smb_router
 from .snapshots import router as snapshots_router
 from .backup import router as backup_router
 from .zfs_backup import router as zfs_backup_router
-from .system import router as system_router
+from .system import router as system_router, health_router
 from .metrics import router as metrics_router
 from .auth import router as auth_router
 
@@ -20,6 +20,7 @@ __all__ = [
     "backup_router",
     "zfs_backup_router",
     "system_router",
+    "health_router",
     "metrics_router",
     "auth_router"
 ]

@@ -53,7 +53,7 @@ class BackupManager:
             backup_db_path.parent.mkdir(parents=True, exist_ok=True)
             if db_path.exists():
                 _, _, rc = await self._run_command(
-                    ["sqlite3", str(db_path), shlex.quote(f".backup {str(backup_db_path)}")]
+                    ["sqlite3", str(db_path), f".backup {str(backup_db_path)}"]
                 )
                 if rc != 0:
                     shutil.copy2(db_path, backup_db_path)

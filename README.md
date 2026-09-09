@@ -37,7 +37,7 @@ over 80% utilisation using NFS given the right configuration.
 - Ubuntu Server 20.04+ (x86-64) or Raspberry Pi OS 64-bit (Trixie recommended) — any Debian-based distro
 - Root access
 - ZFS support (zfsutils-linux)
-- Python 3.9+
+- Python 3.10+
 
 ## Branches
 
@@ -249,7 +249,7 @@ git clone git@github.com:pootle/nazman.git
 cd nazman
 git checkout dev
 
-# Create a local dev venv (prefers python3.13, falls back to any Python 3.9+)
+# Create a local dev venv (prefers python3.13, falls back to any Python 3.10+)
 ./dev-env.sh
 
 # Or, if you have a Makefile toolchain:

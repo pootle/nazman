@@ -1,5 +1,18 @@
 // UI Components for NAZMan
 
+// Escape HTML entities to prevent XSS
+function escapeHtml(text) {
+    if (!text) return '';
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    };
+    return text.toString().replace(/[&<>"']/g, m => map[m]);
+}
+
 // Alert function
 function showAlert(message, type = 'success', duration = 3000) {
     const alert = document.createElement('div');
@@ -112,3 +125,90 @@ class EventEmitter {
 
 // Create global event emitter
 const events = new EventEmitter();
+
+// Shared device picker used by pool vdev selection and backup-disk declaration.
+// Options:
+//   single                 input type: radio (single) vs checkbox (multi)
+//   excludeOsDisks         skip OS disks entirely (backup declare)
+//   alwaysAllowWholeDisk   always offer the whole disk, even when partitioned
+//   disabledWhole          Set of disk ids whose whole disk is unavailable
+//   disabledPartitions     Map<diskId, Set<slotUuid>> of unavailable partitions
+window.DevicePicker = {
+    render(container, opts) {
+        container.innerHTML = this.renderHtml(opts);
+    },
+
+    clear(container) {
+        container.querySelectorAll('.device-pick-radio:checked, .device-pick-cb:checked')
+            .forEach(el => { el.checked = false; });
+    },
+
+    renderHtml({ disks, partitionsByDisk, single = false, excludeOsDisks = false,
+                 alwaysAllowWholeDisk = false, disabledWhole, disabledPartitions,
+                 hideUsed = false }) {
+        const wholeUsed = disabledWhole || new Set();
+        const partUsed = disabledPartitions || {};
+        const cls = single ? 'device-pick-radio' : 'device-pick-cb';
+        const type = single ? 'radio' : 'checkbox';
+
+        const rows = [];
+        for (const disk of disks) {
+            if (disk.status === 'dead') continue;
+            if (excludeOsDisks && disk.is_os_disk) continue;
+            const parts = partitionsByDisk[disk.id] || [];
+            const diskIdKey = String(disk.id);
+            const usedParts = partUsed[diskIdKey] || new Set();
+
+            const wholeDisabled = wholeUsed.has(diskIdKey)
+                || parts.some(p => usedParts.has(p.slot_uuid));
+            if (!(hideUsed && wholeDisabled)
+                && (alwaysAllowWholeDisk || parts.length === 0)) {
+                rows.push(this._labelHtml({
+                    cls, type, disabled: wholeDisabled, key: diskIdKey,
+                    main: disk.device_name,
+                    sub: `${formatBytes(disk.size_bytes)} ${disk.disk_type || ''}`,
+                    tag: 'whole disk',
+                    group: single ? 'device-pick-radio' : null,
+                }));
+            }
+
+            for (const p of parts) {
+                const disabled = (disk.is_os_disk && p.reserved)
+                    || wholeUsed.has(diskIdKey)
+                    || usedParts.has(p.slot_uuid);
+                if (hideUsed && disabled) continue;
+                rows.push(this._labelHtml({
+                    cls, type, disabled, key: `${diskIdKey}:${p.slot_uuid}`,
+                    main: `${disk.device_name} p${p.number}`,
+                    sub: formatBytes(p.size_bytes),
+                    tag: (disk.is_os_disk && p.reserved)
+                        ? 'reserved (OS)'
+                        : (p.slot_uuid || '').substring(0, 8) + '...',
+                    group: single ? 'device-pick-radio' : null,
+                }));
+            }
+        }
+
+        if (rows.length === 0) {
+            return '<p class="empty-state">No available devices.</p>';
+        }
+        return rows.join('');
+    },
+
+    _labelHtml({ cls, type, disabled, key, main, sub, tag, group }) {
+        return `
+        <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
+            <input type="${type}" class="${cls}" value="${key}" ${group ? `name="${group}"` : ''} ${disabled ? 'disabled' : ''}>
+            <span style="flex:1">
+                <span>${main}</span>
+                <small class="text-muted" style="margin-left:8px">${sub}</small>
+            </span>
+            <small class="text-muted">${tag}</small>
+        </label>`;
+    },
+
+    selectedKeys(container) {
+        return [...container.querySelectorAll('.device-pick-radio:checked, .device-pick-cb:checked')]
+            .map(el => el.value);
+    },
+};

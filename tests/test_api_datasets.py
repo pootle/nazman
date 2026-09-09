@@ -175,8 +175,7 @@ async def test_update_dataset(client, db_session):
         return {"compression": "lz4", "recordsize": "1M", "sync_mode": "standard", "quota": None}
 
     with patch("nazman.managers.zfs_manager.run_zfs") as mock_run_zfs, \
-         patch("nazman.api.datasets.run_zfs") as mock_api_run_zfs, \
-         patch("nazman.api.datasets.zfs_manager._get_dataset_properties", side_effect=fake_get_props):
+         patch("nazman.managers.zfs_manager.zfs_manager._get_dataset_properties", side_effect=fake_get_props):
         async def fake_run_zfs(*args, **kwargs):
             # Existence check (zfs list) must show the dataset name in stdout;
             # other calls (set/get) return cleanly.
@@ -184,7 +183,6 @@ async def test_update_dataset(client, db_session):
                 return ("testpool/data", "", 0)
             return ("", "", 0)
         mock_run_zfs.side_effect = fake_run_zfs
-        mock_api_run_zfs.side_effect = fake_run_zfs
         response = client.put("/api/datasets/testpool/data", json={
             "compression": "lz4",
             "recordsize": "1M",
@@ -206,19 +204,17 @@ async def test_update_dataset_special_small_blocks(client, db_session):
         return {"compression": "zstd", "recordsize": "128K", "sync_mode": "standard", "quota": None, "special_small_blocks": "64K"}
 
     with patch("nazman.managers.zfs_manager.run_zfs") as mock_run_zfs, \
-         patch("nazman.api.datasets.run_zfs") as mock_api_run_zfs, \
-         patch("nazman.api.datasets.zfs_manager._get_dataset_properties", side_effect=fake_get_props):
+         patch("nazman.managers.zfs_manager.zfs_manager._get_dataset_properties", side_effect=fake_get_props):
         async def fake_run_zfs(*args, **kwargs):
             if list(args)[0] == "list":
                 return ("testpool/data", "", 0)
             return ("", "", 0)
         mock_run_zfs.side_effect = fake_run_zfs
-        mock_api_run_zfs.side_effect = fake_run_zfs
         response = client.put("/api/datasets/testpool/data", json={
             "special_small_blocks": "64K",
         })
     assert response.status_code == 200
-    set_calls = [c for c in mock_api_run_zfs.call_args_list if c.args and c.args[0] == "set"]
+    set_calls = [c for c in mock_run_zfs.call_args_list if c.args and c.args[0] == "set"]
     assert any(c.args[1] == "special_small_blocks=64K" for c in set_calls)
 
 
@@ -233,19 +229,17 @@ async def test_update_dataset_special_small_blocks_blank_resets(client, db_sessi
         return {"compression": "zstd", "recordsize": "128K", "sync_mode": "standard", "quota": None, "special_small_blocks": "0"}
 
     with patch("nazman.managers.zfs_manager.run_zfs") as mock_run_zfs, \
-         patch("nazman.api.datasets.run_zfs") as mock_api_run_zfs, \
-         patch("nazman.api.datasets.zfs_manager._get_dataset_properties", side_effect=fake_get_props):
+         patch("nazman.managers.zfs_manager.zfs_manager._get_dataset_properties", side_effect=fake_get_props):
         async def fake_run_zfs(*args, **kwargs):
             if list(args)[0] == "list":
                 return ("testpool/data", "", 0)
             return ("", "", 0)
         mock_run_zfs.side_effect = fake_run_zfs
-        mock_api_run_zfs.side_effect = fake_run_zfs
         response = client.put("/api/datasets/testpool/data", json={
             "special_small_blocks": "",
         })
     assert response.status_code == 200
-    set_calls = [c for c in mock_api_run_zfs.call_args_list if c.args and c.args[0] == "set"]
+    set_calls = [c for c in mock_run_zfs.call_args_list if c.args and c.args[0] == "set"]
     assert any(c.args[1] == "special_small_blocks=0" for c in set_calls)
 
 

@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import patch, AsyncMock
 from nazman.models.disk import Disk
 from nazman.managers.disk_manager import refresh_device_map, clear_device_map
+from nazman.utils.exceptions import DiskError
 
 
 def _mk_disk(name="sda", by_id="/dev/disk/by-id/ata-Test_SN123", serial="SN123", **kw):
@@ -106,6 +107,7 @@ async def test_get_disk_health_not_present(client, db_session):
     clear_device_map()
 
     with patch("nazman.api.disks.disk_manager") as mock:
+        mock._live_device_path.side_effect = DiskError("Disk is not currently present; cannot read SMART health")
         response = client.get(f"/api/disks/{disk.id}/health")
         assert response.status_code == 400
         assert "not currently present" in response.json()["detail"]
@@ -172,6 +174,22 @@ async def test_wipe_os_disk_fails(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_wipe_disk_in_pool_fails(client, db_session):
+    disk = _mk_disk(by_id="/dev/disk/by-id/ata-PoolMember", serial="SN_POOL")
+    db_session.add(disk)
+    db_session.commit()
+    db_session.refresh(disk)
+    _present(name="sdb", by_id="/dev/disk/by-id/ata-PoolMember", serial="SN_POOL")
+
+    with patch("nazman.managers.zfs_manager.zfs_manager.is_disk_in_pool", new_callable=AsyncMock) as mock_is_in_pool:
+        mock_is_in_pool.return_value = "tank"
+        response = client.post(f"/api/disks/{disk.id}/wipe")
+
+    assert response.status_code == 400
+    assert "member of pool" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_patch_disk(client, db_session):
     disk = _mk_disk()
     db_session.add(disk)
@@ -227,8 +245,8 @@ async def test_batch_partition(client, db_session):
         {"device_name": "sdb", "device_path": "/dev/sdb", "by_id": "/dev/disk/by-id/ata-B", "serial": "SN_sdb"},
     ])
 
-    with patch("nazman.api.disks.run_command", new_callable=AsyncMock), \
-         patch("nazman.api.disks.write_slot_uuid", new_callable=AsyncMock):
+    with patch("nazman.managers.disk_manager.run_command", new_callable=AsyncMock), \
+         patch("nazman.managers.disk_manager.write_slot_uuid", new_callable=AsyncMock):
         response = client.post("/api/disks/batch-partition", json={
             "disk_ids": [disks[0].id, disks[1].id],
             "partitions": [{"size_mb": 1024}, {"size_mb": None}],
