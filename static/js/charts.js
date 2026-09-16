@@ -1,13 +1,6 @@
 // Shared canvas chart helpers for NAZMan dashboard + monitoring pages.
 // Loaded via base.html so both pages use one source of truth.
 
-function formatBytes(bytes) {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-    if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
-    return (bytes / 1073741824).toFixed(1) + ' GB';
-}
-
 function updateUsageColor(elementId, percent) {
     const element = document.getElementById(elementId);
     if (!element) return;

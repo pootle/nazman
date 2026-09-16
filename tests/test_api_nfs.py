@@ -1,12 +1,16 @@
 import pytest
 from unittest.mock import patch, AsyncMock
 
-from nazman.managers.nfs_manager import nfs_manager
+from nazman.managers.nfs_manager import NfsManager
+
+nfs_manager = NfsManager()
+from nazman.wiring import get_nfs_manager
+from tests.conftest import override_manager
 
 
 @pytest.mark.asyncio
 async def test_list_exports_empty(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.list_exports = AsyncMock(return_value=[])
         response = client.get("/api/nfs/")
         assert response.status_code == 200
@@ -15,7 +19,7 @@ async def test_list_exports_empty(client):
 
 @pytest.mark.asyncio
 async def test_list_exports(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.list_exports = AsyncMock(return_value=[{
             "dataset_name": "testpool/data",
             "export_path": "/testpool/data",
@@ -33,7 +37,7 @@ async def test_list_exports(client):
 
 @pytest.mark.asyncio
 async def test_list_active_exports(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.get_active_exports = AsyncMock(return_value=[
             {"path": "/testpool/data", "client": "192.168.1.0/24", "options": "rw,sync"}
         ])
@@ -45,7 +49,7 @@ async def test_list_active_exports(client):
 
 @pytest.mark.asyncio
 async def test_create_export(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         async def fake_set(db, dataset_name=None, client_spec=None, options=None, sharenfs=None, enabled=None):
             return {
                 "dataset_name": dataset_name,
@@ -68,7 +72,7 @@ async def test_create_export(client):
 
 @pytest.mark.asyncio
 async def test_update_export_enable_disable(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         async def fake_set(db, dataset_name=None, client_spec=None, options=None, sharenfs=None, enabled=None):
             return {
                 "dataset_name": dataset_name,
@@ -87,7 +91,7 @@ async def test_update_export_enable_disable(client):
 
 @pytest.mark.asyncio
 async def test_delete_export(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.delete_export = AsyncMock(return_value=None)
         response = client.delete("/api/nfs/testpool/data")
         assert response.status_code == 200
@@ -152,7 +156,7 @@ async def test_pause_unshares_and_preserves_options():
 
     with patch.object(manager.__class__, "_dataset_exists", fake_exists), \
          patch.object(manager.__class__, "is_server_present", fake_present), \
-         patch.object(manager.__class__, "_read_sharenfs", fake_read), \
+         patch.object(manager.__class__, "read_sharenfs", fake_read), \
          patch.object(manager.__class__, "_active_export_paths", fake_active), \
          patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_zfs):
         result = await manager.set_export(None, "testpool/data", enabled=False)
@@ -186,7 +190,7 @@ async def test_resume_reshare_with_stored_options():
 
     with patch.object(manager.__class__, "_dataset_exists", fake_exists), \
          patch.object(manager.__class__, "is_server_present", fake_present), \
-         patch.object(manager.__class__, "_read_sharenfs", fake_read), \
+         patch.object(manager.__class__, "read_sharenfs", fake_read), \
          patch.object(manager.__class__, "_active_export_paths", fake_active), \
          patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_zfs):
         result = await manager.set_export(None, "testpool/data", enabled=True)
@@ -212,7 +216,7 @@ async def test_resume_off_share_raises():
 
     with patch.object(manager.__class__, "_dataset_exists", fake_exists), \
          patch.object(manager.__class__, "is_server_present", fake_present), \
-         patch.object(manager.__class__, "_read_sharenfs", fake_read):
+         patch.object(manager.__class__, "read_sharenfs", fake_read):
         with pytest.raises(ValidationError, match="recreate"):
             await manager.set_export(None, "testpool/data", enabled=True)
 
@@ -273,8 +277,8 @@ async def test_list_exports_excludes_off_and_flags_paused():
     async def fake_active(*a, **k):
         return {"/testpool/a"}
 
-    with patch.object(manager.__class__, "_list_dataset_names", fake_names), \
-         patch.object(manager.__class__, "_read_sharenfs", fake_read), \
+    with patch.object(manager.__class__, "list_dataset_names", fake_names), \
+         patch.object(manager.__class__, "read_sharenfs", fake_read), \
          patch.object(manager.__class__, "_active_export_paths", fake_active):
         rows = await manager.list_exports(None)
 
@@ -285,7 +289,7 @@ async def test_list_exports_excludes_off_and_flags_paused():
 
 @pytest.mark.asyncio
 async def test_get_presence(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.is_server_present = lambda: True
         response = client.get("/api/nfs/presence")
         assert response.status_code == 200
@@ -294,7 +298,7 @@ async def test_get_presence(client):
 
 @pytest.mark.asyncio
 async def test_install_server(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.install_server = AsyncMock(
             return_value={"installed": True, "message": "NFS kernel server installed successfully."})
         response = client.post("/api/nfs/install")
@@ -305,7 +309,7 @@ async def test_install_server(client):
 @pytest.mark.asyncio
 async def test_install_server_error(client):
     from nazman.utils.exceptions import NfsError
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.install_server = AsyncMock(side_effect=NfsError("apt failed"))
         response = client.post("/api/nfs/install")
         assert response.status_code == 400
@@ -314,7 +318,7 @@ async def test_install_server_error(client):
 
 @pytest.mark.asyncio
 async def test_install_server_already_installed(client):
-    with patch("nazman.api.nfs.nfs_manager") as mock:
+    with override_manager(get_nfs_manager) as mock:
         mock.install_server = AsyncMock(
             return_value={"installed": True, "message": "The NFS kernel server is already installed."})
         response = client.post("/api/nfs/install")

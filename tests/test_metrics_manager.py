@@ -156,7 +156,7 @@ async def test_disk_collector_records_per_disk_series(tmp_path):
 
 @pytest.mark.asyncio
 async def test_normalize_base_name():
-    from nazman.managers.metrics_manager import normalize_base_name
+    from nazman.utils.devices import normalize_base_name
     assert normalize_base_name("sda") == "sda"
     assert normalize_base_name("sda1") == "sda"
     assert normalize_base_name("nvme0n1p2") == "nvme0n1"
@@ -168,7 +168,7 @@ def test_normalize_base_name_resolves_by_id_alias():
     """Bare by-id alias (like zpool leaf names) resolves to the base kernel name."""
     import os
     from unittest.mock import patch
-    from nazman.managers.metrics_manager import normalize_base_name
+    from nazman.utils.devices import normalize_base_name
 
     alias = "ata-WDC_WD80EFBX-part15"
     # Simulate /dev/disk/by-id/<alias> existing and resolving to /dev/sdc1

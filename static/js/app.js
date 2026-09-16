@@ -32,16 +32,12 @@ async function initializeApp() {
 }
 
 async function checkAuthentication() {
-    // Validate the stored token; if absent or invalid, prompt to sign in.
+    // Prompt only when there is no token at all. Token validity is enforced
+    // lazily by the API client (any 401 triggers re-auth + retry); probing
+    // /api/system/status here used to run a full disk/SMART sync on every
+    // page load AND — worse — a transient probe failure destroyed a valid
+    // session, re-prompting on the next page.
     if (!api._hasToken()) {
-        await api._requireAuth().catch(() => {});
-        return;
-    }
-    try {
-        await api.getSystemStatus();
-    } catch (error) {
-        // Token may be invalid / expired: clear it and re-prompt.
-        api.logout();
         await api._requireAuth().catch(() => {});
     }
 }

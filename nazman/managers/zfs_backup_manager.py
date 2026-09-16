@@ -3,28 +3,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 import asyncio
 import json
+import logging
 import os
 import re
 import time
-import uuid
 
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
-from ..utils.commands import run_command, run_zfs, run_zpool, run_pipeline
-from ..utils.exceptions import BackupError, ValidationError
+from ..utils.commands import run_command, run_zfs, run_pipeline
+from ..utils.exceptions import BackupError, BackupDiskNotFoundError, BackupRunNotFoundError, ValidationError
 from ..utils.validation import validate_dataset_name
-from ..managers.disk_manager import (
+from ..utils.devices import (
     get_device_path, read_slot_uuids, resolve_slot_to_device, partition_by_id,
-    get_os_reserved_partition_names,
+    os_reserved_partition_names, kernel_base_name,
 )
+from ..utils import zfs_query
 from ..models.disk import Disk
 from ..models.backup_zfs import BackupDisk, BackupSchedule, BackupRun
 from ..models.scheduler import ScheduledTask, TaskType
 
+logger = logging.getLogger(__name__)
+
 # Marker prefix for backup anchor snapshots so they are distinct from the
 # scheduler's auto-* snapshots and never touched by generic snapshot retention.
 BACKUP_SNAP_PREFIX = "backup-"
+
+# How long a failed in-memory declaration stays visible in the disk list.
+PENDING_FAILED_TTL = 600
 
 
 def _ts() -> str:
@@ -56,8 +62,15 @@ class ZfsBackupManager:
     prunes it only after the next incremental is successfully written.
     """
 
-    def __init__(self):
+    def __init__(self, zfs=None, scheduler=None):
         self.settings = get_settings()
+        # Collaborators injected at wiring time (constructor injection keeps
+        # the manager independently testable and free of import cycles).
+        self.zfs = zfs
+        self.scheduler = scheduler
+        self._pending_declares: Dict[int, Dict[str, Any]] = {}
+        self._declare_tasks: set = set()
+        self._backup_tasks: set = set()
 
     # ── Backup disk declaration / formatting ─────────────────────────────
     async def get_mount_base(self) -> Path:
@@ -81,7 +94,9 @@ class ZfsBackupManager:
 
         Availability: ``mounted`` / ``full`` / ``unmounted`` / ``mismatch`` /
         ``offline``.  Capacity is taken from the mounted filesystem when
-        mounted, otherwise the physical disk size with free=0.
+        mounted, otherwise probed from the ext-family superblock (dumpe2fs) so
+        the backup partition's free space is still reported while unmounted.
+        When neither is possible the physical disk size is shown with free=0.
         """
         state = await self._probe_device(rec)
         total = free = 0
@@ -94,11 +109,45 @@ class ZfsBackupManager:
                     state = "full"
             except OSError:
                 state = "mounted"
-        elif rec.disk and rec.disk.size_bytes:
+        elif state == "unmounted":
+            usage = await self._probe_partition_usage(rec)
+            if usage:
+                total, free = usage
+                if free < (1 << 20):
+                    state = "full"
+        if not total and rec.disk and rec.disk.size_bytes:
             total = rec.disk.size_bytes
         return {"status": state, "total_bytes": total, "free_bytes": free}
 
-    async def _serialize_now(self, rec: BackupDisk) -> Dict[str, Any]:
+    async def _probe_partition_usage(self, rec: BackupDisk) -> Optional[Tuple[int, int]]:
+        """Read an unmounted ext-family partition's total/free bytes via dumpe2fs.
+
+        Returns ``(total, free)`` bytes or None when the filesystem type is not
+        ext-family, the device is missing, or the probe fails.
+        """
+        dev = self._dev_path(rec)
+        if not dev or not os.path.exists(dev):
+            return None
+        if (rec.fs_type or "ext4").lower() not in ("ext2", "ext3", "ext4"):
+            return None
+        _, out, rc = await run_command(
+            ["dumpe2fs", "-h", dev], timeout=30, check=False, op="read", category="disk"
+        )
+        if rc != 0:
+            return None
+        blocks = free_blocks = block_size = None
+        for line in out.splitlines():
+            if "Block count:" in line:
+                blocks = int(line.split(":", 1)[1].strip())
+            elif "Free blocks:" in line:
+                free_blocks = int(line.split(":", 1)[1].strip())
+            elif "Block size:" in line:
+                block_size = int(line.split(":", 1)[1].strip())
+        if None in (blocks, free_blocks, block_size) or block_size <= 0:
+            return None
+        return blocks * block_size, free_blocks * block_size
+
+    async def serialize_now(self, rec: BackupDisk) -> Dict[str, Any]:
         """Full response view of a backup disk with freshly computed state."""
         return {**self._to_dict(rec), **await self._probe_state(rec)}
 
@@ -117,8 +166,23 @@ class ZfsBackupManager:
         }
 
     async def list_backup_disks(self, db: Session) -> List[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        pending = []
+        for disk_id, entry in list(self._pending_declares.items()):
+            if entry["status"] == "failed" and (now - entry["started_at"]).total_seconds() > PENDING_FAILED_TTL:
+                self._pending_declares.pop(disk_id, None)
+                continue
+            pending.append(self._pending_to_dict(entry))
         disks = db.query(BackupDisk).order_by(BackupDisk.id).all()
-        return [await self._serialize_now(d) for d in disks]
+        return pending + [await self.serialize_now(d) for d in disks]
+
+    def pending_disk_ids(self) -> List[int]:
+        """Disk ids with an in-flight (or recently failed) declaration."""
+        return sorted(self._pending_declares.keys())
+
+    def _pending_to_dict(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Response view of an in-memory pending/failed declaration."""
+        return {k: v for k, v in entry.items() if k != "started_at"}
 
     async def _probe_device(self, rec: BackupDisk) -> str:
         """Determine the disk's current state without mounting it.
@@ -152,6 +216,77 @@ class ZfsBackupManager:
             return
         await self._unmount_rec(rec)
 
+    async def start_declare_backup_disk(
+        self, db: Session, disk_id: int, confirm: bool = False,
+        slot_uuid: Optional[str] = None, label: Optional[str] = None,
+        wipe_raid: bool = False,
+    ) -> Dict[str, Any]:
+        """Validate quickly, register an in-memory ``pending`` entry and launch
+        the wipe/format as a background task; returns the pending view at once.
+
+        The destructive work runs in ``_run_declare`` so the caller sees the
+        new backup disk in the list immediately.  The in-memory entry is
+        replaced by the real DB row on success, or flips to ``failed`` (with
+        ``error``) so failures are reported without a blocking request.
+        """
+        disk = db.query(Disk).filter(Disk.id == disk_id).first()
+        if not disk:
+            raise ValidationError("Disk not found")
+        if disk.is_os_disk:
+            raise ValidationError("Cannot use the OS disk as a backup disk")
+        if not confirm:
+            raise ValidationError("Destructive action requires confirmation")
+        if db.query(BackupDisk).filter(BackupDisk.disk_id == disk_id).first():
+            raise ValidationError("Disk is already declared as a backup disk")
+        cur = self._pending_declares.get(disk_id)
+        if cur and cur["status"] == "pending":
+            raise ValidationError("A declaration for this disk is already in progress")
+
+        entry = {
+            "id": -disk_id,
+            "disk_id": disk_id,
+            "slot_uuid": slot_uuid,
+            "partition_number": 1,
+            "device_path": partition_by_id(disk.by_id, 1) if disk.by_id else None,
+            "label": label,
+            "fs_type": "ext4",
+            "mount_point": "",
+            "fs_uuid": "",
+            "total_bytes": disk.size_bytes or 0,
+            "free_bytes": 0,
+            "status": "pending",
+            "unmount_after_backup": True,
+            "error": None,
+            "started_at": datetime.now(timezone.utc),
+        }
+        self._pending_declares[disk_id] = entry
+        task = asyncio.create_task(
+            self._run_declare(disk_id, slot_uuid, label, wipe_raid)
+        )
+        self._declare_tasks.add(task)
+        task.add_done_callback(self._declare_tasks.discard)
+        return self._pending_to_dict(entry)
+
+    async def _run_declare(
+        self, disk_id: int, slot_uuid: Optional[str], label: Optional[str],
+        wipe_raid: bool,
+    ) -> None:
+        """Background task executing the actual wipe+format declaration."""
+        try:
+            from ..database import get_db_context
+            with get_db_context() as db:
+                await self.declare_backup_disk(
+                    db, disk_id, confirm=True,
+                    slot_uuid=slot_uuid, label=label, wipe_raid=wipe_raid,
+                )
+            self._pending_declares.pop(disk_id, None)
+        except Exception as e:
+            entry = self._pending_declares.get(disk_id)
+            if entry:
+                entry["status"] = "failed"
+                entry["error"] = str(e)
+            logger.error("background declare failed for disk %s: %s", disk_id, e, exc_info=True)
+
     async def declare_backup_disk(
         self, db: Session, disk_id: int, confirm: bool = False,
         slot_uuid: Optional[str] = None, label: Optional[str] = None,
@@ -174,9 +309,8 @@ class ZfsBackupManager:
         if not confirm:
             raise ValidationError("Destructive action requires confirmation")
 
-        from .zfs_manager import zfs_manager
-        pool_members = await zfs_manager.get_pool_members()
-        member_pool = self._pool_member_for_disk(pool_members, disk)
+        pool_members = await self._get_pool_members()
+        member_pool = zfs_query.pool_member_for_disk(pool_members, disk)
         if member_pool:
             raise ValidationError(f"Disk is a member of pool '{member_pool}'; remove it from the pool first")
 
@@ -238,7 +372,7 @@ class ZfsBackupManager:
         db.refresh(rec)
         if rec.unmount_after_backup:
             await self._unmount_rec(rec)
-        return await self._serialize_now(rec)
+        return await self.serialize_now(rec)
 
     def _partition_number(self, dev: str) -> int:
         """Parse the partition number from a by-id (-partN) or kernel path."""
@@ -280,20 +414,11 @@ class ZfsBackupManager:
             return f"{by_id}-part1"
         return f"/dev/{part_name}"
 
-    @staticmethod
-    def _pool_member_for_disk(pool_members: Dict[str, str], disk: Disk) -> Optional[str]:
-        """Return the pool that owns ``disk`` (whole-disk or any partition)."""
-        if not disk.by_id:
-            return None
-        by_id = disk.by_id
-        basename = by_id.rsplit("/", 1)[-1]
-        for key in (by_id, basename):
-            if key in pool_members:
-                return pool_members[key]
-        for dev, pool in pool_members.items():
-            if dev.startswith((f"{by_id}-part", f"{basename}-part")):
-                return pool
-        return None
+    async def _get_pool_members(self) -> Dict[str, str]:
+        """Live {device path -> pool name} map, via the injected ZfsManager."""
+        if self.zfs is None:
+            return {}
+        return await self.zfs.get_pool_members()
 
     @staticmethod
     def _pool_member_for_device(pool_members: Dict[str, str], dev: str) -> Optional[str]:
@@ -375,7 +500,7 @@ class ZfsBackupManager:
 
     async def _md_superblocks(self, devices: List[str]) -> List[Dict[str, Any]]:
         """Probe ``mdadm --examine`` for every device; return matching entries."""
-        os_names = await get_os_reserved_partition_names()
+        os_names = await os_reserved_partition_names()
         found = []
         for dev in devices:
             stdout, _, rc = await run_command(
@@ -587,7 +712,7 @@ class ZfsBackupManager:
                 raise BackupError(
                     "Backup disk could not be woken by software; power-cycle its enclosure"
                 )
-        return await self._serialize_now(rec)
+        return await self.serialize_now(rec)
 
     async def mount_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
@@ -595,7 +720,7 @@ class ZfsBackupManager:
             raise ValidationError("Backup disk not found")
         state = await self._probe_device(rec)
         if state == "mounted":
-            return await self._serialize_now(rec)
+            return await self.serialize_now(rec)
         if state == "offline":
             # The disk may be asleep or its bridge idle-but-enumerated; try to
             # bring it back before giving up so scheduled/manual backups can
@@ -618,7 +743,7 @@ class ZfsBackupManager:
         )
         if rc != 0 or not Path(rec.mount_point).is_mount():
             raise BackupError("Failed to mount backup disk")
-        return await self._serialize_now(rec)
+        return await self.serialize_now(rec)
 
     async def unmount_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
@@ -626,13 +751,13 @@ class ZfsBackupManager:
             raise ValidationError("Backup disk not found")
         if not await self._unmount_rec(rec):
             raise BackupError("Failed to unmount backup disk")
-        return await self._serialize_now(rec)
+        return await self.serialize_now(rec)
 
     async def scan_backup_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
         if not rec:
             raise ValidationError("Backup disk not found")
-        return await self._serialize_now(rec)
+        return await self.serialize_now(rec)
 
     async def deregister_backup_disk(self, db: Session, backup_disk_id: int) -> None:
         rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
@@ -666,10 +791,7 @@ class ZfsBackupManager:
 
     async def _dataset_exists(self, dataset_name: str) -> bool:
         """Confirm a dataset currently exists in ZFS by its full name."""
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", dataset_name, check=False, op="read",
-        )
-        return rc == 0 and dataset_name in stdout.split()
+        return await zfs_query.dataset_exists(dataset_name)
 
     async def estimate_incremental_size(self, db: Session, dataset_name: str) -> int:
         """Estimate incr size: last incremental's changed_bytes, else 10% of used."""
@@ -699,18 +821,26 @@ class ZfsBackupManager:
         return free >= needed_bytes
 
     # ── Backup engine -------------------------------------------------------
-    async def run_backup(
-        self,
-        db: Session,
-        dataset_name: str,
-        backup_disk_id: int,
+    async def _has_changes(self, base_snapshot: str, snap: str) -> bool:
+        """Check if there are any file-level differences between two snapshots."""
+        try:
+            stdout, _stderr, rc = await run_zfs(
+                "diff", base_snapshot, snap, timeout=120, check=False,
+            )
+            if rc != 0:
+                return True
+            return bool(stdout.strip())
+        except Exception:
+            return True
+
+    async def start_run_backup(
+        self, db: Session, dataset_name: str, backup_disk_id: int,
         backup_type: str = "full",
     ) -> BackupRun:
-        """Run a full or incremental backup of a dataset to a backup disk."""
+        """Kick off a backup run as a background task; returns the run record
+        immediately so the caller sees a ``running`` entry in the UI."""
         if backup_type not in ("full", "incremental"):
             raise ValidationError("backup_type must be 'full' or 'incremental'")
-
-        # The dataset is identified by its ZFS name; confirm it exists in ZFS.
         ok = await self._dataset_exists(dataset_name)
         if not ok:
             raise ValidationError(f"Dataset '{dataset_name}' not found")
@@ -722,32 +852,74 @@ class ZfsBackupManager:
             dataset_name=dataset_name,
             backup_disk_id=backup_disk_id,
             backup_type=backup_type,
-            snapshot="",
-            stream_file="",
             status="running",
+            phase="pending",
         )
         db.add(run)
         db.commit()
         db.refresh(run)
 
+        task = asyncio.create_task(
+            self._run_backup_worker(run.id),
+        )
+        self._backup_tasks.add(task)
+        task.add_done_callback(self._backup_tasks.discard)
+        return run
+
+    async def _run_backup_worker(self, run_id: int) -> None:
+        """Background task that performs the actual backup."""
+        try:
+            from ..database import get_db_context
+            with get_db_context() as db:
+                run = db.query(BackupRun).filter(BackupRun.id == run_id).first()
+                if not run:
+                    return
+                await self._do_backup(db, run)
+        except Exception as e:
+            logger.error("background backup failed for run %s: %s", run_id, e, exc_info=True)
+
+    async def _do_backup(self, db: Session, run: BackupRun) -> None:
+        """Core backup logic operating on an existing BackupRun record."""
+        rec = db.query(BackupDisk).filter(BackupDisk.id == run.backup_disk_id).first()
         snap = None
         try:
-            await self.mount_backup_disk(db, backup_disk_id)
+            run.phase = "snapshotting"
+            db.commit()
 
-            snap = f"{dataset_name}@{BACKUP_SNAP_PREFIX}{_ts()}"
-            await run_zfs("snapshot", "-r", snap, timeout=120, check=True)
+            await self.mount_backup_disk(db, run.backup_disk_id)
 
+            backup_type = run.backup_type
             base_snapshot = None
             full_anchor = None
             if backup_type == "incremental":
-                base_snapshot = await self._find_anchor(dataset_name)
+                # Resolve the anchor BEFORE creating the new snapshot: the
+                # anchor is the most recent backup-* snapshot, which would
+                # otherwise be the snapshot we are about to create (choosing it
+                # as the -i base makes `zfs send` reject "incremental source is
+                # not earlier than it").
+                base_snapshot = await self._find_anchor(run.dataset_name)
                 if base_snapshot is None:
-                    # No anchor -> promote to a full backup automatically.
                     backup_type = "full"
+                    run.backup_type = "full"
                 else:
-                    full_anchor = await self._find_full_anchor(dataset_name, base_snapshot)
+                    full_anchor = await self._find_full_anchor(run.dataset_name, base_snapshot)
 
-            dest_dir = self._dataset_dir(rec.mount_point, dataset_name)
+            snap = f"{run.dataset_name}@{BACKUP_SNAP_PREFIX}{_ts()}"
+            await run_zfs("snapshot", "-r", snap, timeout=120, check=True)
+            run.snapshot = snap
+            db.commit()
+
+            # Zero-change detection for incremental backups.
+            if backup_type == "incremental" and base_snapshot:
+                if not await self._has_changes(base_snapshot, snap):
+                    run.status = "skipped"
+                    run.error = None
+                    run.completed_at = datetime.now(timezone.utc)
+                    db.commit()
+                    await run_zfs("destroy", "-r", snap, timeout=60, check=False)
+                    return
+
+            dest_dir = self._dataset_dir(rec.mount_point, run.dataset_name)
             dest_dir.mkdir(parents=True, exist_ok=True)
             suffix = "zfs.gz"
             if backup_type == "full":
@@ -758,54 +930,65 @@ class ZfsBackupManager:
                 send_cmd = ["zfs", "send", "-R", "-i", base_snapshot, snap]
             stream_file = str(dest_dir / file_name)
 
-            # Capacity guard: estimate needed space vs free space.
             if backup_type == "full":
-                needed = await self.estimate_needed(dataset_name)
-                run.changed_bytes = 0  # full backups report changed=0; UI uses entire stream
+                needed = await self.estimate_needed(run.dataset_name)
+                run.changed_bytes = 0
             else:
-                needed = await self.estimate_incremental_size(db, dataset_name)
-            if not await self.check_capacity(db, backup_disk_id, needed):
+                needed = await self.estimate_incremental_size(db, run.dataset_name)
+            if not await self.check_capacity(db, run.backup_disk_id, needed):
                 await run_zfs("destroy", "-r", snap, timeout=60, check=False)
                 run.status = "failed"
                 run.error = "Insufficient free space on backup disk"
                 db.commit()
-                return run
+                logger.error("backup run %s failed: %s", run.id, run.error)
+                return
+
+            run.phase = "sending"
+            run.stream_file = stream_file
+            db.commit()
 
             gzip_level = int(self.settings.backup_gzip_level)
-            _, stderr, rc = await run_pipeline(
+            pipeline_task = asyncio.create_task(run_pipeline(
                 [send_cmd, ["gzip", f"-{gzip_level}"]],
                 stdout_path=stream_file,
                 timeout=86400, check=False, op="write", category="zfs",
-            )
+            ))
+            # Monitor the stream file while the pipeline writes.
+            while not pipeline_task.done():
+                await asyncio.sleep(3)
+                try:
+                    run.size_bytes = Path(stream_file).stat().st_size
+                    db.commit()
+                except OSError:
+                    pass
+            _, stderr, rc = pipeline_task.result()
+
             if rc != 0:
                 Path(stream_file).unlink(missing_ok=True)
                 await run_zfs("destroy", "-r", snap, timeout=60, check=False)
                 run.status = "failed"
                 run.error = stderr or "zfs send failed"
                 db.commit()
-                return run
+                logger.error("backup run %s failed: %s", run.id, run.error)
+                return
 
-            size_bytes = Path(stream_file).stat().st_size if Path(stream_file).exists() else 0
-
-            # Any remaining bytes are "changed data"; for a full it's the whole stream.
-            run.backup_type = backup_type
-            run.snapshot = snap
+            run.size_bytes = Path(stream_file).stat().st_size if Path(stream_file).exists() else 0
             run.base_snapshot = base_snapshot
             run.full_anchor = full_anchor
-            run.stream_file = stream_file
-            run.size_bytes = size_bytes
             if backup_type == "incremental":
-                run.changed_bytes = size_bytes
+                run.changed_bytes = run.size_bytes
             run.status = "success"
+            run.phase = None
             run.completed_at = datetime.now(timezone.utc)
             db.commit()
 
-            # Prune old source anchors now that this backup is safely written.
+            run.phase = "pruning"
+            db.commit()
             if backup_type == "incremental" and base_snapshot:
-                await self._prune_old_anchors(dataset_name, snap)
+                await self._prune_old_anchors(run.dataset_name, snap)
             else:
-                await self._prune_old_anchors(dataset_name, snap, keep_full=snap)
-            return run
+                await self._prune_old_anchors(run.dataset_name, snap, keep_full=snap)
+            return
 
         except Exception as e:
             if snap and not run.snapshot:
@@ -814,9 +997,40 @@ class ZfsBackupManager:
             run.error = str(e)
             run.completed_at = datetime.now(timezone.utc)
             db.commit()
-            return run
+            logger.error("backup run %s failed: %s", run.id, run.error, exc_info=True)
+            return
         finally:
             await self._restore_idle_state(rec)
+
+    async def run_backup(
+        self,
+        db: Session,
+        dataset_name: str,
+        backup_disk_id: int,
+        backup_type: str = "full",
+    ) -> BackupRun:
+        """Run a full or incremental backup of a dataset to a backup disk (blocking)."""
+        if backup_type not in ("full", "incremental"):
+            raise ValidationError("backup_type must be 'full' or 'incremental'")
+        ok = await self._dataset_exists(dataset_name)
+        if not ok:
+            raise ValidationError(f"Dataset '{dataset_name}' not found")
+        rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
+        if not rec:
+            raise ValidationError("Backup disk not found")
+
+        run = BackupRun(
+            dataset_name=dataset_name,
+            backup_disk_id=backup_disk_id,
+            backup_type=backup_type,
+            status="running",
+            phase="pending",
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        await self._do_backup(db, run)
+        return run
 
     async def estimate_needed(self, dataset_name: str) -> int:
         """Needed bytes for a full backup of a dataset (with safety margin)."""
@@ -881,8 +1095,6 @@ class ZfsBackupManager:
         Called on scheduler startup so scheduled full/incremental backups survive
         restarts, and used by the API when a schedule is saved or removed.
         """
-        from .scheduler import scheduler_manager
-
         # Names map uniquely back to their schedule row (dataset + disk + type).
         schedules = db.query(BackupSchedule).all()
         desired: Dict[str, Dict] = {}
@@ -909,20 +1121,20 @@ class ZfsBackupManager:
             config = {k: cfg[k] for k in ("dataset_name", "backup_disk_id", "type", "retention")}
             task = existing.get(name)
             if task is None:
-                await scheduler_manager.create_task(
+                await self.scheduler.create_task(
                     db, name=name, task_type=TaskType.ZFS_BACKUP,
                     target=str(cfg["dataset_name"]), schedule=sched_cron, config=config,
                 )
             else:
                 if task.schedule != sched_cron or task.config != config:
-                    await scheduler_manager.update_task(
+                    await self.scheduler.update_task(
                         db, task.id, schedule=sched_cron, config=config,
                     )
 
         # Remove tasks whose schedule row is gone or disabled.
         for name, task in existing.items():
             if name not in desired:
-                await scheduler_manager.delete_task(db, task.id)
+                await self.scheduler.delete_task(db, task.id)
 
     # -- restore -------------------------------------------------------------
 
@@ -1003,10 +1215,207 @@ class ZfsBackupManager:
             raise BackupError(f"Restore failed: {stderr}")
         return {"dataset": target_dataset, "source": str(fp), "force": force}
 
+    # ── Router-facing aggregation (was duplicated inside api/zfs_backup) ──
 
-def shquote(s: str) -> str:
-    import shlex
-    return shlex.quote(s)
+    async def list_schedules(self, db: Session) -> List[Dict[str, Any]]:
+        """All backup schedule rows as plain dicts."""
+        return [
+            {
+                "id": s.id, "dataset_name": s.dataset_name,
+                "backup_disk_id": s.backup_disk_id,
+                "full_cron": s.full_cron, "incremental_cron": s.incremental_cron,
+                "full_retention": s.full_retention,
+                "incremental_retention": s.incremental_retention,
+                "enabled": s.enabled,
+            }
+            for s in db.query(BackupSchedule).all()
+        ]
+
+    async def used_backup_targets(self, db: Session) -> List[Dict[str, Any]]:
+        """(disk_id, slot_uuid) pairs unavailable as backup targets.
+
+        Includes already-declared backup disks, in-flight declarations, and
+        every device currently held by an imported pool (whole disks and
+        partition members). slot_uuid is None when the whole disk is held.
+        """
+        used: List[Dict[str, Any]] = []
+        seen = set()
+
+        def add(disk_id: int, slot_uuid: Optional[str]) -> None:
+            key = (disk_id, slot_uuid)
+            if key not in seen:
+                seen.add(key)
+                used.append({"disk_id": disk_id, "slot_uuid": slot_uuid})
+
+        for d in db.query(BackupDisk).all():
+            add(d.disk_id, d.slot_uuid)
+        for disk_id in self.pending_disk_ids():
+            add(disk_id, None)
+        for dev in await self._get_pool_members():
+            entry = self._usage_entry_for_device(db, dev)
+            if entry:
+                add(entry["disk_id"], entry["slot_uuid"])
+        return used
+
+    def _usage_entry_for_device(self, db: Session, dev: str) -> Optional[Dict[str, Any]]:
+        """Resolve a zpool-reported device to the disk it occupies.
+
+        A device held by a pool (whole disk, or a partition on a disk) claims
+        the whole disk: ZFS owns the disk, so none of its partitions may be
+        offered as a backup target.  Always returns slot_uuid=None.
+        """
+        disk = None
+        if dev.startswith("/dev/disk/by-id/"):
+            m = re.search(r"-part(\d+)$", dev)
+            base = dev[:m.start()] if m else dev
+            disk = db.query(Disk).filter(Disk.by_id == base).first()
+        else:
+            # by-id basename (zpool drops the /dev/disk/by-id/ prefix, and for
+            # partitioned vdevs also the -partN suffix); otherwise a kernel name.
+            disk = db.query(Disk).filter(Disk.by_id == f"/dev/disk/by-id/{dev}").first()
+            if not disk:
+                disk = self._find_disk_by_device_path(db, f"/dev/{dev}")
+            if not disk and dev:
+                base = kernel_base_name(dev)
+                if base != dev:
+                    disk = self._find_disk_by_device_path(db, f"/dev/{base}")
+        if not disk:
+            return None
+        return {"disk_id": disk.id, "slot_uuid": None}
+
+    @staticmethod
+    def _find_disk_by_device_path(db: Session, dev_path: str) -> Optional[Disk]:
+        for d in db.query(Disk).all():
+            if get_device_path(d) == dev_path:
+                return d
+        return None
+
+    async def update_backup_disk(
+        self, db: Session, backup_disk_id: int, unmount_after_backup: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
+        if not rec:
+            raise BackupDiskNotFoundError("Backup disk not found")
+        if unmount_after_backup is not None:
+            rec.unmount_after_backup = unmount_after_backup
+        db.commit()
+        db.refresh(rec)
+        return await self.serialize_now(rec)
+
+    async def list_runs(self, db: Session, limit: int = 200) -> List[BackupRun]:
+        return db.query(BackupRun).order_by(BackupRun.id.desc()).limit(limit).all()
+
+    def get_run(self, db: Session, run_id: int) -> BackupRun:
+        run = db.query(BackupRun).filter(BackupRun.id == run_id).first()
+        if not run:
+            raise BackupRunNotFoundError("Run not found")
+        return run
+
+    async def list_backupable_datasets(self, db: Session) -> List[Dict[str, Any]]:
+        """All datasets with per-disk schedules, backup status, and run info.
+
+        Datasets are enumerated live from ZFS; there is no DB table of datasets.
+        """
+        dataset_names = await zfs_query.all_filesystem_names()
+
+        disk_labels = {d.id: d.label for d in db.query(BackupDisk).all()}
+        schedules_by_dataset: Dict[str, List[BackupSchedule]] = {}
+        for s in db.query(BackupSchedule).all():
+            schedules_by_dataset.setdefault(s.dataset_name, []).append(s)
+
+        runs = db.query(BackupRun).order_by(BackupRun.id.desc()).all()
+        changed_since_full: Dict[str, int] = {}
+        full_runs: Dict[str, int] = {}
+        last_run: Dict[str, BackupRun] = {}
+        last_run_per_disk: Dict[tuple, BackupRun] = {}
+        full_seen = set()
+        for r in runs:
+            last_run.setdefault(r.dataset_name, r)
+            last_run_per_disk.setdefault((r.dataset_name, r.backup_disk_id), r)
+            if r.status != "success":
+                continue
+            full_runs[r.dataset_name] = full_runs.get(r.dataset_name, 0) + 1
+            if r.backup_type == "full":
+                changed_since_full[r.dataset_name] = 0
+                full_seen.add(r.dataset_name)
+            elif r.dataset_name not in full_seen:
+                # Sum of incremental streams after the most recent full backup.
+                changed_since_full[r.dataset_name] = (
+                    changed_since_full.get(r.dataset_name, 0) + (r.changed_bytes or 0)
+                )
+
+        out = []
+        for name in dataset_names:
+            scheds = sorted(schedules_by_dataset.get(name, []), key=lambda s: s.backup_disk_id)
+            last = last_run.get(name)
+            out.append({
+                "name": name,
+                "schedules": [
+                    {
+                        "backup_disk_id": s.backup_disk_id,
+                        "label": disk_labels.get(s.backup_disk_id) or f"Disk {s.backup_disk_id}",
+                        "full_cron": s.full_cron,
+                        "incremental_cron": s.incremental_cron,
+                        "enabled": s.enabled,
+                        "last_type": last_run_per_disk.get((name, s.backup_disk_id)).backup_type
+                        if last_run_per_disk.get((name, s.backup_disk_id)) else None,
+                        "last_status": last_run_per_disk.get((name, s.backup_disk_id)).status
+                        if last_run_per_disk.get((name, s.backup_disk_id)) else None,
+                    }
+                    for s in scheds
+                ],
+                "full_cron": scheds[0].full_cron if scheds else None,
+                "incremental_cron": scheds[0].incremental_cron if scheds else None,
+                "enabled": bool(scheds),
+                "last_type": last.backup_type if last else None,
+                "last_status": last.status if last else None,
+                "last_changed_bytes": last.changed_bytes if last else 0,
+                "last_completed_at": (last.completed_at or last.started_at) if last else None,
+                "changed_since_full": changed_since_full.get(name, 0),
+                "full_runs": full_runs.get(name, 0),
+            })
+        return out
+
+    async def upsert_schedule(self, db: Session, body: Dict[str, Any]) -> BackupSchedule:
+        """Create or update the backup schedule for a (dataset, disk) pair."""
+        dataset_name = body.get("dataset_name")
+        backup_disk_id = body.get("backup_disk_id")
+        if not dataset_name:
+            raise ValidationError("dataset_name required")
+        if not backup_disk_id:
+            raise ValidationError("backup_disk_id required")
+        sched = db.query(BackupSchedule).filter(
+            BackupSchedule.dataset_name == dataset_name,
+            BackupSchedule.backup_disk_id == backup_disk_id,
+        ).first()
+        if not sched:
+            sched = BackupSchedule(dataset_name=dataset_name, backup_disk_id=backup_disk_id)
+            db.add(sched)
+        sched.full_cron = body.get("full_cron")
+        sched.incremental_cron = body.get("incremental_cron")
+        sched.full_retention = body.get("full_retention", 3)
+        sched.incremental_retention = body.get("incremental_retention", 7)
+        sched.enabled = body.get("enabled", True)
+        db.commit()
+        db.refresh(sched)
+
+        # Reconcile ScheduledTask jobs so saved crons actually fire.
+        await self.sync_scheduled_tasks(db)
+        return sched
+
+    async def delete_schedules(
+        self, db: Session, dataset_name: str, backup_disk_id: Optional[int] = None
+    ) -> List[int]:
+        """Remove the dataset's schedule on one disk (or all disks when no disk given)."""
+        query = db.query(BackupSchedule).filter(BackupSchedule.dataset_name == dataset_name)
+        if backup_disk_id is not None:
+            query = query.filter(BackupSchedule.backup_disk_id == backup_disk_id)
+        removed = []
+        for sched in query.all():
+            removed.append(sched.backup_disk_id)
+            db.delete(sched)
+        db.commit()
+        await self.sync_scheduled_tasks(db)
+        return removed
 
 
-zfs_backup_manager = ZfsBackupManager()

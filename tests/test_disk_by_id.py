@@ -2,9 +2,10 @@ import pytest
 from unittest.mock import patch, AsyncMock
 
 from nazman.models.disk import Disk
-from nazman.managers.disk_manager import DiskManager, partition_by_id
-from nazman.managers.disk_manager import resolve_slot_to_device
-from nazman.managers.disk_manager import clear_device_map, refresh_device_map
+from nazman.managers.disk_manager import DiskManager
+from nazman.utils.devices import partition_by_id
+from nazman.utils.devices import resolve_slot_to_device
+from nazman.utils.devices import clear_device_map, refresh_device_map
 
 
 @pytest.mark.parametrize("disk_by_id,num,expected", [
@@ -72,7 +73,7 @@ async def test_sync_disk_reconnects_by_id(db_session):
     assert row.serial == "SN123"
     assert row.status == "active"
     # Kernel name is ephemeral, recorded in the in-memory map (not the DB).
-    from nazman.managers.disk_manager import get_device_name
+    from nazman.utils.devices import get_device_name
     assert get_device_name(row) == "sdb"
     clear_device_map()
 
@@ -201,7 +202,7 @@ async def test_discover_skips_mmc_boot_subdevices():
             return (_json.dumps(lsblk_full), "", 0)
         return ("", "", 0)
 
-    with patch("nazman.managers.disk_manager.run_command", side_effect=fake_run_command):
+    with patch("nazman.utils.devices.run_command", side_effect=fake_run_command):
         disks = await dm.discover_disks()
 
     names = {d["device_name"] for d in disks}
@@ -257,7 +258,7 @@ async def test_discover_marks_both_raid_mirrors_as_os_disk():
             return (_json.dumps(lsblk_full), "", 0)
         return ("", "", 0)
 
-    with patch("nazman.managers.disk_manager.run_command", side_effect=fake_run_command):
+    with patch("nazman.utils.devices.run_command", side_effect=fake_run_command):
         disks = await dm.discover_disks()
 
     os_disk_names = {d["device_name"] for d in disks if d["is_os_disk"]}
@@ -270,7 +271,7 @@ async def test_read_slot_uuids_uses_partuuid_for_no_fs_partitions():
     """Partitions without a filesystem have a PARTUUID but a null UUID, so
     read_slot_uuids must key off PARTUUID or they silently disappear."""
     import json as _json
-    from nazman.managers.disk_manager import read_slot_uuids
+    from nazman.utils.devices import read_slot_uuids
 
     lsblk_out = {
         "blockdevices": [
@@ -300,7 +301,7 @@ async def test_read_slot_uuids_uses_partuuid_for_no_fs_partitions():
     async def fake_run_command(cmd, timeout=300, check=True, capture_output=True, input=None, **kwargs):
         return (_json.dumps(lsblk_out), "", 0)
 
-    with patch("nazman.managers.disk_manager.run_command", side_effect=fake_run_command):
+    with patch("nazman.utils.devices.run_command", side_effect=fake_run_command):
         result = await read_slot_uuids(["/dev/nvme0n1", "/dev/nvme1n1"])
 
     nvme0_parts = result["/dev/nvme0n1"]["partitions"]

@@ -1,19 +1,29 @@
-from .disk_manager import disk_manager
-from .zfs_manager import zfs_manager
-from .snapshot_manager import snapshot_manager
-from .nfs_manager import nfs_manager
-from .backup_manager import backup_manager
-from .zfs_backup_manager import zfs_backup_manager
-from .scheduler import scheduler_manager
-from .metrics_manager import metrics_manager
+"""Manager classes (business logic per domain).
+
+No instances are created at import time; the application object graph is
+assembled in :mod:`nazman.wiring`.
+"""
+
+from .disk_manager import DiskManager
+from .zfs_manager import ZfsManager
+from .snapshot_manager import SnapshotManager
+from .nfs_manager import NfsManager
+from .smb_manager import SmbManager
+from .backup_manager import BackupManager
+from .zfs_backup_manager import ZfsBackupManager
+from .scheduler import SchedulerManager
+from .metrics_manager import MetricsManager
+from .metrics_store import MetricsStore
 
 __all__ = [
-    "disk_manager",
-    "zfs_manager",
-    "snapshot_manager",
-    "nfs_manager",
-    "backup_manager",
-    "zfs_backup_manager",
-    "scheduler_manager",
-    "metrics_manager"
+    "DiskManager",
+    "ZfsManager",
+    "SnapshotManager",
+    "NfsManager",
+    "SmbManager",
+    "BackupManager",
+    "ZfsBackupManager",
+    "SchedulerManager",
+    "MetricsManager",
+    "MetricsStore",
 ]

@@ -1,45 +1,26 @@
 from typing import List, Optional, Dict, Any
 import json
-import re
-from datetime import datetime
 from sqlalchemy.orm import Session
 
 from ..models.pool import Pool
 from ..models.disk import Disk
-from ..managers.nfs_manager import nfs_manager
-from ..managers.smb_manager import smb_manager
-from ..managers.disk_manager import (
-    read_slot_uuids, resolve_slot_to_device, resolve_by_id,
-    get_device_path, get_device_name,
+from ..utils.commands import run_zpool, run_zfs
+from ..utils.devices import (
+    read_slot_uuids, resolve_slot_to_device, get_device_path, get_device_name,
 )
-from ..utils.commands import run_zpool, run_zfs, run_command
-from ..utils.exceptions import PoolError, DatasetError, ValidationError
+from ..utils.exceptions import (
+    PoolError, PoolNotFoundError, DatasetError, DatasetNotFoundError, ValidationError,
+)
+from ..utils.sizes import parse_size_to_bytes
 from ..utils.validation import (
     validate_pool_name, validate_dataset_name,
 )
+from ..utils import zfs_query
 
 
 def _parse_size_bytes(size_str: str) -> float:
     """Parse a ZFS size string (e.g. '3.64T', '1024M', or raw bytes)."""
-    if not size_str:
-        return 0.0
-    s = size_str.strip()
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    if not s:
-        return 0.0
-    unit = s[-1].upper()
-    multiplier = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
-    suffixes = ("KB", "MB", "GB", "TB", "PB",
-                "KiB", "MiB", "GiB", "TiB", "PiB")
-    for suf in suffixes:
-        if s.upper().endswith(suf):
-            return float(s[:-len(suf)]) * multiplier[suf[0]]
-    if unit in multiplier:
-        return float(s[:-1]) * multiplier[unit]
-    return 0.0
+    return float(parse_size_to_bytes(size_str))
 
 
 def _vdev_usable_bytes(vdev: Dict[str, Any]) -> float:
@@ -99,7 +80,11 @@ def _params_to_atime(atime: Optional[str], relatime: Optional[str]) -> str:
 
 
 class ZfsManager:
-    """Manages ZFS pools, datasets, and snapshots."""
+    """Manages ZFS pools and datasets (live state; ZFS is the source of truth).
+
+    Cross-domain destruction orchestration (which also tears down NFS/SMB
+    shares) lives in :class:`nazman.services.destruction.DestructionService`.
+    """
 
     # ── Pool operations ────────────────────────────────────────────────
 
@@ -123,7 +108,7 @@ class ZfsManager:
                 if len(parts) >= 6:
                     pool_name = parts[0]
 
-                    pool = db.query(Pool).filter(Pool.name == pool_name).first()
+                    pool = self.get_pool_by_name(db, pool_name)
                     if not pool:
                         pool = Pool(name=pool_name)
                         db.add(pool)
@@ -164,6 +149,14 @@ class ZfsManager:
                 raise
             raise PoolError(f"Error listing pools: {str(e)}")
 
+    def get_pool_by_name(self, db: Session, name: str) -> Optional[Pool]:
+        """The Pool row for a pool name, or None."""
+        return db.query(Pool).filter(Pool.name == name).first()
+
+    def list_pool_names(self, db: Session) -> List[str]:
+        """Names of all known pools (DB-tracked)."""
+        return [p.name for p in db.query(Pool).all()]
+
     async def is_disk_in_pool(self, by_id: str) -> Optional[str]:
         """Check if a disk (by its /dev/disk/by-id path) is a member of any imported pool.
 
@@ -171,34 +164,25 @@ class ZfsManager:
         """
         if not by_id or not by_id.startswith("/dev/disk/by-id/"):
             return None
+        members = await self.get_pool_members()
+        return zfs_query.pool_member_for_by_id(members, by_id)
 
-        try:
-            stdout, _, rc = await run_zpool(
-                "status", "-j", check=False, op="read",
-            )
-            if rc != 0:
-                return None
+    @staticmethod
+    def pool_member_for_disk(pool_members: Dict[str, str], disk: Disk) -> Optional[str]:
+        """Return the name of the pool that owns ``disk`` (whole disk or any of its partitions)."""
+        return zfs_query.pool_member_for_disk(pool_members, disk)
 
-            data = json.loads(stdout)
-            pools = data.get("pools", {})
-            if not isinstance(pools, dict):
-                return None
-
-            for pool_name, pool_data in pools.items():
-                vdevs = pool_data.get("vdevs", {})
-                for vdev in vdevs.values():
-                    if self._vdev_contains_disk(vdev, by_id):
-                        return pool_name
-            return None
-        except Exception:
-            return None
+    @staticmethod
+    def pool_member_for_by_id(pool_members: Dict[str, str], by_id: Optional[str]) -> Optional[str]:
+        """Return the pool owning ``by_id`` (exact, basename, or any -partN child)."""
+        return zfs_query.pool_member_for_by_id(pool_members, by_id)
 
     @staticmethod
     def _iter_vdev_disks(vdev: Dict[str, Any]):
-        """Yield (path, name) for every leaf disk entry in a vdev tree."""
+        """Yield (leaf, path, name) for every leaf disk entry in a vdev tree."""
         kind = vdev.get("type") or vdev.get("vdev_type")
         if kind == "disk":
-            yield vdev.get("path"), vdev.get("name")
+            yield vdev, vdev.get("path"), vdev.get("name")
         children = vdev.get("vdevs", {})
         if isinstance(children, dict):
             for child in children.values():
@@ -207,12 +191,17 @@ class ZfsManager:
             for child in children:
                 yield from ZfsManager._iter_vdev_disks(child)
 
-    def _vdev_contains_disk(self, vdev: Dict[str, Any], by_id: str) -> bool:
-        """Recursively check if a vdev tree contains the given disk."""
-        for path, name in self._iter_vdev_disks(vdev):
-            if path == by_id or name == by_id:
-                return True
-        return False
+    @staticmethod
+    def _disk_identity_keys(by_id: Optional[str]) -> List[str]:
+        """Exact/basename ids whose (or whose ``-partN`` children's) vdevs belong to a disk."""
+        if not by_id:
+            return []
+        return [by_id, by_id.rsplit("/", 1)[-1]]
+
+    @staticmethod
+    def _leaf_matches_disk(key: str, ids: List[str]) -> bool:
+        """True if a vdev/event key identifies one of ``ids`` (whole or a -partN child)."""
+        return any(key == i or key.startswith(f"{i}-part") for i in ids)
 
     async def get_pool_members(self) -> Dict[str, str]:
         """Map every leaf device used by imported pools to its pool name.
@@ -233,11 +222,152 @@ class ZfsManager:
             for pool_name, pool_data in pools.items():
                 vdevs = pool_data.get("vdevs", {})
                 for vdev in vdevs.values():
-                    for path, name in self._iter_vdev_disks(vdev):
+                    for leaf, path, name in self._iter_vdev_disks(vdev):
                         members.setdefault(path or name, pool_name)
             return members
         except Exception:
             return {}
+
+    async def get_pool_error_counts(self) -> Dict[str, Dict[str, Any]]:
+        """Per-leaf ZFS read/write/checksum error counters for all pools.
+
+        One ``zpool status -j`` call.  Keys are the same live device paths used
+        by :meth:`get_pool_members`.  Counters are cumulative since the pool was
+        last cleared/imported, so they persist across reboots.
+        """
+        counts: Dict[str, Dict[str, Any]] = {}
+        try:
+            stdout, _, rc = await run_zpool("status", "-j", check=False, op="read")
+            if rc != 0:
+                return counts
+            data = json.loads(stdout)
+            pools = data.get("pools", {})
+            if not isinstance(pools, dict):
+                return counts
+            for pool_name, pool_data in pools.items():
+                vdevs = pool_data.get("vdevs", {})
+                if not isinstance(vdevs, dict):
+                    continue
+                for vdev in vdevs.values():
+                    for leaf, path, name in self._iter_vdev_disks(vdev):
+                        key = path or name
+                        if not key:
+                            continue
+                        counts.setdefault(key, {
+                            "pool": pool_name,
+                            "read": ZfsManager._leaf_counter(leaf, "read"),
+                            "write": ZfsManager._leaf_counter(leaf, "write"),
+                            "cksum": ZfsManager._leaf_counter(leaf, "cksum"),
+                            "guid": leaf.get("guid"),
+                        })
+            return counts
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _leaf_counter(leaf: Dict[str, Any], key: str) -> int:
+        try:
+            return int(leaf.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def pool_errors_for_disk(
+        counts: Dict[str, Dict[str, Any]], disk: Disk
+    ) -> Optional[Dict[str, int]]:
+        """Aggregate ZFS read/write/checksum counters for one disk, or None."""
+        if disk is None:
+            return None
+        ids = ZfsManager._disk_identity_keys(disk.by_id)
+        totals = {"read": 0, "write": 0, "cksum": 0}
+        found = False
+        for key, info in counts.items():
+            if ZfsManager._leaf_matches_disk(key, ids):
+                found = True
+                totals["read"] += ZfsManager._leaf_counter(info, "read")
+                totals["write"] += ZfsManager._leaf_counter(info, "write")
+                totals["cksum"] += ZfsManager._leaf_counter(info, "cksum")
+        return totals if found else None
+
+    @staticmethod
+    def leaf_identities_for_disk(
+        counts: Dict[str, Dict[str, Any]], disk: Disk
+    ) -> Dict[str, set]:
+        """GUIDs/paths of the vdev leaves that belong to a disk, for event matching."""
+        ids = ZfsManager._disk_identity_keys(disk.by_id if disk else None)
+        guids: set = set()
+        paths: set = set()
+        for key, info in counts.items():
+            if ZfsManager._leaf_matches_disk(key, ids):
+                guid = info.get("guid")
+                if guid is not None:
+                    guids.add(str(guid))
+                if key.startswith("/"):
+                    paths.add(key)
+        return {"guids": guids, "paths": paths}
+
+    ZFS_ERROR_CLASSES = {
+        "checksum", "data", "io", "io_failure", "vdev.corrupt_data", "dio_verify_rd",
+    }
+
+    async def get_pool_error_events(self, pool_name: str) -> List[Dict[str, Any]]:
+        """Timestamped ZFS error events (checksum/data/io) for a pool.
+
+        Reads the pool's recent event log via ``zpool events <pool> -v -H``
+        (wordy text form; ``zpool events`` has no ``-j`` on OpenZFS 2.x).
+        Events are a ring buffer kept since the pool was imported/cleared, so
+        only recent activity is available.
+        """
+        events: List[Dict[str, Any]] = []
+        try:
+            stdout, _, rc = await run_zpool(
+                "events", pool_name, "-v", "-H", check=False, op="read",
+            )
+            if rc != 0:
+                return events
+            current: Optional[Dict[str, Any]] = None
+            for line in stdout.splitlines():
+                if not line.strip():
+                    continue
+                if not line[:1].isspace() and "\t" in line:
+                    timestamp, cls = line.split("\t", 1)
+                    current = {"time": timestamp.strip(), "class": cls.strip()}
+                    events.append(current)
+                    continue
+                if current is None or " = " not in line:
+                    continue
+                key, _, value = line.partition(" = ")
+                key = key.strip()
+                if key in ("vdev_guid", "vdev_path", "vdev_devid"):
+                    current.setdefault(key, value.strip())
+            return [
+                e for e in events
+                if e["class"].rsplit(".", 1)[-1] in ZfsManager.ZFS_ERROR_CLASSES
+            ]
+        except Exception:
+            return []
+
+    @staticmethod
+    def events_for_disk(
+        events: List[Dict[str, Any]], identities: Dict[str, set]
+    ) -> List[Dict[str, Any]]:
+        """Filter error events down to those touching a disk's vdev leaves.
+
+        Matches on ``vdev_guid`` or ``vdev_path`` (the leaf's full device path,
+        which may be a ``-partN`` child path).  Newest first.
+        """
+        guids = identities.get("guids") or set()
+        ids = [p for p in (identities.get("paths") or set())]
+        out = []
+        for ev in events:
+            guid = str(ev.get("vdev_guid") or "")
+            path = ev.get("vdev_path") or ""
+            if guid and guid in guids:
+                out.append(ev)
+            elif path and ZfsManager._leaf_matches_disk(path, ids):
+                out.append(ev)
+        out.sort(key=lambda e: e.get("time") or "", reverse=True)
+        return out
 
     async def get_pool_status(self, pool_name: str) -> Dict[str, Any]:
         """Get detailed pool status from ZFS."""
@@ -470,7 +600,7 @@ class ZfsManager:
         name = validate_pool_name(name)
 
         # Check if pool already exists
-        existing = db.query(Pool).filter(Pool.name == name).first()
+        existing = self.get_pool_by_name(db, name)
         if existing:
             list_out, _, list_rc = await run_zpool(
                 "list", "-H", "-o", "name", name, check=False, op="read",
@@ -509,10 +639,6 @@ class ZfsManager:
         def group_ashift(group):
             return next((v.get("ashift") for v in group if v.get("ashift")), None)
 
-        role_order = {"special": "special", "log": "log", "cache": "cache"}
-
-        # Vdevs compatible with the single-create path (same ashift or inherit).
-        create_groups = {role: [] for role in role_order}
         # Groups needing a separate zpool add with their own ashift.
         add_steps = []  # list of (label, ashift, command_args)
 
@@ -589,9 +715,9 @@ class ZfsManager:
         """Remove a device from a pool (only for log/cache devices)."""
         validate_pool_name(pool_name)
 
-        pool = db.query(Pool).filter(Pool.name == pool_name).first()
+        pool = self.get_pool_by_name(db, pool_name)
         if not pool:
-            raise PoolError(f"Pool '{pool_name}' not found")
+            raise PoolNotFoundError(f"Pool '{pool_name}' not found")
 
         status_info = await self.get_pool_status(pool_name)
         device_type = None
@@ -655,189 +781,6 @@ class ZfsManager:
         if returncode != 0:
             raise PoolError(f"Failed to import pool: {stderr}")
 
-    async def get_pool_destroy_info(self, db: Session, pool_name: str) -> Dict[str, Any]:
-        """Gather info shown in the pool-destroy confirmation dialog."""
-        validate_pool_name(pool_name)
-
-        size_bytes = used_bytes = free_bytes = None
-        try:
-            stdout, stderr, rc = await run_zpool(
-                "list", "-p", "-H", "-o", "name,size,allocated,free", pool_name,
-                check=False, op="read",
-            )
-            if rc == 0 and stdout.strip():
-                parts = stdout.split()
-                if len(parts) >= 4:
-                    try:
-                        size_bytes = int(parts[1])
-                        used_bytes = int(parts[2])
-                        free_bytes = int(parts[3])
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
-
-        pool = db.query(Pool).filter(Pool.name == pool_name).first()
-        export_info = {"exports": [], "active_clients": []}
-        if pool is not None:
-            export_info = await nfs_manager.get_pool_export_info(db, pool)
-        smb_info = {} if pool is None else smb_manager.get_pool_share_info(db, pool)
-
-        return {
-            "pool_name": pool_name,
-            "size_bytes": size_bytes,
-            "used_bytes": used_bytes,
-            "free_bytes": free_bytes,
-            "has_active_export": bool(export_info["exports"]),
-            **export_info,
-            "smb": smb_info,
-        }
-
-    async def _pool_destroy_obstacles(self, db: Session, pool_name: str) -> Dict[str, Any]:
-        """Return obstacles that would prevent destroying a busy pool.
-
-        Mirrors the dataset-destroy pre-check: a mounted dataset kept in use by
-        an active NFS client (or a local process) causes `zpool destroy -f` to
-        fail with "cannot unmount '<mountpoint>'". Collect each mounted child
-        dataset's mountpoint and any connected NFS clients so the frontend can
-        guide the user to unmount and disconnect before retrying.
-        """
-        mounted = []
-        active_clients = []
-
-        # Enumerate the pool's child datasets (excluding the pool root itself).
-        dataset_names = []
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", "-t", "filesystem", "-r", pool_name,
-            check=False, op="read",
-        )
-        if rc == 0:
-            for line in stdout.splitlines():
-                name = line.strip()
-                if name and name != pool_name:
-                    dataset_names.append(name)
-
-        for ds_name in dataset_names:
-            mount_path = f"/{ds_name}"
-            try:
-                stdout, _, rc = await run_zfs(
-                    "get", "-H", "-o", "value", "mounted", ds_name, check=False, op="read",
-                )
-                if rc == 0 and stdout.strip().lower() == "yes":
-                    mounted.append(mount_path)
-            except Exception:
-                pass
-
-        # Active NFS clients across every dataset mount path in the pool.
-        probe_paths = [f"/{name}" for name in dataset_names]
-        if not probe_paths:
-            probe_paths = [f"/{pool_name}"]
-        try:
-            stdout, _, rc = await run_command(
-                ["showmount", "-a"], timeout=15, check=False
-            )
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("All mount") or ":" not in line:
-                        continue
-                    client, path = line.rsplit(":", 1)
-                    path = path.strip()
-                    if any(path == p or path.startswith(p + "/") for p in probe_paths):
-                        active_clients.append({
-                            "client": client.strip(),
-                            "path": path,
-                        })
-        except Exception:
-            pass
-
-        # Active SMB connections on any dataset share in the pool.
-        smb_connected = []
-        try:
-            smb_connected = await self._smb_active_clients(probe_paths)
-        except Exception:
-            pass
-
-        return {
-            "mounted": mounted,
-            "active_clients": active_clients,
-            "smb_connected": smb_connected,
-        }
-
-    async def _smb_active_clients(self, probe_paths: List[str]) -> List[str]:
-        """Datasets with an active SMB connection (via smbstatus), if available."""
-        connected = []
-        try:
-            stdout, _, rc = await run_command(
-                ["smbstatus", "-b"], timeout=15, check=False,
-                op="read", category="smb",
-            )
-            if rc == 0:
-                # smbstatus -b shows service + pids; match on the service/path
-                # name (the trailing share name equals the dataset basename).
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    m = re.search(r"\b(\S+)\]?\s+\d+", line)
-                    if not m:
-                        continue
-                    svc = m.group(1).strip("[]")
-                    linked = [p for p in probe_paths if p.rsplit("/", 1)[-1] == svc]
-                    if linked:
-                        connected.append(linked[0])
-        except Exception:
-            pass
-        return connected
-
-    async def destroy_pool(self, db: Session, pool_name: str) -> None:
-        """Destroy a pool (DESTRUCTIVE). Removes DB record."""
-        validate_pool_name(pool_name)
-
-        pool = db.query(Pool).filter(Pool.name == pool_name).first()
-
-        # Pre-check: block if any child dataset is busy (mounted/held by an NFS
-        # client). `zpool destroy -f` otherwise fails with "cannot unmount".
-        obstacles = await self._pool_destroy_obstacles(db, pool_name)
-        if obstacles["active_clients"] or obstacles["mounted"] or obstacles.get("smb_connected"):
-            parts = []
-            if obstacles["mounted"]:
-                parts.append(
-                    "child dataset(s) still mounted: " + ", ".join(obstacles["mounted"])
-                )
-            if obstacles["active_clients"]:
-                n = len(obstacles["active_clients"])
-                parts.append(f"{n} NFS client(s) still connected")
-            if obstacles.get("smb_connected"):
-                n = len(obstacles["smb_connected"])
-                parts.append(f"{n} SMB connection(s) still active on {', '.join(obstacles['smb_connected'])}")
-            raise PoolError(
-                f'Pool "{pool_name}" has {"; ".join(parts)}. '
-                "Unmount these datasets and disconnect NFS/SMB clients before destroying "
-                "the pool. (Unmount with e.g. `sudo zfs unmount <dataset>`.)"
-            )
-
-        # Unexport any NFS shares and unshare any SMB shares owned by this pool
-        if pool is not None:
-            try:
-                await nfs_manager.unexport_pool(db, pool)
-            except Exception:
-                pass
-            try:
-                await smb_manager.unshare_pool(db, pool)
-            except Exception:
-                pass
-
-        stdout, stderr, returncode = await run_zpool(
-            "destroy", "-f", pool_name,
-            timeout=300
-        )
-
-        if returncode != 0:
-            raise PoolError(f"Failed to destroy pool: {stderr}")
-
-        if pool:
-            db.delete(pool)
-            db.commit()
-
     # ── Dataset operations ─────────────────────────────────────────────
 
     async def list_datasets(self, db: Session, pool_name: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -862,10 +805,10 @@ class ZfsManager:
                     ds_pool = parts[0].split('/')[0]
                     if ds_pool not in pool_names_seen:
                         pool_names_seen.add(ds_pool)
-                        batch_props.update(await self._get_all_dataset_properties(ds_pool))
+                        batch_props.update(await self.get_all_dataset_properties(ds_pool))
 
             # Collect pool root dataset names to exclude them
-            pool_root_names = {p.name for p in db.query(Pool).all()}
+            pool_root_names = set(self.list_pool_names(db))
 
             datasets = []
             for line in raw_lines:
@@ -897,14 +840,11 @@ class ZfsManager:
                 raise
             raise DatasetError(f"Error listing datasets: {str(e)}")
 
-    async def _dataset_live_exists(self, dataset_name: str) -> bool:
+    async def dataset_exists(self, dataset_name: str) -> bool:
         """Confirm a dataset currently exists in ZFS by its full name."""
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", dataset_name, check=False, op="read"
-        )
-        return rc == 0 and dataset_name in stdout.split()
+        return await zfs_query.dataset_exists(dataset_name)
 
-    async def _get_dataset_properties(self, dataset_name: str) -> Dict[str, str]:
+    async def get_dataset_properties(self, dataset_name: str) -> Dict[str, str]:
         """Get live ZFS properties for a single dataset (1 subprocess call)."""
         try:
             stdout, stderr, rc = await run_zfs(
@@ -939,7 +879,7 @@ class ZfsManager:
         except Exception:
             return {}
 
-    async def _get_all_dataset_properties(self, pool_name: str) -> Dict[str, Dict[str, str]]:
+    async def get_all_dataset_properties(self, pool_name: str) -> Dict[str, Dict[str, str]]:
         """Get live ZFS properties for all datasets in a pool (1 subprocess call)."""
         try:
             stdout, stderr, rc = await run_zfs(
@@ -997,16 +937,13 @@ class ZfsManager:
         """Create a new dataset."""
         name = validate_dataset_name(name)
 
-        pool = db.query(Pool).filter(Pool.name == pool_name).first()
+        pool = self.get_pool_by_name(db, pool_name)
         if not pool:
-            raise PoolError(f"Pool '{pool_name}' not found")
+            raise PoolNotFoundError(f"Pool '{pool_name}' not found")
 
         full_name = f"{pool_name}/{name}"
 
-        list_out, _, list_rc = await run_zfs(
-            "list", "-H", "-o", "name", full_name, check=False
-        )
-        if list_rc == 0 and full_name in list_out.split():
+        if await self.dataset_exists(full_name):
             raise ValidationError(f"Dataset '{full_name}' already exists")
 
         cmd = [
@@ -1046,89 +983,6 @@ class ZfsManager:
             "mountpoint": f"/{full_name}",
         }
 
-    async def _dataset_destroy_obstacles(self, db: Session, dataset_name: str) -> Dict[str, Any]:
-        """Return obstacles that would prevent destroying a mounted/busy dataset.
-
-        ``mounted`` reflects whether the dataset filesystem is currently mounted,
-        ``exports`` lists any defined NFS exports (informational), and
-        ``active_clients`` lists NFS clients currently connected to the dataset's
-        mount path. Active clients keep the mount busy even after the share is
-        removed, which is the common cause of a "cannot unmount" destroy failure.
-        """
-        mounted = False
-        exports = []
-        active_clients = []
-
-        try:
-            stdout, _, rc = await run_zfs(
-                "get", "-H", "-o", "value", "mounted", dataset_name, check=False, op="read",
-            )
-            if rc == 0 and stdout.strip().lower() == "yes":
-                mounted = True
-        except Exception:
-            pass
-
-        sharenfs = await nfs_manager._read_sharenfs(dataset_name)
-        if sharenfs not in ("off", ""):
-            exports = [f"/{dataset_name}"]
-
-        mount_path = f"/{dataset_name}"
-        try:
-            stdout, _, rc = await run_command(
-                ["showmount", "-a"], timeout=15, check=False
-            )
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("All mount") or ":" not in line:
-                        continue
-                    client, path = line.rsplit(":", 1)
-                    path = path.strip()
-                    if path == mount_path or path.startswith(mount_path + "/"):
-                        active_clients.append({
-                            "client": client.strip(),
-                            "path": path,
-                        })
-        except Exception:
-            pass  # showmount unavailable or no NFS server
-
-        return {
-            "mounted": mounted,
-            "exports": exports,
-            "active_clients": active_clients,
-            "smb_share": smb_manager.list_shares(db),
-        }
-
-    async def destroy_dataset(self, db: Session, dataset_name: str, recursive: bool = False) -> None:
-        """Destroy a dataset (DESTRUCTIVE)."""
-        obstacles = await self._dataset_destroy_obstacles(db, dataset_name)
-        smb_share = next((s for s in (obstacles.get("smb_share") or [])
-                          if s["dataset_name"] == dataset_name), None)
-        if obstacles["mounted"] or obstacles["active_clients"] or smb_share:
-            parts = []
-            if obstacles["mounted"]:
-                parts.append("still mounted")
-            if obstacles["active_clients"]:
-                n = len(obstacles["active_clients"])
-                parts.append(f"{n} NFS client(s) still connected")
-            if smb_share:
-                parts.append("has an active SMB share")
-            raise DatasetError(
-                f'Dataset "{dataset_name}" is {", ".join(parts)}. '
-                "Remove the SMB share, unmount the dataset, and disconnect NFS clients "
-                "before destroying."
-            )
-
-        cmd = ["destroy"]
-        if recursive:
-            cmd.append("-r")
-        cmd.append(dataset_name)
-
-        stdout, stderr, returncode = await run_zfs(*cmd, timeout=300, check=False)
-
-        if returncode != 0:
-            raise DatasetError(f"Failed to destroy dataset: {stderr}")
-
     async def update_dataset(
         self,
         dataset_name: str,
@@ -1145,8 +999,8 @@ class ZfsManager:
         validate_dataset_name(dataset_name)
 
         # Check dataset exists
-        if not await self._dataset_live_exists(dataset_name):
-            raise DatasetError(f"Dataset '{dataset_name}' not found")
+        if not await self.dataset_exists(dataset_name):
+            raise DatasetNotFoundError(f"Dataset '{dataset_name}' not found")
 
         # Apply property changes via zfs set
         if compression is not None:
@@ -1179,10 +1033,8 @@ class ZfsManager:
             await run_zfs("set", f"readonly={readonly}", dataset_name)
 
         # Return dataset with live ZFS properties
-        live_props = await self._get_dataset_properties(dataset_name)
+        live_props = await self.get_dataset_properties(dataset_name)
         return {
             "name": dataset_name,
             **live_props,
         }
-
-zfs_manager = ZfsManager()

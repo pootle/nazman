@@ -58,7 +58,7 @@ async def run_command(
         stderr_str = stderr.decode('utf-8') if stderr else ""
         duration_ms = int((time.monotonic() - start) * 1000)
         
-        if check and process.returncode != 0:
+        if process.returncode != 0:
             command_log.record(
                 command=display_cmd,
                 status="failed",
@@ -68,20 +68,21 @@ async def run_command(
                 op=op,
                 category=category,
             )
-            raise CommandError(
+            if check:
+                raise CommandError(
+                    command=display_cmd,
+                    returncode=process.returncode,
+                    stderr=stderr_str
+                )
+        else:
+            command_log.record(
                 command=display_cmd,
+                status="success",
                 returncode=process.returncode,
-                stderr=stderr_str
+                duration_ms=duration_ms,
+                op=op,
+                category=category,
             )
-
-        command_log.record(
-            command=display_cmd,
-            status="success",
-            returncode=process.returncode,
-            duration_ms=duration_ms,
-            op=op,
-            category=category,
-        )
         return stdout_str, stderr_str, process.returncode
         
     except asyncio.TimeoutError:
@@ -238,22 +239,23 @@ async def run_pipeline(
                 returncode = p.returncode
                 break
 
-        if check and returncode != 0:
+        if returncode != 0:
             command_log.record(
                 command=display_cmd, status="failed",
                 returncode=returncode, stderr=stderr_str,
                 duration_ms=duration_ms, op=op, category=category,
             )
-            raise CommandError(
-                command=display_cmd, returncode=returncode,
-                stderr=stderr_str,
+            if check:
+                raise CommandError(
+                    command=display_cmd, returncode=returncode,
+                    stderr=stderr_str,
+                )
+        else:
+            command_log.record(
+                command=display_cmd, status="success",
+                returncode=returncode, duration_ms=duration_ms,
+                op=op, category=category,
             )
-
-        command_log.record(
-            command=display_cmd, status="success",
-            returncode=returncode, duration_ms=duration_ms,
-            op=op, category=category,
-        )
         return stdout_str, stderr_str, returncode
 
     except asyncio.TimeoutError:
@@ -355,15 +357,3 @@ async def run_command_sync(
             category=category,
         )
         raise
-
-
-def parse_zpool_status(output: str) -> dict:
-    """Parse zpool status output into structured data."""
-    # TODO: Implement parsing
-    return {"raw": output}
-
-
-def parse_zpool_list(output: str) -> List[dict]:
-    """Parse zpool list output into structured data."""
-    # TODO: Implement parsing
-    return [{"raw": output}]

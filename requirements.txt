@@ -14,3 +14,4 @@ aiofiles==25.1.0
 psutil==7.2.2
 PyJWT==2.13.0
 httpx==0.28.1
+markdown==3.10.3

@@ -28,10 +28,16 @@ class NasManAPI {
         const response = await fetch(`${this.baseUrl}${path}`, options);
 
         if (response.status === 401) {
-            // A stored token is present but no longer valid; drop it so we prompt.
-            if (this.token) {
-                this.logout();
+            const stored = localStorage.getItem('nazman_token');
+            if (stored && stored !== this.token) {
+                // A login in another tab superseded our stale in-memory token;
+                // adopt the shared one and replay instead of clobbering it.
+                this.token = stored;
+                return this.request(method, path, data);
             }
+            // Our token (or the absence of one) is genuinely invalid; drop it
+            // so we prompt. Only removes the stored copy when it is ours.
+            this.logout();
             await this._requireAuth();
             // Retry once with the (now-present) token.
             return this.request(method, path, data);
@@ -452,3 +458,17 @@ class NasManAPI {
 }
 
 const api = new NasManAPI();
+
+// Propagate sign-in / sign-out across tabs: a login in one tab immediately
+// replaces the stale in-memory token in every other open tab, so background
+// pollers stop acting on expired credentials.
+window.addEventListener('storage', (e) => {
+    if (e.key !== 'nazman_token') {
+        return;
+    }
+    api.token = e.newValue;
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) {
+        logoutBtn.style.display = api.token ? '' : 'none';
+    }
+});

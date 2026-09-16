@@ -2,7 +2,9 @@ import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 from datetime import datetime, timezone
 
-from nazman.managers.scheduler import scheduler_manager
+from nazman.managers.scheduler import SchedulerManager
+
+scheduler_manager = SchedulerManager()
 from nazman.models.scheduler import ScheduledTask, TaskType
 
 
@@ -122,32 +124,49 @@ async def test_execute_snapshot_creates_snapshot_with_retention():
 
 
 @pytest.mark.asyncio
-async def test_execute_zfs_backup_uses_per_dataset_lock():
-    """Test that _execute_zfs_backup uses per-dataset locking."""
-    import asyncio
-    
-    config = {
-        "dataset_name": "tank/data",
-        "backup_disk_id": 1,
-        "type": "full"
-    }
-    
-    # Create a mock for the backup manager
-    with patch('nazman.managers.zfs_backup_manager.zfs_backup_manager') as mock_backup, \
-         patch('nazman.database.get_db_context') as mock_db_ctx:
-        
-        mock_backup.run_backup = AsyncMock()
-        mock_db_ctx.return_value.__enter__ = MagicMock()
-        mock_db_ctx.return_value.__exit__ = MagicMock()
-        
-        # Execute the backup
-        await scheduler_manager._execute_zfs_backup(config)
-        
-        # Verify the lock was created for this dataset
-        assert "tank/data" in scheduler_manager._dataset_locks
-        
-        # Verify run_backup was called
-        mock_backup.run_backup.assert_called_once()
+async def test_zfs_backup_executor_runs_backup():
+    """The wiring-registered ZFS_BACKUP executor calls run_backup per task.
+
+    The scheduler itself no longer imports backup managers; wiring binds an
+    executor closure that acquires a per-dataset lock and runs the backup.
+    """
+    from nazman import wiring
+
+    container = wiring.build_container()
+    executor = container.scheduler._executors[TaskType.ZFS_BACKUP.value]
+
+    task = ScheduledTask(
+        name="zfs-full-tank-data",
+        task_type=TaskType.ZFS_BACKUP.value,
+        target="tank/data",
+        schedule="0 3 * * *",
+        config={"dataset_name": "tank/data", "backup_disk_id": 1, "type": "full"},
+    )
+
+    with patch.object(type(container.zfs_backup), "run_backup",
+                      new_callable=AsyncMock) as mock_run:
+        await executor(task, MagicMock())
+        mock_run.assert_called_once()
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["dataset_name"] == "tank/data"
+        assert kwargs["backup_disk_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_zfs_backup_executor_requires_dataset_and_disk():
+    """Missing config keys raise instead of silently no-op'ing."""
+    from nazman import wiring
+    from nazman.utils.exceptions import NAZManError
+
+    container = wiring.build_container()
+    executor = container.scheduler._executors[TaskType.ZFS_BACKUP.value]
+
+    task = ScheduledTask(
+        name="broken", task_type=TaskType.ZFS_BACKUP.value,
+        target="t", schedule="0 3 * * *", config={},
+    )
+    with pytest.raises(NAZManError, match="requires"):
+        await executor(task, MagicMock())
 
 
 @pytest.mark.asyncio

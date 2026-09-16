@@ -1,11 +1,13 @@
 import pytest
 from unittest.mock import patch, AsyncMock
 from nazman.models.backup import BackupCommit
+from nazman.wiring import get_backup_manager
+from tests.conftest import override_manager
 
 
 @pytest.mark.asyncio
 async def test_get_backup_status(client):
-    with patch("nazman.api.backup.backup_manager") as mock:
+    with override_manager(get_backup_manager) as mock:
         mock.get_backup_status = AsyncMock(return_value={
             "repo_exists": False,
             "repo_path": "/tmp/backup",
@@ -22,7 +24,7 @@ async def test_get_backup_status(client):
 
 @pytest.mark.asyncio
 async def test_get_backup_history_empty(client):
-    with patch("nazman.api.backup.backup_manager") as mock:
+    with override_manager(get_backup_manager) as mock:
         mock.get_backup_history = AsyncMock(return_value=[])
         response = client.get("/api/backup/history")
         assert response.status_code == 200
@@ -40,7 +42,7 @@ async def test_get_backup_history(client, db_session):
     db_session.add(commit)
     db_session.commit()
 
-    with patch("nazman.api.backup.backup_manager") as mock:
+    with override_manager(get_backup_manager) as mock:
         mock.get_backup_history = AsyncMock(return_value=[commit])
         response = client.get("/api/backup/history")
         assert response.status_code == 200
@@ -51,7 +53,7 @@ async def test_get_backup_history(client, db_session):
 
 @pytest.mark.asyncio
 async def test_create_backup(client, db_session):
-    with patch("nazman.api.backup.backup_manager") as mock:
+    with override_manager(get_backup_manager) as mock:
         async def fake_backup(db, message=None):
             commit = BackupCommit(
                 commit_hash="def456",
@@ -76,7 +78,7 @@ async def test_create_backup(client, db_session):
 
 @pytest.mark.asyncio
 async def test_restore_backup(client):
-    with patch("nazman.api.backup.backup_manager") as mock:
+    with override_manager(get_backup_manager) as mock:
         mock.restore_configuration = AsyncMock(return_value=True)
         response = client.post("/api/backup/restore", json={
             "commit_hash": "abc123",
@@ -87,7 +89,7 @@ async def test_restore_backup(client):
 
 @pytest.mark.asyncio
 async def test_restore_backup_failure(client):
-    with patch("nazman.api.backup.backup_manager") as mock:
+    with override_manager(get_backup_manager) as mock:
         mock.restore_configuration = AsyncMock(return_value=False)
         response = client.post("/api/backup/restore", json={
             "commit_hash": "nonexistent",

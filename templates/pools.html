@@ -262,17 +262,6 @@ async function toggleMetricLogging() {
     }
 }
 
-function formatSize(bytes) {
-    if (!bytes) return 'Unknown';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    let i = 0;
-    while (bytes >= 1024 && i < units.length - 1) {
-        bytes /= 1024;
-        i++;
-    }
-    return bytes.toFixed(2) + ' ' + units[i];
-}
-
 // ── Create Pool Modal ──────────────────────────────────────
 
 async function showCreatePoolModal() {
@@ -422,9 +411,9 @@ function confirmDevicePicker() {
         if (slotUuid) {
             const part = (diskPartitions[diskId] || []).find(p => p.slot_uuid === slotUuid);
             label = `${disk.device_name} p${part?.number || '?'} `;
-            label += `<small class="text-muted">${slotUuid.substring(0, 8)}... ${part ? formatSize(part.size_bytes) : ''}</small>`;
+            label += `<small class="text-muted">${slotUuid.substring(0, 8)}... ${part ? formatBytes(part.size_bytes) : ''}</small>`;
         } else {
-            label = `${disk.device_name} <small class="text-muted">${formatSize(disk.size_bytes)} whole disk</small>`;
+            label = `${disk.device_name} <small class="text-muted">${formatBytes(disk.size_bytes)} whole disk</small>`;
         }
 
         row.innerHTML = `

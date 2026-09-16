@@ -361,9 +361,29 @@ body {
 .badge-system { background-color: #8e44ad; color: white; }
 .badge-removed { background-color: #7f8c8d; color: white; }
 
+/* Disk role badges (disks page) */
+.badge-role-system { background-color: #8e44ad; color: white; }
+.badge-role-pool { background-color: #2980b9; color: white; }
+.badge-role-backup { background-color: #16a085; color: white; }
+.badge-role-unused { background-color: #95a5a6; color: white; }
+.badge-role-dead { background-color: #c0392b; color: white; }
+.badge-role-removed { background-color: #7f8c8d; color: white; }
+
+/* Backup disk probe state (free column on the disks page) */
+.badge-state-mounted { background-color: #27ae60; color: white; }
+.badge-state-full { background-color: #e67e22; color: white; }
+.badge-state-unmounted { background-color: #95a5a6; color: white; }
+.badge-state-offline { background-color: #7f8c8d; color: white; }
+.badge-state-mismatch { background-color: #e74c3c; color: white; }
+.badge-state-unknown { background-color: #95a5a6; color: white; }
+
 /* Removed/not-currently-present disk rows */
 .removed-row td { opacity: 0.55; }
 .removed-row:hover td { opacity: 0.9; }
+
+/* Dead disk rows */
+.dead-row td { opacity: 0.55; }
+.dead-row:hover td { opacity: 0.9; }
 
 /* Status */
 .status {
@@ -382,6 +402,63 @@ body {
 .status-ok { background-color: #27ae60; color: white; }
 .status-failing { background-color: #e74c3c; color: white; }
 .status-unknown { background-color: #95a5a6; color: white; }
+.status-dead { background-color: #7f8c8d; color: white; }
+.status-attention { background-color: #e67e22; color: white; }
+
+/* Disk needing attention (SMART failing or ZFS errors on the disks page) */
+.badge-health-attention {
+    background-color: #e67e22;
+    color: white;
+    animation: status-amber-pulse 1.5s infinite;
+    cursor: help;
+}
+
+/* Disk details modal */
+.disk-detail-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1fr;
+    gap: 16px;
+}
+.disk-detail-grid .detail-col { min-width: 0; }
+.disk-detail-section {
+    background: #fafafa;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 12px;
+}
+.disk-detail-section h4 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #555;
+}
+.detail-key {
+    color: #888;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    width: 150px;
+    display: inline-block;
+    vertical-align: top;
+}
+.detail-val { font-size: 13px; word-break: break-all; }
+.smart-attr-table, .event-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.smart-attr-table td, .event-table td {
+    padding: 3px 6px;
+    border-top: 1px solid #eee;
+    text-align: left;
+}
+.smart-attr-table .num { font-variant-numeric: tabular-nums; }
+.problem-item { font-size: 13px; margin: 0 0 4px; }
+.problem-warn { color: #e67e22; }
+.problem-fatal { color: #e74c3c; font-weight: 600; }
+.empty-hint { color: #888; font-size: 13px; font-style: italic; }
+
+@media (max-width: 768px) {
+    .disk-detail-grid { grid-template-columns: 1fr; }
+}
 
 @keyframes status-amber-pulse {
     0%, 100% { background-color: #f39c12; }
@@ -804,6 +881,22 @@ code.event-cmd {
 .alert-success { background-color: var(--success-color); }
 .alert-error { background-color: var(--danger-color); }
 .alert-warning { background-color: var(--warning-color); }
+
+/* Message history modal */
+.message-entry {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    gap: 10px;
+    font-size: 0.9em;
+}
+.message-entry:last-child { border-bottom: none; }
+.message-ts { color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+.message-text { word-break: break-word; }
+.message-error .message-text { color: var(--danger-color); }
+.message-warning .message-text { color: var(--warning-color); }
+.message-success .message-text { color: var(--success-color); }
+.message-info .message-text { color: var(--primary-color); }
 
 @keyframes slideIn {
     from {

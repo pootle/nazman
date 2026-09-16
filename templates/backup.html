@@ -390,6 +390,7 @@ function refreshBackupHistory() {
 // ── ZFS data backup ──────────────────────────────────────────────────
 let backupDisks = [];
 let backupDatasets = [];
+let backupRuns = [];
 let allDisks = [];
 let diskPartitions = {};
 let usedDisks = [];
@@ -436,6 +437,7 @@ async function loadBackupDisks() {
         await refreshDiskInventory();
         renderBackupDisks();
         renderBackupDatasets();
+        scheduleDisksPoll();
     } catch (e) {
         showError('backup-disks', 'Failed to load backup disks');
     }
@@ -447,6 +449,8 @@ const BACKUP_STATUS_LABELS = {
     full: 'Full',
     offline: 'Not connected',
     mismatch: 'Filesystem changed',
+    pending: 'Preparing…',
+    failed: 'Failed',
 };
 const BACKUP_STATUS_TIPS = {
     mounted: 'Plugged in and mounted',
@@ -454,6 +458,8 @@ const BACKUP_STATUS_TIPS = {
     full: 'Mounted but the disk is full',
     offline: 'No device detected. Try Wake / Replug; if the enclosure is fitted but off, power-cycle it.',
     mismatch: 'A device is present but its filesystem UUID differs from what was declared. Re-scan or re-declare.',
+    pending: 'Wiping &amp; formatting the disk; this takes a few minutes.',
+    failed: 'The declaration failed. See the error, then retry via Declare.',
 };
 
 function backupStatusBadge(status) {
@@ -461,7 +467,9 @@ function backupStatusBadge(status) {
         : (status === 'full' ? 'status-warning'
         : (status === 'unmounted' ? 'status-unknown'
         : (status === 'mismatch' ? 'status-warning'
-        : 'status-unknown')));
+        : (status === 'pending' ? 'status-running'
+        : (status === 'failed' ? 'status-faulted'
+        : 'status-unknown')))));
     return `<span class="${cls}" title="${BACKUP_STATUS_TIPS[status] || ''}">${BACKUP_STATUS_LABELS[status] || status}</span>`;
 }
 
@@ -472,6 +480,7 @@ function renderBackupDisks() {
         return;
     }
     const offline = (d) => d.status === 'offline' || d.status === 'mismatch';
+    const inflight = (d) => d.status === 'pending' || d.status === 'failed';
     c.innerHTML = `
         <table class="data-table">
             <thead><tr>
@@ -480,20 +489,24 @@ function renderBackupDisks() {
             </tr></thead>
             <tbody>
                 ${backupDisks.map(d => {
+                    const pending = d.status === 'pending';
+                    const failed = d.status === 'failed';
                     const pct = d.total_bytes ? Math.round((d.free_bytes / d.total_bytes) * 100) : 0;
                     return `<tr>
-                        <td title="${d.device_path}">${d.label ? d.label : '<span class="text-muted">—</span>'}</td>
+                        <td title="${d.device_path || ''}">${d.label ? d.label : '<span class="text-muted">—</span>'}</td>
                         <td>${d.fs_type}</td>
-                        <td>${formatBytes(d.total_bytes)}</td>
-                        <td>${formatBytes(d.free_bytes)} (${pct}%)</td>
+                        <td>${inflight(d) ? '—' : formatBytes(d.total_bytes)}</td>
+                        <td>${inflight(d) || d.status === 'offline' || d.status === 'mismatch' ? '—' : pct + '% free (' + formatBytes(d.free_bytes) + ')'}</td>
                         <td>${backupStatusBadge(d.status)}</td>
-                        <td><input type="checkbox" ${d.unmount_after_backup ? 'checked' : ''} onchange="setUnmountAfter(${d.id}, this.checked)"></td>
-                        <td>
-                            <button class="btn btn-secondary btn-sm" onclick="toggleMount(${d.id})" ${offline(d) ? 'disabled title="Disk is not present"' : ''}>${d.status === 'mounted' ? 'Unmount' : 'Mount'}</button>
+                        <td><input type="checkbox" ${d.unmount_after_backup ? 'checked' : ''} ${inflight(d) ? 'disabled' : ''} onchange="setUnmountAfter(${d.id}, this.checked)"></td>
+                        <td>${
+                            pending ? '<span class="status-running">wiping &amp; formatting…</span>'
+                            : failed ? '<span class="text-muted" title="' + (d.error || '') + '">failed — retry via Declare</span>'
+                            : `<button class="btn btn-secondary btn-sm" onclick="toggleMount(${d.id})" ${offline(d) ? 'disabled title="Disk is not present"' : ''}>${d.status === 'mounted' ? 'Unmount' : 'Mount'}</button>
                             <button class="btn btn-secondary btn-sm" onclick="wakeDisk(${d.id})" ${offline(d) ? '' : 'disabled title="Disk is present; nothing to wake"'} title="Software wake/replug: force a sleeping or dropped USB disk to re-enumerate, no power cycle needed">Wake / Replug</button>
                             <button class="btn btn-secondary btn-sm" onclick="scanDisk(${d.id})">Scan</button>
-                            <button class="btn btn-danger btn-sm" onclick="removeBackupDisk(${d.id})">Remove</button>
-                        </td>
+                            <button class="btn btn-danger btn-sm" onclick="removeBackupDisk(${d.id})">Remove</button>`
+                        }</td>
                     </tr>`;
                 }).join('')}
             </tbody>
@@ -658,7 +671,8 @@ async function confirmDeclareDisk() {
 async function declareDisk(id, slotUuid, label, wipeRaid) {
     try {
         await api.declareBackupDisk(id, true, slotUuid, label, wipeRaid);
-        showAlert('Backup disk declared and formatted', 'success');
+        // The wipe+format runs in the background: the pending row shows in the
+        // list immediately and the status poll reports the final outcome.
         await loadZfsBackup();
     } catch (e) {
         showAlert('Failed to declare backup disk: ' + e.message, 'error');
@@ -703,7 +717,7 @@ function renderBackupDatasets() {
                     const scheds = ds.schedules || [];
                     const busy = (diskId) => activeRuns.has(ds.name + '/' + diskId);
                     const assigned = new Set(scheds.map(s => s.backup_disk_id));
-                    const addOpts = backupDisks.filter(d => !assigned.has(d.id))
+                    const addOpts = backupDisks.filter(d => d.status !== 'pending' && d.status !== 'failed' && !assigned.has(d.id))
                         .map(d => `<option value="${d.id}" title="${d.device_path}">${diskName(d)}</option>`).join('');
                     const blocks = scheds.length ? scheds.map(s => {
                         const diskId = s.backup_disk_id;
@@ -730,13 +744,13 @@ function renderBackupDatasets() {
                     const addControl = noDisks || !addOpts ? '' :
                         `<div class="sched-add">
                             <select id="newdisk-${ds.name}" class="form-control" title="Add another backup disk for grandfather-father-son retention">${addOpts}</select>
-                            <button class="btn btn-secondary btn-sm" title="Back up this dataset to an additional disk" onclick="addDiskSchedule('${ds.name}')">Add another disk</button>
+                            <button class="btn btn-secondary btn-sm" title="Back up this dataset to an additional disk" onclick="addDiskSchedule('${ds.name}')">Add disk</button>
                         </div>`;
 
                     return `<tr>
                         <td><code>${ds.name}</code></td>
                         <td>${blocks}${addControl}</td>
-                        <td>${formatBytes(ds.changed_since_full)} <small class="text-muted">(${ds.full_runs || 0} backups)</small></td>
+                        <td title="Size of changed data since the last full backup">${formatBytes(ds.changed_since_full)} <small class="text-muted">(${ds.full_runs || 0} backups)</small></td>
                         <td>${scheduleRunBadge(ds.last_status)} <small class="text-muted">${ds.last_type || '-'} ${formatDate(ds.last_completed_at)}</small></td>
                     </tr>`;
                 }).join('')}
@@ -751,12 +765,14 @@ async function runDataset(name, diskId, type) {
     renderBackupDatasets();
     try {
         await api.runBackup(name, diskId, type);
-        showAlert(`${type} backup to disk ${diskId} complete`, 'success');
+        // The backup runs in the background; scheduleRunsPoll picks up the
+        // running→success/failed transition and refreshes the dataset panel.
+        await loadBackupRuns();
+        scheduleRunsPoll();
     } catch (e) {
         showAlert(`Backup failed: ${e.message}`, 'error');
-    } finally {
         activeRuns.delete(key);
-        await loadZfsBackup();
+        await loadBackupDatasets();
     }
 }
 
@@ -808,11 +824,9 @@ async function removeSchedule(name, diskId) {
 
 async function loadBackupRuns() {
     try {
-        const runs = await api.listBackupRuns();
-        renderBackupRuns(runs);
-        // Keep polling while any run is in progress so the running→success
-        // transition (scheduled or manual) shows up without a manual reload.
-        if (runs.some(r => r.status === 'running')) {
+        backupRuns = await api.listBackupRuns();
+        renderBackupRuns(backupRuns);
+        if (backupRuns.some(r => r.status === 'running')) {
             scheduleRunsPoll();
         }
     } catch (e) {
@@ -823,10 +837,22 @@ async function loadBackupRuns() {
 let runsPollTimer = null;
 function scheduleRunsPoll() {
     if (runsPollTimer) return;
+    const prev = new Map(backupRuns.map(r => [r.id, r.status]));
     runsPollTimer = setTimeout(async () => {
         runsPollTimer = null;
         const runs = await api.listBackupRuns().catch(() => []);
+        backupRuns = runs;
         renderBackupRuns(runs);
+        for (const r of runs) {
+            const was = prev.get(r.id);
+            if (was !== 'running') continue;
+            activeRuns.delete(r.dataset_name + '/' + r.backup_disk_id);
+            if (r.status === 'success') {
+                showAlert(r.backup_type + ' backup of ' + r.dataset_name + ' complete', 'success');
+            } else if (r.status === 'failed') {
+                showAlert('Backup failed: ' + (r.error || 'unknown error'), 'error');
+            }
+        }
         if (runs.some(r => r.status === 'running')) {
             scheduleRunsPoll();
         } else {
@@ -835,9 +861,45 @@ function scheduleRunsPoll() {
     }, 5000);
 }
 
-function runStatusBadge(status) {
+let disksPollTimer = null;
+function scheduleDisksPoll() {
+    // While any declaration is pending, poll the disk list until it resolves
+    // to a real backup disk (success) or is reported failed.
+    const pending = backupDisks.filter(d => d.status === 'pending');
+    if (pending.length === 0) return;
+    if (disksPollTimer) return;
+    const prev = new Map(pending.map(d => [d.disk_id, d.status]));
+    disksPollTimer = setTimeout(async () => {
+        disksPollTimer = null;
+        let disks;
+        try {
+            disks = await api.listBackupDisks();
+        } catch (e) {
+            scheduleDisksPoll();
+            return;
+        }
+        backupDisks = disks;
+        renderBackupDisks();
+        for (const d of disks) {
+            const was = prev.get(d.disk_id);
+            if (was !== 'pending') continue;
+            if (d.status === 'failed') {
+                showAlert('Failed to declare backup disk: ' + (d.error || 'declaration failed'), 'error');
+            } else if (d.status !== 'pending') {
+                showAlert('Backup disk declared and formatted', 'success');
+            }
+        }
+        if (disks.some(d => d.status === 'pending')) {
+            scheduleDisksPoll();
+        }
+    }, 5000);
+}
+
+function runStatusBadge(status, phase) {
     if (status === 'success') return '<span class="status-online">success</span>';
-    if (status === 'running') return '<span class="status-running">running</span>';
+    if (status === 'skipped') return '<span class="status-unknown">skipped — no changes</span>';
+    if (status === 'running' && phase === 'sending') return '<span class="status-running">sending…</span>';
+    if (status === 'running') return `<span class="status-running">${phase || 'running'}…</span>`;
     return `<span class="status-faulted">${status}</span>`;
 }
 
@@ -854,23 +916,29 @@ function renderBackupRuns(runs) {
                 <th>Changed</th><th>Snapshot</th><th>Date</th><th>Restore</th>
             </tr></thead>
             <tbody>
-                ${runs.map(r => `
-                    <tr>
+                ${runs.map(r => {
+                    const sending = r.status === 'running' && r.phase === 'sending' && r.size_bytes > 0;
+                    return `<tr>
                         <td><code>${r.dataset_name}</code></td>
                         <td><span class="badge">${r.backup_type}</span></td>
-                        <td title="${r.error || ''}">${runStatusBadge(r.status)}</td>
+                        <td title="${r.error || ''}">${runStatusBadge(r.status, r.phase)}${sending ? ' <span class="text-muted">(' + formatBytes(r.size_bytes) + ')</span>' : ''}</td>
                         <td>${formatBytes(r.size_bytes)}</td>
                         <td>${formatBytes(r.changed_bytes)}</td>
-                        <td><code title="${r.stream_file}">${r.snapshot}</code></td>
+                        <td><code title="${r.stream_file || ''}">${r.snapshot || '—'}</code></td>
                         <td>${formatDate(r.completed_at || r.started_at)}</td>
-                        <td>${r.status === 'running' ? '<span class="text-muted">—</span>' : `<button class="btn btn-danger btn-sm" onclick="restoreRun(${r.id}, '${r.dataset_name}')">Restore</button>`}</td>
-                    </tr>`
-                ).join('')}
+                        <td>${r.status === 'running' || r.status === 'skipped' || r.status === 'failed' ? '<span class="text-muted">—</span>' : `<button class="btn btn-danger btn-sm" onclick="restoreRun(${r.id}, '${r.dataset_name}')">Restore</button>`}</td>
+                    </tr>`;
+                }).join('')}
             </tbody>
         </table>`;
 }
 
 function restoreRun(runId, dsName) {
+    const run = backupRuns.find(r => r.id === runId);
+    if (run && (run.status === 'skipped' || run.status === 'failed' || run.status === 'running')) {
+        showAlert(`Cannot restore a ${run.status} backup run`, 'error');
+        return;
+    }
     if (!confirm(`Restore dataset "${dsName}" from this backup run?\n\nThis overwrites the live dataset with the backup stream.`)) return;
     if (!confirm('Are you REALLY sure? Live data will be replaced.')) return;
     api.restoreBackupRun(runId, dsName).then(() => {

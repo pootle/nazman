@@ -4,9 +4,10 @@ import shutil
 
 from sqlalchemy.orm import Session
 
-from ..utils.commands import run_zfs, run_command, run_zpool
+from ..utils.commands import run_zfs, run_command
 from ..utils.exceptions import NfsError, ValidationError
 from ..utils.validation import validate_ip_cidr
+from ..utils import provisioning, zfs_query
 
 
 class NfsManager:
@@ -22,9 +23,9 @@ class NfsManager:
 
     # Dedicated identity anonymous NFS clients are squashed to, so clients with
     # arbitrary local UIDs get consistent read/write access.
-    ANON_USER = "nfsanon"
-    ANON_UID = 65533
-    ANON_GID = 65533
+    ANON_USER = provisioning.ANON_USER
+    ANON_UID = provisioning.ANON_UID
+    ANON_GID = provisioning.ANON_GID
 
     # zfs-share.service runs `zfs share -a` before nfs-server.service, so on
     # slow boots the kernel export table can be left empty (exportfs -r only
@@ -125,17 +126,14 @@ class NfsManager:
             return "off"
         return v
 
-    async def _read_sharenfs(self, dataset_name: str) -> str:
+    async def read_sharenfs(self, dataset_name: str) -> str:
         stdout, _, rc = await run_zfs(
             "get", "-H", "-o", "value", "sharenfs", dataset_name, check=False, op="read",
         )
         return self._normalize_sharenfs(stdout)
 
     async def _dataset_exists(self, dataset_name: str) -> bool:
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", dataset_name, check=False, op="read",
-        )
-        return rc == 0 and dataset_name in stdout.split()
+        return await zfs_query.dataset_exists(dataset_name)
 
     async def _set_sharenfs(self, dataset_name: str, value: str) -> None:
         """Set the sharenfs property and sync the kernel export accordingly.
@@ -159,32 +157,15 @@ class NfsManager:
 
     # -- listing -----------------------------------------------------------
 
-    async def _list_dataset_names(self, pool_name: Optional[str] = None) -> List[str]:
+    async def list_dataset_names(self, pool_name: Optional[str] = None) -> List[str]:
         """Full ZFS names of every dataset (filesystem), excluding pool roots.
 
         Dataset existence is derived live from ZFS: no database copy exists.
         When ``pool_name`` is given, only that pool's children are returned.
         """
         if pool_name:
-            roots = [pool_name]
-        else:
-            stdout, _, rc = await run_zpool("list", "-H", "-o", "name", check=False, op="read")
-            if rc != 0:
-                return []
-            roots = [line.strip() for line in stdout.splitlines() if line.strip()]
-
-        names: List[str] = []
-        for root in roots:
-            stdout, _, rc = await run_zfs(
-                "list", "-H", "-o", "name", "-t", "filesystem", "-r", root, check=False, op="read",
-            )
-            if rc != 0:
-                continue
-            for line in stdout.splitlines():
-                name = line.strip()
-                if name and name != root:
-                    names.append(name)
-        return names
+            return await zfs_query.list_filesystem_names(pool_name)
+        return await zfs_query.all_filesystem_names()
 
     async def _active_export_paths(self) -> set:
         """Set of currently active export paths from the kernel export table."""
@@ -209,8 +190,8 @@ class NfsManager:
         """
         active = await self._active_export_paths()
         rows = []
-        for name in await self._list_dataset_names():
-            sharenfs = await self._read_sharenfs(name)
+        for name in await self.list_dataset_names():
+            sharenfs = await self.read_sharenfs(name)
             if sharenfs in ("", "off"):
                 continue
             rows.append({
@@ -316,7 +297,7 @@ class NfsManager:
 
         if enabled is False:
             await run_zfs("unshare", dataset_name, check=False)
-            return await self._export_status(dataset_name, await self._read_sharenfs(dataset_name))
+            return await self._export_status(dataset_name, await self.read_sharenfs(dataset_name))
 
         if sharenfs is not None:
             value = sharenfs.strip()
@@ -326,7 +307,7 @@ class NfsManager:
         else:
             # No new config supplied: re-share with the stored options, or
             # refuse to enable a share whose settings were discarded.
-            current = await self._read_sharenfs(dataset_name)
+            current = await self.read_sharenfs(dataset_name)
             if current in ("", "off"):
                 if enabled is True:
                     raise ValidationError(
@@ -361,7 +342,7 @@ class NfsManager:
         names = set()
         if pool.name:
             names.add(pool.name)
-        names.update(await self._list_dataset_names(pool.name))
+        names.update(await self.list_dataset_names(pool.name))
 
         for name in names:
             try:
@@ -371,13 +352,13 @@ class NfsManager:
 
     async def get_pool_export_info(self, db: Session, pool) -> Dict[str, Any]:
         """Return share status and active NFS clients for a pool's datasets."""
-        dataset_names = await self._list_dataset_names(pool.name)
+        dataset_names = await self.list_dataset_names(pool.name)
         export_paths = sorted({f"/{pool.name}"} | {f"/{d}" for d in dataset_names})
         active = await self._active_export_paths()
 
         exports = []
         for name in dataset_names:
-            sharenfs = await self._read_sharenfs(name)
+            sharenfs = await self.read_sharenfs(name)
             if sharenfs in ("", "off"):
                 continue
             path = f"/{name}"
@@ -389,7 +370,7 @@ class NfsManager:
                 "paused": path not in active,
             })
         if pool.name:
-            root = await self._read_sharenfs(pool.name)
+            root = await self.read_sharenfs(pool.name)
             if root not in ("", "off"):
                 path = f"/{pool.name}"
                 exports.append({
@@ -400,22 +381,7 @@ class NfsManager:
                     "paused": path not in active,
                 })
 
-        active_clients = []
-        try:
-            stdout, _, rc = await run_command(
-                ["showmount", "-a"], timeout=15, check=False
-            )
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("All mount") or ":" not in line:
-                        continue
-                    client, path = line.rsplit(":", 1)
-                    path = path.strip()
-                    if any(path == p or path.startswith(p + "/") for p in export_paths):
-                        active_clients.append({"client": client.strip(), "path": path})
-        except Exception:
-            pass
+        active_clients = await zfs_query.showmount_clients(export_paths)
 
         return {"exports": exports, "active_clients": active_clients}
 
@@ -423,35 +389,12 @@ class NfsManager:
 
     async def _ensure_anon_user(self) -> None:
         """Idempotently ensure the anonymous NFS user/group exists."""
-        stdout, _, rc = await run_command(
-            ["getent", "group", self.ANON_USER], timeout=10, check=False
-        )
-        if rc != 0:
-            await run_command(
-                ["groupadd", "-g", str(self.ANON_GID), self.ANON_USER], timeout=30
-            )
-        stdout, _, rc = await run_command(
-            ["getent", "passwd", self.ANON_USER], timeout=10, check=False
-        )
-        if rc != 0:
-            await run_command(
-                [
-                    "useradd", "-r", "-g", str(self.ANON_GID),
-                    "-u", str(self.ANON_UID), "-M",
-                    "-s", "/usr/sbin/nologin",
-                    "-d", "/var/lib/nfs", self.ANON_USER,
-                ],
-                timeout=30,
-            )
+        await provisioning.ensure_anon_user()
 
     async def _prepare_dataset_dir(self, dataset_name: str) -> None:
         """Make the shared directory writable by the anon user."""
         try:
-            await run_command(["chown", f":{self.ANON_USER}", f"/{dataset_name}"], timeout=30, op="write", category="nfs")
-            await run_command(["chmod", "2775", f"/{dataset_name}"], timeout=30, op="write", category="nfs")
+            await provisioning.prepare_dataset_dir(dataset_name, category="nfs")
         except Exception as e:
             raise NfsError(f"Failed to prepare dataset directory: {str(e)}")
 
-
-# Singleton instance
-nfs_manager = NfsManager()

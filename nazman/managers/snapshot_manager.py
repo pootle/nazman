@@ -89,6 +89,3 @@ class SnapshotManager:
         if returncode != 0:
             raise DatasetError(f"Failed to destroy snapshot: {stderr}")
 
-
-# Singleton instance
-snapshot_manager = SnapshotManager()

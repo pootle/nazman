@@ -2,6 +2,8 @@ import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 from tests.conftest import mock_run_command, mock_run_zpool
 from nazman.utils.command_log import command_log
+from nazman.wiring import get_zfs_manager, get_disk_manager, get_metrics_manager
+from tests.conftest import override_manager
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +38,9 @@ async def test_get_system_status(client):
             percent=50.0,
         )
 
-        with patch("nazman.api.system.zfs_manager") as mock_zfs:
+        with override_manager(get_zfs_manager) as mock_zfs:
             mock_zfs.list_pools = AsyncMock(return_value=[])
-            with patch("nazman.api.system.disk_manager") as mock_disk:
+            with override_manager(get_disk_manager) as mock_disk:
                 mock_disk.sync_disks_to_database = AsyncMock(return_value=[])
 
                 response = client.get("/api/system/status")
@@ -55,7 +57,7 @@ async def test_get_system_metrics(client):
     fake_cpu = [{"ts": 1000.0, "value": 10.0}, {"ts": 1005.0, "value": 42.0}]
     fake_mem = [{"ts": 1000.0, "value": 20.0}, {"ts": 1005.0, "value": 50.0}]
 
-    with patch("nazman.api.system.metrics_manager") as mock_metrics, \
+    with override_manager(get_metrics_manager) as mock_metrics, \
          patch("nazman.api.system.psutil") as mock_psutil:
         mock_metrics.get_series.side_effect = lambda name: fake_cpu if name == "cpu" else fake_mem
         mock_psutil.virtual_memory.return_value = MagicMock(
@@ -86,22 +88,22 @@ async def test_get_system_metrics_includes_net_disks_pools(client, db_session):
     fake_net = [{"ts": 1.0, "value": 30.0}]
     fake_disk_series = {"sda": [{"ts": 1.0, "value": 40.0}]}
 
-    with patch("nazman.api.system.metrics_manager") as mock_metrics, \
+    with override_manager(get_metrics_manager) as mock_metrics, \
          patch("nazman.api.system.psutil") as mock_psutil, \
-         patch("nazman.api.system.get_disk_series_names") as mock_disk_names, \
          patch("nazman.api.system.list_network_interfaces") as mock_ifaces, \
          patch("nazman.api.system.get_selected_network_interface") as mock_sel, \
-         patch("nazman.api.system.zfs_manager") as mock_zfs:
+         override_manager(get_zfs_manager) as mock_zfs:
         mock_metrics.get_series.side_effect = lambda name: {
             "cpu": fake_cpu, "memory": fake_mem, "net": fake_net,
             "disk_sda": fake_disk_series["sda"],
         }.get(name, [])
-        mock_disk_names.return_value = {"sda": "disk_sda"}
+        mock_metrics.disk_series_names.return_value = {"sda": "disk_sda"}
         mock_ifaces.return_value = [{"name": "eth0", "speed_mbps": 1000, "up": True}]
         mock_sel.return_value = "eth0"
         mock_zfs.get_pool_status = AsyncMock(return_value={
             "data_vdevs": [{"children": [{"name": "sda1", "state": "ONLINE", "path": "", "size": ""}]}],
         })
+        mock_zfs.list_pool_names.return_value = ["testpool"]
         mock_psutil.virtual_memory.return_value = MagicMock(
             total=8_000_000_000, used=4_000_000_000, percent=50.0,
         )
@@ -133,16 +135,16 @@ async def test_get_system_metrics_pool_disks_priority_and_cap(client, db_session
         b = name[len("disk_"):]
         return disk_series.get(b, [])
 
-    with patch("nazman.api.system.metrics_manager") as mock_metrics, \
+    with override_manager(get_metrics_manager) as mock_metrics, \
          patch("nazman.api.system.psutil") as mock_psutil, \
-         patch("nazman.api.system.get_disk_series_names") as mock_disk_names, \
          patch("nazman.api.system.list_network_interfaces") as mock_ifaces, \
          patch("nazman.api.system.get_selected_network_interface") as mock_sel, \
-         patch("nazman.api.system.zfs_manager") as mock_zfs:
+         override_manager(get_zfs_manager) as mock_zfs:
         mock_metrics.get_series.side_effect = fake_metrics_get
-        mock_disk_names.return_value = {b: f"disk_{b}" for b in base_names}
+        mock_metrics.disk_series_names.return_value = {b: f"disk_{b}" for b in base_names}
         mock_ifaces.return_value = []
         mock_sel.return_value = None
+        mock_zfs.list_pool_names.return_value = ["bigpool"]
         mock_zfs.get_pool_status = AsyncMock(return_value={
             "data_vdevs": [{"children": [
                 {"name": "sda", "state": "ONLINE", "path": "", "size": ""},
@@ -181,16 +183,16 @@ async def test_get_system_metrics_pool_disks_dedupe(client, db_session):
     def fake_metrics_get(name):
         return []
 
-    with patch("nazman.api.system.metrics_manager") as mock_metrics, \
+    with override_manager(get_metrics_manager) as mock_metrics, \
          patch("nazman.api.system.psutil") as mock_psutil, \
-         patch("nazman.api.system.get_disk_series_names") as mock_disk_names, \
          patch("nazman.api.system.list_network_interfaces") as mock_ifaces, \
          patch("nazman.api.system.get_selected_network_interface") as mock_sel, \
-         patch("nazman.api.system.zfs_manager") as mock_zfs:
+         override_manager(get_zfs_manager) as mock_zfs:
         mock_metrics.get_series.side_effect = fake_metrics_get
-        mock_disk_names.return_value = {"sda": "disk_sda", "sdb": "disk_sdb"}
+        mock_metrics.disk_series_names.return_value = {"sda": "disk_sda", "sdb": "disk_sdb"}
         mock_ifaces.return_value = []
         mock_sel.return_value = None
+        mock_zfs.list_pool_names.return_value = ["dedupool"]
         mock_zfs.get_pool_status = AsyncMock(return_value={
             "data_vdevs": [{"children": [{"name": "sda", "state": "ONLINE", "path": "", "size": ""}]}],
             "special_vdevs": [{"children": [{"name": "sda", "state": "ONLINE", "path": "", "size": ""}]}],

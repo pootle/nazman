@@ -13,16 +13,70 @@ function escapeHtml(text) {
     return text.toString().replace(/[&<>"']/g, m => map[m]);
 }
 
+// Fly-in alert (toast) history. Every message is kept in localStorage so
+// transient alerts (which auto-dismiss after a few seconds) can be reviewed
+// later from the Messages modal in the header.
+const MESSAGE_LOG_KEY = 'nazman_messages';
+const MESSAGE_LOG_MAX = 200;
+
+let messageHistory = loadMessageHistory();
+
+function loadMessageHistory() {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(MESSAGE_LOG_KEY) || '[]');
+        return Array.isArray(parsed) ? parsed.slice(0, MESSAGE_LOG_MAX) : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function saveMessageHistory() {
+    try {
+        localStorage.setItem(MESSAGE_LOG_KEY, JSON.stringify(messageHistory.slice(0, MESSAGE_LOG_MAX)));
+    } catch (e) {
+        // Storage unavailable/full; the in-memory log still works for this page.
+    }
+}
+
 // Alert function
 function showAlert(message, type = 'success', duration = 3000) {
+    messageHistory.unshift({ ts: new Date().toISOString(), type, message: String(message) });
+    saveMessageHistory();
+
     const alert = document.createElement('div');
     alert.className = `alert alert-${type}`;
     alert.textContent = message;
     document.body.appendChild(alert);
-    
+
     setTimeout(() => {
         alert.remove();
     }, duration);
+}
+
+function renderMessageHistory() {
+    const list = document.getElementById('message-history-list');
+    if (!list) return;
+    if (messageHistory.length === 0) {
+        list.innerHTML = '<p class="text-muted">No messages yet.</p>';
+        return;
+    }
+    list.innerHTML = messageHistory.map(m =>
+        `<div class="message-entry message-${m.type}">
+            <span class="message-ts">${formatDate(m.ts)}</span>
+            <span class="message-text">${escapeHtml(m.message)}</span>
+        </div>`
+    ).join('');
+}
+
+function openMessageHistory() {
+    renderMessageHistory();
+    showModal('message-history-modal');
+}
+
+function clearMessageHistory() {
+    messageHistory = [];
+    saveMessageHistory();
+    renderMessageHistory();
 }
 
 // Format bytes to human readable
@@ -212,3 +266,10 @@ window.DevicePicker = {
             .map(el => el.value);
     },
 };
+
+document.addEventListener('DOMContentLoaded', function () {
+    const messagesBtn = document.getElementById('messages-btn');
+    if (messagesBtn) messagesBtn.addEventListener('click', openMessageHistory);
+    const clearBtn = document.getElementById('messages-clear-btn');
+    if (clearBtn) clearBtn.addEventListener('click', clearMessageHistory);
+});

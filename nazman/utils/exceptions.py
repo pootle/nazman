@@ -32,8 +32,22 @@ class ValidationError(NAZManError):
     pass
 
 
+class NotFoundError(NAZManError):
+    """Raised when a requested entity does not exist.
+
+    Handlers map this to HTTP 404, so callers must not string-sniff messages
+    to distinguish "missing" from "failed".
+    """
+    pass
+
+
 class DiskError(NAZManError):
     """Raised when a disk operation fails."""
+    pass
+
+
+class DiskNotFoundError(DiskError, NotFoundError):
+    """Raised when a disk row does not exist."""
     pass
 
 
@@ -42,8 +56,18 @@ class PoolError(NAZManError):
     pass
 
 
+class PoolNotFoundError(PoolError, NotFoundError):
+    """Raised when a pool does not exist."""
+    pass
+
+
 class DatasetError(NAZManError):
     """Raised when a dataset operation fails."""
+    pass
+
+
+class DatasetNotFoundError(DatasetError, NotFoundError):
+    """Raised when a dataset does not exist."""
     pass
 
 
@@ -59,4 +83,14 @@ class SmbError(NAZManError):
 
 class BackupError(NAZManError):
     """Raised when a backup operation fails."""
+    pass
+
+
+class BackupDiskNotFoundError(BackupError, NotFoundError):
+    """Raised when a declared backup disk does not exist."""
+    pass
+
+
+class BackupRunNotFoundError(BackupError, NotFoundError):
+    """Raised when a backup run record does not exist."""
     pass

@@ -7,9 +7,16 @@ from unittest.mock import patch, AsyncMock, MagicMock
 from nazman.models.disk import Disk
 from nazman.models.pool import Pool
 from nazman.models.backup_zfs import BackupDisk, BackupRun, BackupSchedule
-from nazman.managers.zfs_backup_manager import zfs_backup_manager
-from nazman.managers.zfs_manager import zfs_manager
+from nazman.managers.zfs_backup_manager import ZfsBackupManager
+from nazman.managers.zfs_manager import ZfsManager
+from nazman.managers.scheduler import SchedulerManager
+
+zfs_manager = ZfsManager()
+scheduler_manager = SchedulerManager()
+zfs_backup_manager = ZfsBackupManager(zfs=zfs_manager, scheduler=scheduler_manager)
 from nazman.utils.exceptions import ValidationError, BackupError, CommandError
+from nazman.wiring import get_zfs_backup_manager
+from tests.conftest import override_manager
 
 
 def _mk_pool(db_session, name):
@@ -73,6 +80,7 @@ async def test_run_backup_full_writes_successful_run(db_session, tmp_path, monke
     monkeypatch.setattr(Path, "is_mount", fake_is_mount)
 
     with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_run_zfs) as rzfs, \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
          patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipeline) as rpipe, \
          patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
          patch("os.path.exists", return_value=True), \
@@ -122,7 +130,8 @@ async def test_run_backup_capacity_insufficient_aborts(db_session, tmp_path, mon
     monkeypatch.setattr(Path, "is_mount", lambda self: str(self) == str(tmp_path))
 
     with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_run_zfs), \
-         patch.object(zfs_backup_manager, "mount_backup_disk", new=AsyncMock()), \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
+         patch.object(ZfsBackupManager, "mount_backup_disk", new=AsyncMock()), \
          patch("nazman.managers.zfs_backup_manager.os.statvfs", return_value=FakeStatvfs()), \
          patch("nazman.managers.zfs_backup_manager.run_pipeline", new=AsyncMock()):
         run = await zfs_backup_manager.run_backup(
@@ -170,12 +179,12 @@ async def test_api_run_backup(client, db_session):
     db_session.add(run)
     db_session.commit()
 
-    with patch("nazman.api.zfs_backup.zfs_backup_manager") as mock:
-        mock.run_backup = AsyncMock(return_value=run)
+    with override_manager(get_zfs_backup_manager) as mock:
+        mock.start_run_backup = AsyncMock(return_value=run)
         response = client.post("/api/backup-zfs/runs", json={
             "dataset_name": "tank/media", "backup_disk_id": bd.id, "backup_type": "full",
         })
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     data = response.json()
     assert data["dataset_name"] == "tank/media"
     assert data["status"] == "success"
@@ -183,7 +192,7 @@ async def test_api_run_backup(client, db_session):
 
 @pytest.mark.asyncio
 async def test_api_used_disks_empty(client, db_session):
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})):
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})):
         response = client.get("/api/backup-zfs/disks/used")
     assert response.status_code == 200
     assert response.json() == []
@@ -210,7 +219,7 @@ async def test_api_used_disks_lists_whole_and_partition(client, db_session):
     ])
     db_session.commit()
 
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})):
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})):
         response = client.get("/api/backup-zfs/disks/used")
     assert response.status_code == 200, response.text
     rows = response.json()
@@ -237,8 +246,8 @@ async def test_api_used_disks_includes_pool_members(client, db_session):
         "/dev/disk/by-id/sata-PART-part2": "poolA",
         "/dev/disk/by-id/sata-WHOLE": "poolB",
     }
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value=members)), \
-         patch("nazman.api.zfs_backup.get_device_path", return_value="/dev/sdc"):
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value=members)), \
+         patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdc"):
         response = client.get("/api/backup-zfs/disks/used")
 
     assert response.status_code == 200, response.text
@@ -267,7 +276,7 @@ async def test_declare_whole_disk_wipes_and_formats_part1(db_session, tmp_path, 
         return ("", "", 0)
 
     with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
-         patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch.object(zfs_backup_manager, "_ensure_unused", new=AsyncMock()), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch.object(zfs_backup_manager, "_fs_uuid", new=AsyncMock(return_value="FSID1")):
@@ -300,7 +309,7 @@ async def test_declare_partition_formats_in_place_no_parted(db_session, tmp_path
         ]}}
 
     with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
-         patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch.object(zfs_backup_manager, "_ensure_unused", new=AsyncMock()), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch("nazman.managers.zfs_backup_manager.read_slot_uuids", side_effect=fake_read_slot_uuids), \
@@ -325,7 +334,7 @@ async def test_declare_rejects_unknown_slot(db_session, monkeypatch):
     async def fake_read_slot_uuids(paths):
         return {"/dev/sdb": {"partitions": []}}
 
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch("nazman.managers.zfs_backup_manager.read_slot_uuids", side_effect=fake_read_slot_uuids):
         with pytest.raises(ValidationError):
@@ -344,7 +353,7 @@ async def test_declare_rejects_already_declared_disk(db_session, monkeypatch):
     db_session.commit()
     monkeypatch.setattr(zfs_backup_manager.settings, "backup_mount_base", "/tmp/zzz")
 
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"):
         with pytest.raises(ValidationError):
             await zfs_backup_manager.declare_backup_disk(db_session, disk.id, confirm=True)
@@ -376,7 +385,7 @@ async def test_declare_rejects_partition_pool_member(db_session, monkeypatch):
         ]}}
 
     members = {"/dev/disk/by-id/ata-X-part1": "poolA"}
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value=members)), \
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value=members)), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch("nazman.managers.zfs_backup_manager.read_slot_uuids", side_effect=fake_read_slot_uuids):
         with pytest.raises(ValidationError) as ei:
@@ -389,7 +398,7 @@ async def test_declare_rejects_partition_pool_member(db_session, monkeypatch):
 async def test_declare_rejects_whole_disk_when_partition_is_pool_member(db_session):
     disk = await _add_declare_disk(db_session)
     members = {"/dev/disk/by-id/ata-X-part1": "poolA"}
-    with patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value=members)):
+    with patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value=members)):
         with pytest.raises(ValidationError) as ei:
             await zfs_backup_manager.declare_backup_disk(db_session, disk.id, confirm=True)
     assert "pool 'poolA'" in str(ei.value)
@@ -440,7 +449,7 @@ async def test_declare_propagates_mkfs_failure(db_session):
         return ("", "", 0)
 
     with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
-         patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch.object(zfs_backup_manager, "_ensure_unused", new=AsyncMock()), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"):
         with pytest.raises(BackupError) as ei:
@@ -501,7 +510,7 @@ async def test_api_raid_info_endpoint(client, db_session):
         {"device": "/dev/sdb1", "name": "pootlenaz:0", "version": "1.2",
          "os_backing": False},
     ]}
-    with patch.object(zfs_backup_manager, "get_raid_info",
+    with patch.object(ZfsBackupManager, "get_raid_info",
                       new=AsyncMock(return_value=payload)):
         response = client.get(f"/api/backup-zfs/disks/{disk.id}/raid-info")
     assert response.status_code == 200, response.text
@@ -514,7 +523,7 @@ async def test_declare_requires_wipe_raid_when_superblock_present(db_session):
     fake, _ = _cmd_log_fake({"/dev/sdb1": EXAMINE_SB})
 
     with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake), \
-         patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch("nazman.managers.zfs_backup_manager.read_slot_uuids", new=AsyncMock(return_value={
              "/dev/sdb": {"partitions": [
@@ -554,7 +563,7 @@ async def test_declare_wipe_raid_stops_array_and_zeros_superblock(db_session, tm
 
     with patch("nazman.managers.zfs_backup_manager.run_command",
                side_effect=record_run_command), \
-         patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch.object(zfs_backup_manager, "_ensure_unused", new=AsyncMock()), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch("nazman.managers.zfs_backup_manager.read_slot_uuids", new=AsyncMock(return_value={
@@ -587,14 +596,14 @@ async def test_declare_wipe_raid_refuses_os_array(db_session):
         return ("", "", 0)
 
     with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
-         patch.object(zfs_manager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
          patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
          patch("nazman.managers.zfs_backup_manager.read_slot_uuids", new=AsyncMock(return_value={
              "/dev/sdb": {"partitions": [
                  {"name": "sdb1", "slot_uuid": "slot-abc", "size_bytes": 10},
              ]},
          })), \
-         patch("nazman.managers.zfs_backup_manager.get_os_reserved_partition_names",
+         patch("nazman.managers.zfs_backup_manager.os_reserved_partition_names",
                new=AsyncMock(return_value={"sdb1"})):
         with pytest.raises(ValidationError) as ei:
             await zfs_backup_manager.declare_backup_disk(
@@ -617,7 +626,7 @@ async def test_api_restore_run_ok(client, db_session, tmp_path):
     db_session.add(run)
     db_session.commit()
 
-    with patch.object(zfs_backup_manager, "restore_dataset", new=AsyncMock(
+    with patch.object(ZfsBackupManager, "restore_dataset", new=AsyncMock(
         return_value={"dataset": "tank/media", "source": "/tmp/nonexistent.zfs.gz", "force": False}
     )):
         response = client.post(f"/api/backup-zfs/runs/{run.id}/restore", json={"target_dataset": "tank/media"})
@@ -628,7 +637,6 @@ async def test_api_restore_run_ok(client, db_session, tmp_path):
 @pytest.mark.asyncio
 async def test_sync_scheduled_tasks_creates_zb_backup_tasks(db_session):
     from nazman.models.scheduler import ScheduledTask, TaskType
-    from nazman.managers.zfs_backup_manager import zfs_backup_manager
 
     bd = BackupDisk(
         disk_id=999, mount_point="/tmp/mnt", fs_uuid="AAA",
@@ -653,7 +661,6 @@ async def test_sync_scheduled_tasks_creates_zb_backup_tasks(db_session):
 
 @pytest.mark.asyncio
 async def test_api_list_disk_streams_and_restore_file(client, db_session, tmp_path):
-    from nazman.managers.zfs_backup_manager import zfs_backup_manager
 
     bd = BackupDisk(
         disk_id=998, mount_point=str(tmp_path), fs_uuid="BBB",
@@ -661,14 +668,14 @@ async def test_api_list_disk_streams_and_restore_file(client, db_session, tmp_pa
     db_session.add(bd)
     db_session.commit()
 
-    with patch.object(zfs_backup_manager, "list_stream_files", new=AsyncMock(
+    with patch.object(ZfsBackupManager, "list_stream_files", new=AsyncMock(
         return_value=[{"path": str(tmp_path / "x.zfs.gz"), "dataset": "tank", "size_bytes": 100}]
     )):
         resp = client.get(f"/api/backup-zfs/disks/{bd.id}/streams")
     assert resp.status_code == 200, resp.text
     assert resp.json()[0]["dataset"] == "tank"
 
-    with patch.object(zfs_backup_manager, "restore_dataset", new=AsyncMock(
+    with patch.object(ZfsBackupManager, "restore_dataset", new=AsyncMock(
         return_value={"dataset": "tank/media", "source": str(tmp_path / "x.zfs.gz"), "force": False}
     )):
         resp = client.post("/api/backup-zfs/restore-file",
@@ -804,6 +811,7 @@ async def test_run_backup_offline_marks_run_failed(db_session):
         return ("", "", 0)
 
     with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_run_zfs), \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
          patch.object(zfs_backup_manager, "_wake_backup_disk", new=AsyncMock(return_value=False)):
         run = await zfs_backup_manager.run_backup(
             db_session, dataset_name="tank/media", backup_disk_id=bd.id, backup_type="full"
@@ -830,7 +838,7 @@ async def test_restore_dataset_mounts_owner_and_restores_idle(db_session, tmp_pa
         return ("", "", 0)
 
     with patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipeline), \
-         patch.object(zfs_backup_manager, "mount_backup_disk", new=AsyncMock()) as mnt, \
+         patch.object(ZfsBackupManager, "mount_backup_disk", new=AsyncMock()) as mnt, \
          patch.object(zfs_backup_manager, "_restore_idle_state", new=AsyncMock()) as idle:
         res = await zfs_backup_manager.restore_dataset(db_session, str(fp), "tank/media")
 
@@ -875,7 +883,7 @@ async def test_api_mount_offline_returns_400(client, db_session):
     db_session.add(bd)
     db_session.commit()
 
-    with patch.object(zfs_backup_manager, "mount_backup_disk",
+    with patch.object(ZfsBackupManager, "mount_backup_disk",
                       new=AsyncMock(side_effect=BackupError("Backup disk is offline"))):
         resp = client.post(f"/api/backup-zfs/disks/{bd.id}/mount")
     assert resp.status_code == 400
@@ -885,7 +893,6 @@ async def test_api_mount_offline_returns_400(client, db_session):
 @pytest.mark.asyncio
 async def test_sync_scheduled_tasks_task_names_include_disk_id(db_session):
     from nazman.models.scheduler import ScheduledTask, TaskType
-    from nazman.managers.zfs_backup_manager import zfs_backup_manager
 
     bd = BackupDisk(disk_id=997, mount_point="/tmp/mnt", fs_uuid="CCC")
     db_session.add(bd)
@@ -908,8 +915,6 @@ async def test_sync_scheduled_tasks_task_names_include_disk_id(db_session):
 @pytest.mark.asyncio
 async def test_sync_scheduled_tasks_cleans_legacy_unqualified_names(db_session):
     from nazman.models.scheduler import ScheduledTask, TaskType
-    from nazman.managers.scheduler import scheduler_manager
-    from nazman.managers.zfs_backup_manager import zfs_backup_manager
 
     bd = BackupDisk(disk_id=996, mount_point="/tmp/mnt", fs_uuid="DDD")
     db_session.add(bd)
@@ -991,7 +996,6 @@ async def test_backup_schedule_composite_unique_constraint(db_session):
 @pytest.mark.asyncio
 async def test_list_backupable_datasets_shapes_per_disk_schedules(client, db_session):
     from unittest.mock import patch as _patch
-    from nazman.managers.nfs_manager import nfs_manager
 
     d1 = BackupDisk(disk_id=990, label="Backup A1", mount_point="/tmp/mnt1", fs_uuid="H1")
     d2 = BackupDisk(disk_id=989, label="Backup A2", mount_point="/tmp/mnt2", fs_uuid="H2")
@@ -1011,8 +1015,10 @@ async def test_list_backupable_datasets_shapes_per_disk_schedules(client, db_ses
     ])
     db_session.commit()
 
-    with _patch.object(nfs_manager, "_list_dataset_names", new=AsyncMock(
-            return_value=["tank/media"])):
+    with _patch("nazman.utils.zfs_query.run_zpool", new=AsyncMock(
+             return_value=("tank\n", "", 0))), \
+         _patch("nazman.utils.zfs_query.run_zfs", new=AsyncMock(
+             return_value=("tank\ntank/media\n", "", 0))):
         resp = client.get("/api/backup-zfs/datasets")
     assert resp.status_code == 200, resp.text
     data = resp.json()[0]
@@ -1173,12 +1179,12 @@ async def test_api_wake_backup_disk(client, db_session):
                "mount_point": "/tmp/w", "fs_uuid": "AAA", "unmount_after_backup": True,
                "status": "offline", "total_bytes": 0, "free_bytes": 0}
 
-    with patch.object(zfs_backup_manager, "wake_backup_disk", new=AsyncMock(return_value=bd_dict)):
+    with patch.object(ZfsBackupManager, "wake_backup_disk", new=AsyncMock(return_value=bd_dict)):
         resp = client.post(f"/api/backup-zfs/disks/{bd.id}/wake")
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "offline"
 
-    with patch.object(zfs_backup_manager, "wake_backup_disk",
+    with patch.object(ZfsBackupManager, "wake_backup_disk",
                       new=AsyncMock(side_effect=BackupError("power-cycle their enclosure"))):
         resp = client.post(f"/api/backup-zfs/disks/{bd.id}/wake")
     assert resp.status_code == 400
@@ -1251,3 +1257,106 @@ async def test_deregister_backup_disk_removes_runs_and_schedules(db_session):
     assert db_session.query(BackupDisk).count() == 0
     assert db_session.query(BackupSchedule).count() == 0
     assert db_session.query(BackupRun).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_api_start_run_backup_returns_202(client, db_session):
+    """POST /runs registers the run row, returns 202, and spawns the worker."""
+    bd = BackupDisk(disk_id=999, mount_point="/tmp/mnt", fs_uuid="AAA")
+    db_session.add(bd)
+    db_session.commit()
+
+    # Real start_run_backup: it persists the run row and spawns the worker
+    # task; only the spawn is mocked so no backup actually executes.
+    with patch("nazman.utils.zfs_query.run_zfs",
+               AsyncMock(return_value=("tank/media", "", 0))), \
+         patch("nazman.managers.zfs_backup_manager.asyncio.create_task") as ct:
+        response = client.post("/api/backup-zfs/runs", json={
+            "dataset_name": "tank/media", "backup_disk_id": bd.id, "backup_type": "full",
+        })
+    assert response.status_code == 202, response.text
+    data = response.json()
+    assert data["status"] == "running"
+    assert data["dataset_name"] == "tank/media"
+    ct.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_backup_incremental_uses_prior_anchor(db_session, tmp_path, monkeypatch):
+    """Incremental must send -i <prior-anchor> <new-snapshot>, never -i <new> <new>.
+
+    Regresses the ordering bug where the anchor was found AFTER the new
+    snapshot was created, so the anchor resolved to the snapshot itself and
+    `zfs send -R -i <snap> <snap>` failed ("incremental source ... is not
+    earlier than it").
+    """
+    bd = BackupDisk(
+        disk_id=999, mount_point=str(tmp_path), fs_uuid="AAA",
+        unmount_after_backup=True,
+    )
+    db_session.add(bd)
+    db_session.commit()
+
+    anchor = "tank/media@backup-20260901-120000"
+    snaps = {anchor}
+    mounted = [True]
+    sends = []
+
+    async def fake_run_zfs(*args, **kwargs):
+        cmd = list(args)
+        if cmd and cmd[0] == "snapshot":
+            snaps.add(cmd[2])
+            return ("", "", 0)
+        if cmd and cmd[0] == "destroy":
+            return ("", "", 0)
+        if cmd and cmd[0] == "get":
+            return ("123456", "", 0)
+        if cmd and cmd[0] == "diff":
+            # Report changes so the run is not skipped.
+            return ("M\tsome/file\n", "", 0)
+        if cmd and cmd[0] == "list":
+            if "-t" in cmd and "snapshot" in cmd:
+                return ("\n".join(sorted(snaps)), "", 0)
+            return ("tank/media", "", 0)
+        return ("", "", 0)
+
+    async def fake_pipeline(stages, stdout_path=None, **kwargs):
+        sends.append(list(stages[0]))
+        os.makedirs(os.path.dirname(stdout_path), exist_ok=True)
+        with open(stdout_path, "w") as f:
+            f.write("INCRSTREAM")
+        return ("", "", 0)
+
+    async def fake_run_command(cmd, **kwargs):
+        if cmd[0] == "mount":
+            mounted[0] = True
+        if cmd[0] == "umount":
+            mounted[0] = False
+        return ("", "", 0)
+
+    def fake_is_mount(self):
+        return mounted[0] and str(self) == str(tmp_path)
+
+    monkeypatch.setattr(Path, "is_mount", fake_is_mount)
+
+    with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_run_zfs), \
+         patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
+         patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipeline), \
+         patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
+         patch("os.path.exists", return_value=True), \
+         patch.object(ZfsBackupManager, "_fs_uuid", new=AsyncMock(return_value="AAA")):
+        run = await zfs_backup_manager.run_backup(
+            db_session, dataset_name="tank/media", backup_disk_id=bd.id,
+            backup_type="incremental",
+        )
+
+    assert run.status == "success"
+    assert run.backup_type == "incremental"
+    assert run.base_snapshot == anchor
+    assert len(sends) == 1
+    send = sends[0]
+    assert send[:3] == ["zfs", "send", "-R"]
+    # -i must reference the pre-existing anchor, not the freshly created one.
+    base_arg = send[send.index("-i") + 1]
+    assert base_arg == anchor
+    assert send[-1] != anchor

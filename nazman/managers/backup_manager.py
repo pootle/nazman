@@ -1,13 +1,16 @@
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 import shutil
-import shlex
 from sqlalchemy.orm import Session
 
 from ..models.backup import BackupCommit
 from ..config import get_settings
+from ..utils.commands import run_command, run_zpool
 from ..utils.exceptions import BackupError
+
+logger = logging.getLogger(__name__)
 
 
 class BackupManager:
@@ -219,8 +222,8 @@ class BackupManager:
         """Export ZFS pool configurations."""
         try:
             # Export pool list
-            stdout, stderr, returncode = await self._run_command(
-                ["zpool", "list", "-H", "-o", "name"]
+            stdout, stderr, returncode = await run_zpool(
+                "list", "-H", "-o", "name", check=False
             )
             
             if returncode == 0:
@@ -232,8 +235,8 @@ class BackupManager:
                 for pool_name in pools:
                     if pool_name:
                         # Export pool status
-                        stdout, stderr, returncode = await self._run_command(
-                            ["zpool", "status", "-j", pool_name]
+                        stdout, stderr, returncode = await run_zpool(
+                            "status", "-j", pool_name, check=False
                         )
                         
                         if returncode == 0:
@@ -241,8 +244,8 @@ class BackupManager:
                             pool_config_path.write_text(stdout)
                         
                         # Export pool properties
-                        stdout, stderr, returncode = await self._run_command(
-                            ["zpool", "get", "-j", "all", pool_name]
+                        stdout, stderr, returncode = await run_zpool(
+                            "get", "-j", "all", pool_name, check=False
                         )
                         
                         if returncode == 0:
@@ -251,7 +254,7 @@ class BackupManager:
             
         except Exception as e:
             # Log error but don't fail backup
-            print(f"Warning: Failed to export pool configs: {str(e)}")
+            logger.warning("Failed to export pool configs: %s", e)
     
     async def _export_partition_tables(self) -> None:
         """Export partition tables for all disks."""
@@ -281,7 +284,7 @@ class BackupManager:
             
         except Exception as e:
             # Log error but don't fail backup
-            print(f"Warning: Failed to export partition tables: {str(e)}")
+            logger.warning("Failed to export partition tables: %s", e)
     
     async def _apply_exports(self, exports_file: Path) -> None:
         """Apply NFS exports from file."""
@@ -309,14 +312,10 @@ class BackupManager:
             return await self._run_command(cmd, op="read", category="backup")
         return await self._run_command(cmd, op="write", category="backup")
     
-    async def _run_command(self, cmd: list, **kwargs) -> tuple:
+    @staticmethod
+    async def _run_command(cmd: list, **kwargs) -> tuple:
         """Run a system command (via run_command so it is captured in the command log)."""
-        from ..utils.commands import run_command
         try:
             return await run_command(cmd, timeout=60, check=False, **kwargs)
         except Exception as e:
             return ("", str(e), -1)
-
-
-# Singleton instance
-backup_manager = BackupManager()

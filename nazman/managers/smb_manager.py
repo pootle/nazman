@@ -19,8 +19,9 @@ from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
-from ..utils.commands import run_command, run_zfs
+from ..utils.commands import run_command
 from ..utils.exceptions import SmbError, ValidationError
+from ..utils import provisioning, zfs_query
 
 SMB_CONF_PATH = "/etc/samba/smb.conf"
 
@@ -31,9 +32,9 @@ _MARKER_END = "# ===== end NAZMan managed shares ====="
 
 # Shared identity used by NFS; reuse it for SMB so NFS and SMB clients write as
 # the same user/group, keeping permission semantics consistent.
-ANON_USER = "nfsanon"
-ANON_UID = 65533
-ANON_GID = 65533
+ANON_USER = provisioning.ANON_USER
+ANON_UID = provisioning.ANON_UID
+ANON_GID = provisioning.ANON_GID
 
 
 def _normalize_dataset_name(name: str) -> str:
@@ -103,10 +104,7 @@ class SmbManager:
 
     @staticmethod
     async def _dataset_exists(dataset_name: str) -> bool:
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", dataset_name, check=False, op="read",
-        )
-        return rc == 0 and dataset_name in stdout.split()
+        return await zfs_query.dataset_exists(dataset_name)
 
     @staticmethod
     def share_name_for(dataset_name: str) -> str:
@@ -118,7 +116,7 @@ class SmbManager:
     # -- config path (test override) ---------------------------------------
 
     def conf_path(self) -> str:
-        return os.environ.get("NASMAN_SMB_CONF", SMB_CONF_PATH)
+        return os.environ.get("NAZMAN_SMB_CONF", SMB_CONF_PATH)
 
     # -- smb.conf parsing ---------------------------------------------------
 
@@ -285,8 +283,7 @@ class SmbManager:
 
         if enabled:
             try:
-                await run_command(["chown", f":{ANON_USER}", f"/{dataset_name}"], timeout=30, op="write", category="smb")
-                await run_command(["chmod", "2775", f"/{dataset_name}"], timeout=30, op="write", category="smb")
+                await provisioning.prepare_dataset_dir(dataset_name, category="smb")
             except Exception as e:
                 raise SmbError(f"Failed to prepare dataset directory: {e}")
 
@@ -350,16 +347,7 @@ class SmbManager:
     async def unshare_pool(self, db: Session, pool) -> None:
         """Remove NAZMan-managed SMB shares for every dataset in a pool."""
         pool_name = pool.name if isinstance(pool.name, str) else str(pool.name)
-        dataset_names = []
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", "-t", "filesystem", "-r", pool_name,
-            check=False, op="read",
-        )
-        if rc == 0:
-            for line in stdout.splitlines():
-                name = line.strip()
-                if name and name != pool_name:
-                    dataset_names.append(name)
+        dataset_names = await zfs_query.list_filesystem_names(pool_name)
         for name in dataset_names:
             self._rewrite_region(self.conf_path(), remove_dataset=name)
         if dataset_names:
@@ -369,25 +357,4 @@ class SmbManager:
 
     @staticmethod
     async def _ensure_anon_user() -> None:
-        stdout, _, rc = await run_command(
-            ["getent", "group", ANON_USER], timeout=10, check=False
-        )
-        if rc != 0:
-            await run_command(["groupadd", "-g", str(ANON_GID), ANON_USER], timeout=30)
-        stdout, _, rc = await run_command(
-            ["getent", "passwd", ANON_USER], timeout=10, check=False
-        )
-        if rc != 0:
-            await run_command(
-                [
-                    "useradd", "-r", "-g", str(ANON_GID),
-                    "-u", str(ANON_UID), "-M",
-                    "-s", "/usr/sbin/nologin",
-                    "-d", "/var/lib/nfs", ANON_USER,
-                ],
-                timeout=30,
-            )
-
-
-# Singleton instance
-smb_manager = SmbManager()
+        await provisioning.ensure_anon_user()

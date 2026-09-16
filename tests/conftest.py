@@ -13,31 +13,43 @@ from nazman.database import Base, get_db, get_db_context
 from nazman.main import app
 from nazman.config import Settings
 from nazman.auth import get_current_user
-from nazman.managers.scheduler import scheduler_manager
+from nazman import wiring
+
+
+@contextlib.contextmanager
+def override_manager(provider):
+    """Replace a wired manager/service for the duration of a test block.
+
+    Mirrors the old ``patch("nazman.api.<router>.<manager>")`` idiom under the
+    DI seam: yields a MagicMock installed as the dependency's value.
+    """
+    mock = MagicMock()
+    app.dependency_overrides[provider] = lambda: mock
+    try:
+        yield mock
+    finally:
+        app.dependency_overrides.pop(provider, None)
 
 
 @pytest.fixture(autouse=True)
-def reset_scheduler():
-    """Reset scheduler state before and after each test."""
-    # Stop scheduler if it's running (check both _started flag and actual running state)
-    try:
-        if scheduler_manager.scheduler.running:
-            scheduler_manager.scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    scheduler_manager._started = False
-    scheduler_manager._dataset_locks.clear()
-    
+def fresh_container():
+    """Rebuild the object graph for every test; nothing leaks across tests.
+
+    Managers are plain classes constructed by the wiring container, so state
+    that previously leaked via module-level singletons (scheduler flag,
+    pending backup declares) is simply fresh each test.
+    """
+    wiring.reset_container()
     yield
-    
-    # Cleanup after test - ensure scheduler is stopped
-    try:
-        if scheduler_manager.scheduler.running:
-            scheduler_manager.scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    scheduler_manager._started = False
-    scheduler_manager._dataset_locks.clear()
+    container = wiring._container
+    if container is not None:
+        # Stop an actually-started scheduler so its thread cannot outlive the test.
+        try:
+            if container.scheduler.scheduler.running:
+                container.scheduler.scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+    wiring.reset_container()
 
 
 @pytest.fixture(autouse=True)
@@ -85,14 +97,6 @@ def db_session(db_engine):
 @pytest.fixture()
 def client(db_engine, override_settings):
     """Create a test client with overridden database and settings."""
-    # Ensure scheduler is stopped before creating client
-    try:
-        if scheduler_manager.scheduler.running:
-            scheduler_manager.scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    scheduler_manager._started = False
-    
     TestSession = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
 
     def override_get_db():
@@ -117,29 +121,20 @@ def client(db_engine, override_settings):
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: {"username": "admin", "authenticated": True}
 
-    # Mock scheduler start/stop to prevent it from actually running during tests
-    with patch("nazman.managers.scheduler.scheduler_manager.start", new_callable=AsyncMock), \
-         patch("nazman.managers.scheduler.scheduler_manager.stop", new_callable=AsyncMock), \
-         patch("nazman.database.engine", db_engine), \
+    with patch("nazman.database.engine", db_engine), \
          patch("nazman.database.SessionLocal", TestSession), \
-         patch("nazman.database.get_db_context", override_get_db_context):
+         patch("nazman.database.get_db_context", override_get_db_context), \
+         patch("nazman.managers.scheduler.SchedulerManager.start", new_callable=AsyncMock), \
+         patch("nazman.managers.scheduler.SchedulerManager.stop", new_callable=AsyncMock):
         with TestClient(app, raise_server_exceptions=False) as c:
             yield c
-
-    # Stop scheduler after client is done
-    try:
-        if scheduler_manager.scheduler.running:
-            scheduler_manager.scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    scheduler_manager._started = False
 
     app.dependency_overrides.clear()
 
 
 def mock_run_command(return_stdout="", return_stderr="", return_code=0):
     """Helper to create a mock for run_command."""
-    async def _mock(cmd, timeout=300, check=True, capture_output=True):
+    async def _mock(cmd, timeout=300, check=True, capture_output=True, **kwargs):
         return (return_stdout, return_stderr, return_code)
     return _mock
 

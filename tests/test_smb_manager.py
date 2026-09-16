@@ -3,14 +3,16 @@ import pytest
 from unittest.mock import patch, AsyncMock
 
 from nazman.managers.smb_manager import (
-    SmbManager, smb_manager, _MARKER_BEGIN, _MARKER_END, ANON_USER,
+    SmbManager, _MARKER_BEGIN, _MARKER_END, ANON_USER,
 )
+
+smb_manager = SmbManager()
 
 
 def _write_conf(tmp_path, content="[global]\n\tworkgroup = WORKGROUP\n\tsecurity = user\n"):
     conf = tmp_path / "smb.conf"
     conf.write_text(content, encoding="utf-8")
-    os.environ["NASMAN_SMB_CONF"] = str(conf)
+    os.environ["NAZMAN_SMB_CONF"] = str(conf)
     return str(conf)
 
 
@@ -18,7 +20,7 @@ def _write_conf(tmp_path, content="[global]\n\tworkgroup = WORKGROUP\n\tsecurity
 def manager(tmp_path):
     _write_conf(tmp_path)
     yield smb_manager
-    os.environ.pop("NASMAN_SMB_CONF", None)
+    os.environ.pop("NAZMAN_SMB_CONF", None)
 
 
 def test_share_name_for():
@@ -78,7 +80,7 @@ async def test_set_share_requires_samba_installed(tmp_path):
     conf = _write_conf(tmp_path)
     manager = SmbManager()
     with patch.object(SmbManager, "is_server_present", return_value=False), \
-         patch("nazman.managers.smb_manager.run_zfs",
+         patch("nazman.utils.zfs_query.run_zfs",
                AsyncMock(side_effect=lambda *a, **k: ("pool/data", "", 0))):
         from nazman.utils.exceptions import SmbError
         with pytest.raises(SmbError, match="Samba is not installed"):
@@ -89,7 +91,7 @@ async def test_set_share_requires_samba_installed(tmp_path):
 async def test_set_share_unknown_dataset(tmp_path):
     _write_conf(tmp_path)
     manager = SmbManager()
-    with patch("nazman.managers.smb_manager.run_zfs",
+    with patch("nazman.utils.zfs_query.run_zfs",
                AsyncMock(side_effect=lambda *a, **k: ("", "", 1))):
         from nazman.utils.exceptions import ValidationError
         with pytest.raises(ValidationError, match="not found"):
@@ -99,8 +101,8 @@ async def test_set_share_unknown_dataset(tmp_path):
 @pytest.mark.asyncio
 async def test_set_share_end_to_end(tmp_path):
     conf = _write_conf(tmp_path)
-    manager = smb_manager.__class__()
-    os.environ["NASMAN_SMB_CONF"] = conf
+    manager = SmbManager()
+    os.environ["NAZMAN_SMB_CONF"] = conf
 
     def fake_run_zfs(*args, **kwargs):
         if args and args[0] == "list":
@@ -114,8 +116,9 @@ async def test_set_share_end_to_end(tmp_path):
         return ("", "", 0)
 
     with patch.object(SmbManager, "is_server_present", return_value=True), \
-         patch("nazman.managers.smb_manager.run_zfs", side_effect=fake_run_zfs), \
-         patch("nazman.managers.smb_manager.run_command", side_effect=fake_cmd):
+         patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
+         patch("nazman.managers.smb_manager.run_command", side_effect=fake_cmd), \
+         patch("nazman.utils.provisioning.run_command", side_effect=fake_cmd):
         result = await manager.set_share(None, "pool/data", read_only=False, enabled=True)
 
     assert result["dataset_name"] == "pool/data"
@@ -125,7 +128,7 @@ async def test_set_share_end_to_end(tmp_path):
     shares = manager.list_shares(None)
     assert len(shares) == 1
     assert shares[0]["dataset_name"] == "pool/data"
-    os.environ.pop("NASMAN_SMB_CONF", None)
+    os.environ.pop("NAZMAN_SMB_CONF", None)
 
 
 @pytest.mark.asyncio
@@ -193,8 +196,8 @@ async def test_install_server_apt_failure(tmp_path):
 @pytest.mark.asyncio
 async def test_reload_validation_failure(tmp_path):
     _write_conf(tmp_path)
-    manager = smb_manager.__class__()
-    os.environ["NASMAN_SMB_CONF"] = _write_conf(tmp_path)
+    manager = SmbManager()
+    os.environ["NAZMAN_SMB_CONF"] = _write_conf(tmp_path)
     from nazman.utils.exceptions import SmbError
 
     async def fake_cmd(cmd, timeout=None, check=None, **kw):

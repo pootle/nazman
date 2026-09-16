@@ -36,10 +36,16 @@ sudo ./dev-live.sh update    # deploy.sh: copy changed files to /opt/nazman + re
 - `nazman/` — Python application package
   - `api/` — FastAPI route handlers under `/api/*`
   - `managers/` — business logic (ZFS, disk, NFS, SMB, backup, scheduler, metrics)
+  - `services/` — cross-domain composition (destruction, disk view) that may touch several managers
   - `models/` — SQLAlchemy ORM models
-  - `utils/` — subprocess wrappers, validation, exceptions, command log
+  - `utils/` — subprocess wrappers, validation, exceptions, command log, guide renderer,
+    stable device identity (`devices.py`), shared ZFS queries (`zfs_query.py`),
+    shared anon-user provisioning (`provisioning.py`)
+  - `wiring.py` — builds the object graph (managers/services with collaborators injected)
+    and exposes FastAPI `Depends` providers; database DDL migrations live in `migrations.py`
 - `static/` — CSS/JS frontend
 - `templates/` — Jinja2 HTML templates
+- `docs/` — user guide Markdown sources served at `/guide` (`nazman/utils/guide.py`)
 - `tests/` — pytest suite
 
 ## Conventions
@@ -50,6 +56,12 @@ sudo ./dev-live.sh update    # deploy.sh: copy changed files to /opt/nazman + re
 - Subprocess calls go through `nazman/utils/commands.py` wrappers
   (`run_command`, `run_zpool`, `run_zfs`, `run_pipeline`) so they are audited and
   testable. Do not call external CLI tools directly.
+- Managers are plain classes with **no module-level singletons**; collaborators
+  are injected in `wiring.build_container()` and reached from routes via the
+  `Depends` providers in `nazman/wiring.py`. Manager modules must not import one
+  another or the API layer — put shared logic in `utils/` (e.g. `devices.py`,
+  `zfs_query.py`, `provisioning.py`) and cross-domain orchestration in
+  `services/` (e.g. `destruction.py`, `disk_view.py`).
 - ZFS is the source of truth for pools/datasets/NFS; do not duplicate that state
   in the database.
 - Disk identity uses stable `/dev/disk/by-id/` paths, never ephemeral kernel

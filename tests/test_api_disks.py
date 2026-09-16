@@ -1,8 +1,14 @@
 import pytest
 from unittest.mock import patch, AsyncMock
+import json
+from contextlib import ExitStack, contextmanager
 from nazman.models.disk import Disk
-from nazman.managers.disk_manager import refresh_device_map, clear_device_map
+from nazman.models.backup_zfs import BackupDisk
+from nazman.utils.devices import refresh_device_map, clear_device_map
+from nazman.managers.disk_manager import DiskManager
 from nazman.utils.exceptions import DiskError
+
+disk_manager = DiskManager()
 
 
 def _mk_disk(name="sda", by_id="/dev/disk/by-id/ata-Test_SN123", serial="SN123", **kw):
@@ -28,10 +34,39 @@ def _present(name="sda", by_id="/dev/disk/by-id/ata-Test_SN123", serial="SN123")
     }])
 
 
+@contextmanager
+def mocked_disk_views(pool_members=None, error_counts=None, backup_disks=None,
+                      usage=None):
+    """Patch the manager lookups the disk-view service composes per request.
+
+    Yields nothing special; individual mocks are accessible by name via the
+    returned ExitStack if a test needs assertions, but most only set returns.
+    """
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "nazman.managers.zfs_manager.ZfsManager.get_pool_members",
+            new_callable=AsyncMock,
+            return_value={} if pool_members is None else pool_members))
+        stack.enter_context(patch(
+            "nazman.managers.zfs_manager.ZfsManager.get_pool_error_counts",
+            new_callable=AsyncMock,
+            return_value={} if error_counts is None else error_counts))
+        stack.enter_context(patch(
+            "nazman.managers.zfs_backup_manager.ZfsBackupManager.list_backup_disks",
+            new_callable=AsyncMock,
+            return_value=[] if backup_disks is None else backup_disks))
+        stack.enter_context(patch(
+            "nazman.managers.disk_manager.DiskManager.get_disk_usage",
+            new_callable=AsyncMock,
+            return_value={} if usage is None else usage))
+        yield stack
+
+
 @pytest.mark.asyncio
 async def test_list_disks(client):
-    with patch("nazman.api.disks.disk_manager") as mock:
-        mock.sync_disks_to_database = AsyncMock(return_value=[])
+    with mocked_disk_views(), \
+         patch("nazman.managers.disk_manager.DiskManager.sync_disks_to_database",
+               new_callable=AsyncMock, return_value=[]):
         response = client.get("/api/disks/")
         assert response.status_code == 200
         assert response.json() == []
@@ -44,8 +79,9 @@ async def test_list_disks_with_data(client, db_session):
     db_session.commit()
     _present()
 
-    with patch("nazman.api.disks.disk_manager") as mock:
-        mock.sync_disks_to_database = AsyncMock(return_value=[disk])
+    with mocked_disk_views(usage={disk.id: {"partition_count": 3, "free_percent": 25}}), \
+         patch("nazman.managers.disk_manager.DiskManager.sync_disks_to_database",
+               new_callable=AsyncMock, return_value=[disk]):
         response = client.get("/api/disks/")
         assert response.status_code == 200
         data = response.json()
@@ -53,6 +89,9 @@ async def test_list_disks_with_data(client, db_session):
         assert data[0]["by_id"] == "/dev/disk/by-id/ata-Test_SN123"
         assert data[0]["device_name"] == "sda"
         assert data[0]["serial"] == "SN123"
+        assert data[0]["partition_count"] == 3
+        assert data[0]["free_percent"] == 25
+        assert data[0]["role"] == "unused"
 
 
 @pytest.mark.asyncio
@@ -63,11 +102,13 @@ async def test_get_disk(client, db_session):
     db_session.refresh(disk)
     _present()
 
-    response = client.get(f"/api/disks/{disk.id}")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["device_name"] == "sda"
-    assert data["by_id"] == "/dev/disk/by-id/ata-Test_SN123"
+    with mocked_disk_views():
+        response = client.get(f"/api/disks/{disk.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["device_name"] == "sda"
+        assert data["by_id"] == "/dev/disk/by-id/ata-Test_SN123"
+        assert data["role"] == "unused"
 
 
 @pytest.mark.asyncio
@@ -84,33 +125,94 @@ async def test_get_disk_health(client, db_session):
     db_session.refresh(disk)
     _present()
 
-    with patch("nazman.api.disks.disk_manager") as mock:
-        mock.get_disk_health = AsyncMock(return_value={
-            "temperature": 35,
-            "power_on_hours": 1000,
-            "health_status": "ok",
-        })
+    smart_report = {
+        "model_name": "Test HDD",
+        "health_status": "ok",
+        "passed": True,
+        "temperature": 35,
+        "power_on_hours": 1000,
+        "problems": [],
+        "attributes": [
+            {"id": 1, "name": "Raw_Read_Error_Rate", "value": 100, "worst": 100,
+             "thresh": 6, "when_failed": "", "flags": "", "raw": 0},
+        ],
+        "self_test": [],
+        "nvme": None,
+    }
+    with mocked_disk_views(), \
+         patch.object(DiskManager, "live_device_path", return_value="/dev/sda"), \
+         patch.object(DiskManager, "get_smart_details",
+                      new_callable=AsyncMock, return_value=smart_report):
         response = client.get(f"/api/disks/{disk.id}/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["health_status"] == "ok"
-        assert data["temperature"] == 35
+        assert data["disk"]["device_name"] == "sda"
+        assert data["disk"]["zfs_errors"] is None
+        assert data["smart"]["health_status"] == "ok"
+        assert data["smart"]["temperature"] == 35
+        assert data["zfs"]["pool"] is None
+        assert data["zfs"]["errors"] is None
+        assert data["zfs"]["events"] == []
 
 
 @pytest.mark.asyncio
-async def test_get_disk_health_not_present(client, db_session):
-    """A disk not currently attached returns a clear error (no SMART read)."""
+async def test_get_disk_health_smart_unavailable(client, db_session):
+    """A disk not currently attached reports null SMART instead of a 400,
+    so the details modal can still show device and ZFS info."""
     disk = _mk_disk()
     db_session.add(disk)
     db_session.commit()
     db_session.refresh(disk)
     clear_device_map()
 
-    with patch("nazman.api.disks.disk_manager") as mock:
-        mock._live_device_path.side_effect = DiskError("Disk is not currently present; cannot read SMART health")
+    with mocked_disk_views(), \
+         patch.object(DiskManager, "live_device_path",
+                      side_effect=DiskError("Disk is not currently present")):
         response = client.get(f"/api/disks/{disk.id}/health")
-        assert response.status_code == 400
-        assert "not currently present" in response.json()["detail"]
+        assert response.status_code == 200
+        data = response.json()
+        assert data["smart"] is None
+        assert data["disk"]["device_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_disk_health_pool_member_surfaces_zfs_errors(client, db_session):
+    """Pool-member health includes aggregated ZFS counters + matched events."""
+    disk = _mk_disk()
+    db_session.add(disk)
+    db_session.commit()
+    db_session.refresh(disk)
+    _present()
+
+    counts = {
+        f"{disk.by_id}-part1": {"pool": "tank", "read": 3, "write": 5, "cksum": 7, "guid": "1234"},
+    }
+    events = [
+        {"time": "2025-01-02T03:04:05Z", "class": "ereport.fs.zfs.checksum",
+         "vdev_guid": "1234", "vdev_path": f"{disk.by_id}-part1",
+         "vdev_devid": f"{disk.by_id}-part1"},
+    ]
+    with mocked_disk_views(
+            pool_members={disk.by_id: "tank", f"{disk.by_id}-part1": "tank"},
+            error_counts=counts), \
+         patch("nazman.managers.zfs_manager.ZfsManager.get_pool_error_events",
+               new_callable=AsyncMock, return_value=events), \
+         patch.object(DiskManager, "live_device_path", return_value="/dev/sda"), \
+         patch.object(DiskManager, "get_smart_details", new_callable=AsyncMock,
+                      return_value={"health_status": "ok", "passed": True,
+                                    "temperature": None, "power_on_hours": None,
+                                    "problems": [], "attributes": [], "self_test": [],
+                                    "model_name": None, "nvme": None}):
+        response = client.get(f"/api/disks/{disk.id}/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["disk"]["role"] == "pool"
+        assert data["disk"]["role_detail"] == "tank"
+        assert data["disk"]["zfs_errors"] == {"read": 3, "write": 5, "cksum": 7}
+        assert data["zfs"]["pool"] == "tank"
+        assert data["zfs"]["errors"] == {"read": 3, "write": 5, "cksum": 7}
+        assert len(data["zfs"]["events"]) == 1
+        assert data["zfs"]["events"][0]["class"] == "ereport.fs.zfs.checksum"
 
 
 @pytest.mark.asyncio
@@ -128,8 +230,8 @@ async def test_get_disk_partitions_nvme(client, db_session):
     db_session.refresh(disk)
     _present(name="nvme0n1", by_id="/dev/disk/by-id/nvme-INTEL_TEST", serial="SNNVME")
 
-    with patch("nazman.api.disks.read_slot_uuids", new_callable=AsyncMock) as m, \
-         patch("nazman.api.disks.get_os_reserved_partition_names", new_callable=AsyncMock) as rm:
+    with patch("nazman.services.disk_view.read_slot_uuids", new_callable=AsyncMock) as m, \
+         patch("nazman.services.disk_view.os_reserved_partition_names", new_callable=AsyncMock) as rm:
         rm.return_value = {"nvme0n1p1"}
         m.return_value = {
             "/dev/nvme0n1": {
@@ -181,8 +283,9 @@ async def test_wipe_disk_in_pool_fails(client, db_session):
     db_session.refresh(disk)
     _present(name="sdb", by_id="/dev/disk/by-id/ata-PoolMember", serial="SN_POOL")
 
-    with patch("nazman.managers.zfs_manager.zfs_manager.is_disk_in_pool", new_callable=AsyncMock) as mock_is_in_pool:
-        mock_is_in_pool.return_value = "tank"
+    with patch("nazman.managers.zfs_manager.ZfsManager.get_pool_members",
+               new_callable=AsyncMock) as mock_members:
+        mock_members.return_value = {disk.by_id: "tank"}
         response = client.post(f"/api/disks/{disk.id}/wipe")
 
     assert response.status_code == 400
@@ -246,7 +349,11 @@ async def test_batch_partition(client, db_session):
     ])
 
     with patch("nazman.managers.disk_manager.run_command", new_callable=AsyncMock), \
-         patch("nazman.managers.disk_manager.write_slot_uuid", new_callable=AsyncMock):
+         patch("nazman.utils.devices.run_command", new_callable=AsyncMock), \
+         patch("nazman.managers.disk_manager.write_slot_uuid", new_callable=AsyncMock), \
+         patch("nazman.managers.zfs_manager.ZfsManager.get_pool_members",
+               new_callable=AsyncMock) as pm:
+        pm.return_value = {}
         response = client.post("/api/disks/batch-partition", json={
             "disk_ids": [disks[0].id, disks[1].id],
             "partitions": [{"size_mb": 1024}, {"size_mb": None}],
@@ -308,3 +415,145 @@ async def test_batch_partition_skips_os_disk(client, db_session):
     assert len(data) == 1
     assert data[0]["success"] is False
     assert "OS disk" in data[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_batch_partition_skips_missing_disk(client):
+    response = client.post("/api/disks/batch-partition", json={
+        "disk_ids": [999],
+        "partitions": [{"size_mb": 1024}],
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["success"] is False
+    assert "not found" in data[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_disk_roles(client, db_session):
+    """GET /api/disks role detection: pool, backup, system, dead, unused."""
+    unused = _mk_disk(by_id="/dev/disk/by-id/ata-Unused", serial="SN_UNUSED")
+    pool_disk = _mk_disk(by_id="/dev/disk/by-id/ata-Pool", serial="SN_POOLSON")
+    backup_disk = _mk_disk(by_id="/dev/disk/by-id/ata-BackupDisk", serial="SN_BKUP")
+    system = _mk_disk(by_id="/dev/disk/by-id/ata-System", serial="SN_SYS", is_os_disk=True)
+    dead = _mk_disk(by_id="/dev/disk/by-id/ata-Dead", serial="SN_DEAD", status="dead")
+    db_session.add_all([unused, pool_disk, backup_disk, system, dead])
+    db_session.commit()
+    for d in (unused, pool_disk, backup_disk, system, dead):
+        db_session.refresh(d)
+    refresh_device_map([
+        {"device_name": "sda", "device_path": "/dev/sda", "by_id": unused.by_id, "serial": unused.serial},
+        {"device_name": "sdb", "device_path": "/dev/sdb", "by_id": pool_disk.by_id, "serial": pool_disk.serial},
+        {"device_name": "sdc", "device_path": "/dev/sdc", "by_id": backup_disk.by_id, "serial": backup_disk.serial},
+        {"device_name": "sdd", "device_path": "/dev/sdd", "by_id": system.by_id, "serial": system.serial},
+    ])
+    db_session.add(BackupDisk(disk_id=backup_disk.id, label="Office drive",
+                              mount_point="/mnt/bk", fs_uuid="FS1"))
+    db_session.commit()
+
+    with mocked_disk_views(
+            pool_members={pool_disk.by_id: "tank", f"{pool_disk.by_id}-part1": "tank"},
+            error_counts={f"{pool_disk.by_id}-part1": {"pool": "tank", "read": 1, "write": 0, "cksum": 0, "guid": "1"}},
+            backup_disks=[{"disk_id": backup_disk.id, "label": "Office drive", "status": "unmounted"}]), \
+         patch("nazman.managers.disk_manager.DiskManager.sync_disks_to_database",
+               new_callable=AsyncMock, return_value=[unused, pool_disk, backup_disk, system, dead]):
+        response = client.get("/api/disks/")
+        assert response.status_code == 200
+        by_id = {d["by_id"]: d for d in response.json()}
+
+        assert by_id[unused.by_id]["role"] == "unused"
+        assert by_id[pool_disk.by_id]["role"] == "pool"
+        assert by_id[pool_disk.by_id]["role_detail"] == "tank"
+        assert by_id[pool_disk.by_id]["zfs_errors"] == {"read": 1, "write": 0, "cksum": 0}
+        assert by_id[unused.by_id]["zfs_errors"] is None
+        assert by_id[backup_disk.by_id]["role"] == "backup"
+        assert by_id[backup_disk.by_id]["role_detail"] == "Office drive"
+        assert by_id[backup_disk.by_id]["backup_state"] == "unmounted"
+        assert by_id[system.by_id]["role"] == "system"
+        assert by_id[dead.by_id]["role"] == "dead"
+
+
+@pytest.mark.asyncio
+async def test_get_disk_usage_free_percent():
+    """get_disk_usage computes partition count + unpartitioned-space %."""
+    disk = _mk_disk(size_bytes=1_000_000_000)
+    _present()  # registers /dev/sda in the device map
+
+    slot_info = {
+        "/dev/sda": {
+            "partitions": [
+                {"name": "sda1", "size_bytes": 100_000_000},
+                {"name": "sda2", "size_bytes": 500_000_000},
+            ]
+        }
+    }
+    with patch("nazman.managers.disk_manager.read_slot_uuids", new_callable=AsyncMock) as m:
+        m.return_value = slot_info
+        usage = await disk_manager.get_disk_usage([disk])
+
+    assert usage[disk.id]["partition_count"] == 2
+    assert usage[disk.id]["free_percent"] == 40
+
+
+@pytest.mark.asyncio
+async def test_get_smart_details_parses_problems():
+    """get_smart_details surfaces failing/threshold attributes and problems."""
+    smart_json = json.dumps({
+        "model_name": "MR7100",
+        "device": {"type": "sata"},
+        "smart_status": {"passed": False},
+        "ata_smart_attributes": {"table": [
+            {"id": 1, "name": "Raw_Read_Error_Rate", "value": 100, "worst": 100,
+             "thresh": 16, "when_failed": "", "flags": {"string": "POSR--"},
+             "raw": {"value": 0}},
+            {"id": 5, "name": "Reallocated_Sector_Ct", "value": 10, "worst": 10,
+             "thresh": 36, "when_failed": "NOW", "flags": {"string": "POSR--"},
+             "raw": {"value": 120}},
+            {"id": 9, "name": "Power_On_Hours", "value": 9876, "worst": 9876,
+             "thresh": 0, "when_failed": "", "flags": {"string": "-O---"},
+             "raw": {"value": 12345}},
+            {"id": 194, "name": "Temperature_Celsius", "value": 40, "worst": 40,
+             "thresh": 0, "when_failed": "", "flags": {"string": "-O---"},
+             "raw": {"value": 40}},
+            {"id": 197, "name": "Current_Pending_Sector", "value": 100, "worst": 100,
+             "thresh": 0, "when_failed": "", "flags": {"string": "----"},
+             "raw": {"value": 3}},
+        ]},
+        "ata_smart_self_test_log": {"table": [
+            {"type": "Short offline", "status": "Completed without error",
+             "remaining": "100%", "lifetime_hours": 12300},
+            {"type": "Short offline", "status": "Completed: read failure",
+             "remaining": "10%", "lifetime_hours": 12400},
+        ]},
+    })
+
+    with patch("nazman.managers.disk_manager.run_command", new_callable=AsyncMock,
+               return_value=(smart_json, "", 0)) as mock_run:
+        details = await disk_manager.get_smart_details("/dev/sda")
+
+    assert details["health_status"] == "failing"
+    assert details["passed"] is False
+    assert details["temperature"] == 40
+    assert details["power_on_hours"] == 9876
+    assert len(details["attributes"]) == 5
+    assert details["attributes"][1]["when_failed"] == "NOW"
+    assert details["problems"][0] == "SMART overall-health self-assessment FAILED"
+    assert any("Reallocated_Sector_Ct below threshold" in p for p in details["problems"])
+    assert any("Current_Pending_Sector: 3" in p for p in details["problems"])
+    assert [t["failed"] for t in details["self_test"]] == [False, True]
+    mock_run.assert_called_once_with(
+        ["smartctl", "-a", "-j", "/dev/sda"],
+        timeout=30, check=False, op="read", category="smartctl",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_smart_details_unavailable():
+    """Unusable SMART output degrades to a stub with a problem message."""
+    with patch("nazman.managers.disk_manager.run_command", new_callable=AsyncMock,
+               return_value=("", "smartctl: unable to open", 1)):
+        details = await disk_manager.get_smart_details("/dev/sda")
+
+    assert details["health_status"] == "unknown"
+    assert details["attributes"] == []
+    assert details["problems"] == ["SMART data unavailable"]

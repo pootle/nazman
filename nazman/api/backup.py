@@ -5,8 +5,8 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import backup_manager
-from ..models.backup import BackupCommit
+from ..managers.backup_manager import BackupManager
+from ..wiring import get_backup_manager
 
 router = APIRouter(prefix="/api/backup", tags=["backup"], dependencies=[Depends(get_current_user)])
 
@@ -35,7 +35,7 @@ class RestoreRequest(BaseModel):
 
 @router.get("/status", response_model=BackupStatusResponse)
 async def get_backup_status(
-
+    backup_manager: BackupManager = Depends(get_backup_manager),
 ):
     """Get backup system status."""
     return await backup_manager.get_backup_status()
@@ -45,7 +45,7 @@ async def get_backup_status(
 async def get_backup_history(
     limit: int = 50,
     db: Session = Depends(get_db),
-
+    backup_manager: BackupManager = Depends(get_backup_manager),
 ):
     """Get backup commit history."""
     return await backup_manager.get_backup_history(db, limit)
@@ -55,7 +55,7 @@ async def get_backup_history(
 async def create_backup(
     message: Optional[str] = None,
     db: Session = Depends(get_db),
-
+    backup_manager: BackupManager = Depends(get_backup_manager),
 ):
     """Create a new backup."""
     return await backup_manager.backup_configuration(db, message)
@@ -65,7 +65,7 @@ async def create_backup(
 async def restore_backup(
     request: RestoreRequest,
     db: Session = Depends(get_db),
-
+    backup_manager: BackupManager = Depends(get_backup_manager),
 ):
     """Restore configuration from a specific commit."""
     success = await backup_manager.restore_configuration(db, request.commit_hash)

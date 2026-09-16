@@ -4,8 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}NAZMan{% endblock %}</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=5">
+    <link rel="stylesheet" href="/static/css/style.css?v=6">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    {% block head_extra %}{% endblock %}
 </head>
 <body>
     <div class="container">
@@ -81,12 +82,21 @@
                         <span>Settings</span>
                     </a>
                 </li>
+                <li class="nav-item">
+                    <a href="/guide" class="nav-link {% if request.url.path.startswith('/guide') %}active{% endif %}">
+                        <i class="fas fa-book"></i>
+                        <span>User Guide</span>
+                    </a>
+                </li>
             </ul>
         </nav>
         <main class="main-content">
             <header class="header">
                 <h1>{% block page_title %}Dashboard{% endblock %}</h1>
                 <div class="header-actions">
+                    <button class="btn btn-icon" id="messages-btn" title="Message history">
+                        <i class="fas fa-bell"></i>
+                    </button>
                     <button class="btn btn-icon" id="refresh-btn" title="Refresh">
                         <i class="fas fa-sync-alt"></i>
                     </button>
@@ -120,10 +130,25 @@
         </div>
     </div>
 
+    <!-- Message history modal -->
+    <div id="message-history-modal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 560px">
+            <div class="modal-header">
+                <h3>Messages</h3>
+                <button class="close" onclick="hideModal('message-history-modal')">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 12px 20px;" id="message-history-list"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="messages-clear-btn">Clear</button>
+                <button type="button" class="btn btn-primary" onclick="hideModal('message-history-modal')">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/js/charts.js?v=3"></script>
-    <script src="/static/js/api.js?v=4"></script>
-    <script src="/static/js/components.js?v=3"></script>
-    <script src="/static/js/app.js?v=3"></script>
+    <script src="/static/js/api.js?v=5"></script>
+    <script src="/static/js/components.js?v=4"></script>
+    <script src="/static/js/app.js?v=4"></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

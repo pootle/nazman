@@ -28,6 +28,20 @@ async def test_run_command_failure_no_check():
 
 
 @pytest.mark.asyncio
+async def test_run_command_no_check_still_logs_failure():
+    from nazman.utils.command_log import command_log
+    with patch("nazman.utils.command_log.command_log.record") as rec:
+        stdout, stderr, rc = await run_command(
+            ["sh", "-c", "echo boom >&2; exit 2"], timeout=10, check=False
+        )
+    assert rc == 2
+    args = rec.call_args.kwargs
+    assert args["status"] == "failed"
+    assert args["returncode"] == 2
+    assert "boom" in args.get("stderr", "")
+
+
+@pytest.mark.asyncio
 async def test_run_command_failure_with_check():
     with pytest.raises(CommandError) as exc_info:
         await run_command(["false"], timeout=10, check=True)
@@ -116,6 +130,20 @@ async def test_run_pipeline_reports_first_failing_stage():
         [["sh", "-c", "echo x; exit 3"], ["cat"]], timeout=10, check=False
     )
     assert rc == 3
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_no_check_still_logs_failure():
+    from nazman.utils.command_log import command_log
+    with patch("nazman.utils.command_log.command_log.record") as rec:
+        stdout, stderr, rc = await run_pipeline(
+            [["sh", "-c", "echo err >&2; exit 3"], ["cat"]], timeout=10, check=False
+        )
+    assert rc == 3
+    args = rec.call_args.kwargs
+    assert args["status"] == "failed"
+    assert args["returncode"] == 3
+    assert "err" in args.get("stderr", "")
 
 
 @pytest.mark.asyncio

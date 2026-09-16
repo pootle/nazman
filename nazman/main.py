@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -6,7 +8,9 @@ from pathlib import Path
 
 from .config import get_settings, ensure_directories
 from .database import init_db
-from .utils.exceptions import NAZManError
+from .utils.exceptions import NAZManError, NotFoundError
+from .utils.guide import guide_page_context
+from .wiring import get_container
 from .api import (
     disks_router, pools_router, datasets_router,
     nfs_router, smb_router, snapshots_router, backup_router, zfs_backup_router,
@@ -16,61 +20,61 @@ from .api import (
 # Get application settings
 settings = get_settings()
 
-# Create FastAPI app
-app = FastAPI(
-    title=settings.app_title,
-    version=settings.app_version,
-    description="Web-based ZFS NAS management for Ubuntu Server"
-)
 
-# Ensure required directories exist
-ensure_directories()
-
-
-@app.exception_handler(NAZManError)
-async def nazman_error_handler(request: Request, exc: NAZManError):
-    """Convert domain errors into a 400 with a meaningful detail message."""
-    return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-# Initialize database
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
 
-    # Start scheduler
-    from .managers import scheduler_manager
-    await scheduler_manager.start()
-
-    # Start metrics recorder
-    from .managers import metrics_manager
-    await metrics_manager.start()
+    container = get_container()
 
     # Initialise the persistent metrics store and load per-pool logging flags.
-    from .managers.metrics_store import metrics_store
-    metrics_store.connect()
+    container.metrics_store.connect()
+
+    # Start the scheduler (loads persisted tasks) and the metrics recorder.
+    await container.scheduler.start()
+    await container.metrics.start()
 
     # Initialise + prune the persistent command log store.
     from .utils.command_log_store import command_log_store
     command_log_store.connect()
     command_log_store.prune()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    from .managers import scheduler_manager
-    await scheduler_manager.stop()
+    yield
 
-    from .managers import metrics_manager
-    await metrics_manager.stop()
-
-    from .managers.metrics_store import metrics_store
-    metrics_store.close()
+    await container.scheduler.stop()
+    await container.metrics.stop()
+    container.metrics_store.close()
 
     from .utils.command_log_store import command_log_store
     command_log_store.close()
 
     # Ephemeral kernel-name knowledge does not survive restarts.
-    from .managers.disk_manager import clear_device_map
+    from .utils.devices import clear_device_map
     clear_device_map()
+
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.app_title,
+    version=settings.app_version,
+    description="Web-based ZFS NAS management for Ubuntu Server",
+    lifespan=lifespan,
+)
+
+# Ensure required directories exist
+ensure_directories()
+
+
+@app.exception_handler(NotFoundError)
+async def not_found_error_handler(request: Request, exc: NotFoundError):
+    """Domain 'entity does not exist' errors map to 404."""
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(NAZManError)
+async def nazman_error_handler(request: Request, exc: NAZManError):
+    """Convert domain errors into a 400 with a meaningful detail message."""
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 # Mount static files
 static_path = Path(__file__).parent.parent / "static"
@@ -166,3 +170,14 @@ async def events_page(request: Request):
 async def monitoring_page(request: Request):
     """Performance monitoring page."""
     return templates.TemplateResponse(request, "monitoring.html")
+
+
+@app.get("/guide", response_class=HTMLResponse)
+@app.get("/guide/{page}", response_class=HTMLResponse)
+async def guide_page(request: Request, page: str = "overview"):
+    """User guide pages rendered from the docs/ markdown sources."""
+    ctx = guide_page_context(page)
+    if ctx is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Guide page not found")
+    return templates.TemplateResponse(request, "guide.html", ctx)

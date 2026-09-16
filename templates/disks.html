@@ -53,142 +53,210 @@
         </div>
     </div>
 </div>
+
+<!-- Disk Details Modal -->
+<div id="disk-detail-modal" class="modal" style="display: none;">
+    <div class="modal-content" style="max-width:900px">
+        <div class="modal-header">
+            <h3 id="disk-detail-title">Disk Details</h3>
+            <button class="close" onclick="closeDiskDetails()">&times;</button>
+        </div>
+        <div class="modal-body" id="disk-detail-body">
+            <div class="disk-detail-grid">
+                <div class="detail-col">
+                    <div class="disk-detail-section">
+                        <h4>Device</h4>
+                        <div id="dd-summary"></div>
+                    </div>
+                    <div class="disk-detail-section">
+                        <h4>SMART</h4>
+                        <div id="dd-smart"></div>
+                    </div>
+                </div>
+                <div class="detail-col">
+                    <div class="disk-detail-section">
+                        <h4>ZFS Error History</h4>
+                        <div id="dd-zfs"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
 let disks = [];
-let diskPartitionsCache = {};   // disk_id -> [{number, slot_uuid, device_path, size_bytes}]
 
 document.addEventListener('DOMContentLoaded', function() {
-    loadDisks();
+    loadDisksPage();
 });
 
-async function loadDisks() {
+async function loadDisksPage() {
     try {
         disks = await api.getDisks();
-        diskPartitionsCache = {};
-        for (const disk of disks) {
-            if (disk.is_os_disk) continue;
-            try {
-                const info = await api.getDiskPartitions(disk.id);
-                diskPartitionsCache[disk.id] = info.partitions;
-            } catch (e) {
-                diskPartitionsCache[disk.id] = [];
-            }
-        }
         renderDisks();
     } catch (error) {
         console.error('Failed to load disks:', error);
     }
 }
 
+function refreshDisks() {
+    loadDisksPage();
+}
+
 function renderDisks() {
     const container = document.getElementById('disks-table');
-    const osDisks = disks.filter(d => d.is_os_disk);
-    const available = disks
-        .filter(d => !d.is_os_disk)
-        .sort((a, b) => {
-            const present = d => d.device_name && d.status !== 'removed' && d.status !== 'dead';
-            return (present(b) - present(a) || a.id - b.id);
-        });
 
-    let html = '';
-
-    if (available.length > 0) {
-        html += `
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th style="width:32px"></th>
-                        <th>Device</th>
-                        <th>Model</th>
-                        <th>Serial</th>
-                        <th>Size</th>
-                        <th>Type</th>
-                        <th>Health</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${available.map(disk => {
-                        const parts = diskPartitionsCache[disk.id] || [];
-                        const hasParts = parts.length > 0;
-                        const isDead = disk.status === 'dead';
-                        const isRemoved = disk.status === 'removed';
-                        const label = disk.device_name || (disk.by_id || '').replace('/dev/disk/by-id/', '') || disk.serial || 'Unknown';
-                        const absentBadge = (!disk.device_name && !isDead) ? '<span class="badge badge-removed">not present</span>' : '';
-                        return `
-                        <tr class="${isDead ? 'dead-row' : (isRemoved ? 'removed-row' : '')}" data-disk-id="${disk.id}">
-                            <td>
-                                ${(!isDead && !isRemoved) ? `<input type="checkbox" class="disk-cb" value="${disk.id}">` : ''}
-                            </td>
-                            <td>
-                                ${label} ${absentBadge} ${isRemoved ? '<span class="badge badge-removed">removed</span>' : ''}
-                                <br><small class="text-muted" title="${disk.by_id || ''}">${(disk.by_id || '').replace('/dev/disk/by-id/', '') || 'by-id unavailable'}</small>
-                            </td>
-                            <td>${disk.model || 'Unknown'}</td>
-                            <td>${disk.serial || 'Unknown'}</td>
-                            <td>${formatSize(disk.size_bytes)}</td>
-                            <td><span class="badge badge-${disk.disk_type}">${disk.disk_type}</span></td>
-                            <td><span class="status status-${disk.health_status}">${disk.health_status}</span></td>
-                            <td>
-                                ${isDead
-                                    ? `<button class="btn btn-sm btn-primary" onclick="resurrectDisk(${disk.id})">Resurrect</button>`
-                                    : (!isRemoved ? `<button class="btn btn-sm btn-danger" onclick="markDead(${disk.id})">Dead</button>` : '')
-                                }
-                                ${(isRemoved || !disk.device_name) ? `<button class="btn btn-sm btn-secondary" onclick="dropDisk(${disk.id})">Drop</button>` : ''}
-                            </td>
-                        </tr>
-                        ${parts.map(p => `
-                            <tr class="partition-row" data-parent-disk="${disk.id}">
-                                <td></td>
-                                <td style="text-align:right;padding-right:24px" colspan="5">
-                                    <small class="text-muted">
-                                        <i class="fas fa-columns"></i>
-                                        Partition ${p.number}
-                                        <code style="margin-left:4px">${p.slot_uuid.substring(0, 8)}...</code>
-                                    </small>
-                                </td>
-                                <td><small>${formatSize(p.size_bytes)}</small></td>
-                                <td></td>
-                            </tr>
-                        `).join('')}
-                    `}).join('')}
-                </tbody>
-            </table>`;
-    } else {
-        html += '<p class="empty-state">No available disks found.</p>';
+    if (disks.length === 0) {
+        container.innerHTML = '<p class="empty-state">No disks found.</p>';
+        return;
     }
 
-    if (osDisks.length > 0) {
-        html += `
-            <h3 style="margin-top:24px">System Disk(s)</h3>
-            <table class="data-table">
-                <thead>
-                    <tr><th></th><th>Device</th><th>Model</th><th>Size</th><th>Type</th><th>Health</th><th></th></tr>
-                </thead>
-                <tbody>
-                    ${osDisks.map(disk => `
-                        <tr>
-                            <td></td>
-                            <td>${disk.device_name || (disk.by_id || '').replace('/dev/disk/by-id/', '') || disk.serial || 'Unknown'} <span class="badge badge-system">System</span></td>
-                            <td>${disk.model || 'Unknown'}</td>
-                            <td>${formatSize(disk.size_bytes)}</td>
-                            <td><span class="badge badge-${disk.disk_type}">${disk.disk_type}</span></td>
-                            <td><span class="status status-${disk.health_status}">${disk.health_status}</span></td>
-                            <td></td>
-                        </tr>
-                    `).join('')}
-                </tbody>
-            </table>`;
-    }
+    const sorted = [...disks].sort((a, b) => (diskSortRank(a) - diskSortRank(b)) || (a.id - b.id));
+
+    let html = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th style="width:32px"></th>
+                    <th>Device</th>
+                    <th>Model</th>
+                    <th>Size</th>
+                    <th>Type</th>
+                    <th>Health</th>
+                    <th>Parts</th>
+                    <th>Free</th>
+                    <th>Role</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${sorted.map(diskRow).join('')}
+            </tbody>
+        </table>`;
 
     container.innerHTML = html;
 
     document.querySelectorAll('.disk-cb').forEach(cb => {
         cb.addEventListener('change', updatePartitionButton);
     });
+}
+
+function diskSortRank(disk) {
+    if (disk.status === 'dead' || disk.status === 'removed') return 3;
+    if (diskHealthState(disk) === 'attention') return 2;
+    if (disk.is_os_disk) return 1;
+    return 0;
+}
+
+function diskRow(disk) {
+    const isDead = disk.status === 'dead';
+    const isRemoved = disk.status === 'removed';
+    const present = !isDead && !isRemoved && !!disk.device_name;
+    const label = disk.device_name || (disk.by_id || '').replace('/dev/disk/by-id/', '') || disk.serial || 'Unknown';
+    const absentBadge = (!disk.device_name && !isDead) ? '<span class="badge badge-removed">not present</span>' : '';
+
+    return `
+        <tr class="${isDead ? 'dead-row' : (isRemoved ? 'removed-row' : '')}" data-disk-id="${disk.id}">
+            <td>${present ? `<input type="checkbox" class="disk-cb" value="${disk.id}">` : ''}</td>
+            <td>
+                <a href="javascript:void(0)" onclick="openDiskDetails(${disk.id}); return false;" title="View details">${label}</a>
+                ${absentBadge} ${isRemoved ? '<span class="badge badge-removed">removed</span>' : ''}
+            </td>
+            <td>${disk.model || 'Unknown'}</td>
+            <td>${formatBytes(disk.size_bytes)}</td>
+            <td><span class="badge badge-${disk.disk_type}">${disk.disk_type}</span></td>
+            <td>${healthCell(disk)}</td>
+            <td>${present ? (disk.partition_count || 0) : '—'}</td>
+            <td>${freeSpaceCell(disk)}</td>
+            <td>${roleBadge(disk)}</td>
+            <td>${actionButtons(disk)}</td>
+        </tr>`;
+}
+
+function zfsErrorTotal(disk) {
+    const e = disk.zfs_errors;
+    return e ? (e.cksum || 0) + (e.read || 0) + (e.write || 0) : 0;
+}
+
+function diskHealthState(disk) {
+    if (disk.status === 'dead') return 'dead';
+    if (disk.status === 'removed') return 'removed';
+    if (!disk.device_name) return 'absent';
+    if (disk.health_status === 'failing' || zfsErrorTotal(disk) > 0) return 'attention';
+    return disk.health_status === 'ok' ? 'ok' : 'unknown';
+}
+
+function healthCell(disk) {
+    const state = diskHealthState(disk);
+    if (state === 'attention') {
+        const bits = [];
+        if (disk.health_status === 'failing') bits.push('SMART: failing');
+        const e = disk.zfs_errors || {};
+        if (e.cksum) bits.push(`ZFS checksum: ${e.cksum}`);
+        if (e.read) bits.push(`ZFS read: ${e.read}`);
+        if (e.write) bits.push(`ZFS write: ${e.write}`);
+        return `<span class="badge badge-health-attention" title="${escapeHtml(bits.join('; ') || 'problems detected')}">
+            <i class="fas fa-exclamation-triangle"></i> Attention</span>`;
+    }
+    if (state === 'dead') return '<span class="status status-dead">Dead</span>';
+    if (state === 'removed' || state === 'absent') return '<span class="badge badge-removed">not present</span>';
+    if (state === 'unknown') return '<span class="status status-unknown">Unknown</span>';
+    return '<span class="status status-ok">OK</span>';
+}
+
+function freeSpaceCell(disk) {
+    if (disk.role === 'backup') {
+        return `<span class="badge badge-state-${disk.backup_state || 'unknown'}">${disk.backup_state || 'unknown'}</span>`;
+    }
+    if (typeof disk.free_percent !== 'number') return '—';
+    const pct = Math.round(disk.free_percent);
+    const color = pct < 25 ? '#e74c3c' : (pct < 50 ? '#f39c12' : '#27ae60');
+    return `
+        <div style="min-width:100px">
+            <div style="background:#444;border-radius:4px;height:8px;overflow:hidden;margin-bottom:3px">
+                <div style="width:${pct}%;background:${color};height:100%"></div>
+            </div>
+            <small class="text-muted" title="Space not allocated to any partition">${pct}% free</small>
+        </div>`;
+}
+
+function roleBadge(disk) {
+    switch (disk.role) {
+        case 'pool':
+            return `<span class="badge badge-role-pool" title="Free space shown is per-disk (unallocated)">Pool: ${disk.role_detail || '?'}</span>`;
+        case 'backup':
+            return disk.role_detail
+                ? `<span class="badge badge-role-backup">Backup: ${disk.role_detail}</span>`
+                : '<span class="badge badge-role-backup">Backup</span>';
+        case 'system':
+            return '<span class="badge badge-role-system">System</span>';
+        case 'dead':
+            return '<span class="badge badge-role-dead">Dead</span>';
+        case 'removed':
+            return '<span class="badge badge-role-removed">Removed</span>';
+        default:
+            return '<span class="badge badge-role-unused">Unused</span>';
+    }
+}
+
+function actionButtons(disk) {
+    const isDead = disk.status === 'dead';
+    const isRemoved = disk.status === 'removed';
+    const present = !isDead && !isRemoved && !!disk.device_name;
+    let out = `<button class="btn btn-sm btn-secondary" onclick="openDiskDetails(${disk.id})">
+        <i class="fas fa-info-circle"></i> Details</button> `;
+    if (isDead) {
+        out += `<button class="btn btn-sm btn-primary" onclick="resurrectDisk(${disk.id})">Resurrect</button>`;
+    } else if (!isRemoved && present) {
+        out += `<button class="btn btn-sm btn-danger" onclick="markDead(${disk.id})">Dead</button>`;
+    }
+    if (isRemoved || !present) {
+        out += `<button class="btn btn-sm btn-secondary" onclick="dropDisk(${disk.id})">Drop</button>`;
+    }
+    return out;
 }
 
 function updatePartitionButton() {
@@ -198,21 +266,6 @@ function updatePartitionButton() {
     btn.innerHTML = checked.length > 1
         ? `<i class="fas fa-cut"></i> Partition ${checked.length} Disks`
         : `<i class="fas fa-cut"></i> Partition Selected`;
-}
-
-function refreshDisks() {
-    loadDisks();
-}
-
-function formatSize(bytes) {
-    if (!bytes) return 'Unknown';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    let i = 0;
-    while (bytes >= 1024 && i < units.length - 1) {
-        bytes /= 1024;
-        i++;
-    }
-    return bytes.toFixed(2) + ' ' + units[i];
 }
 
 // ── Partition Modal ──────────────────────────────────────────
@@ -228,7 +281,7 @@ function openPartitionModal() {
         const disk = disks.find(d => d.id === selectedDiskIds[0]);
         title.textContent = `Partition ${disk.device_name}`;
         document.getElementById('partition-disk-info').innerHTML =
-            `<strong>${disk.device_name}</strong> — ${formatSize(disk.size_bytes)} ${disk.disk_type}`;
+            `<strong>${disk.device_name}</strong> — ${formatBytes(disk.size_bytes)} ${disk.disk_type}`;
     } else {
         title.textContent = `Partition ${selectedDiskIds.length} Disks`;
         const names = selectedDiskIds.map(id => disks.find(d => d.id === id)?.device_name).filter(Boolean);
@@ -301,7 +354,7 @@ async function wipeAndPartitionSelected() {
         const results = await api.batchPartitionDisks({ disk_ids: selectedDiskIds, partitions });
         const failed = results.filter(r => !r.success);
         hidePartitionModal();
-        await loadDisks();
+        await loadDisksPage();
         if (failed.length === 0) {
             showAlert(`Partitioned ${names.length} disk(s)`, 'success');
         } else {
@@ -324,7 +377,7 @@ async function wipeOnlySelected() {
         const results = await api.batchWipeDisks({ disk_ids: selectedDiskIds, partitions: [] });
         const failed = results.filter(r => !r.success);
         hidePartitionModal();
-        await loadDisks();
+        await loadDisksPage();
         if (failed.length === 0) {
             showAlert(`Wiped ${names.length} disk(s)`, 'success');
         } else {
@@ -336,6 +389,172 @@ async function wipeOnlySelected() {
     }
 }
 
+// ── Disk Details Modal ───────────────────────────────────────
+
+async function openDiskDetails(diskId) {
+    const disk = disks.find(d => d.id === diskId);
+    if (!disk) return;
+    document.getElementById('disk-detail-title').textContent = `Details — ${disk.device_name || disk.serial || 'Disk #' + diskId}`;
+    const body = document.getElementById('disk-detail-body');
+    body.innerHTML = '<p class="loading">Loading details...</p>';
+    document.getElementById('disk-detail-modal').style.display = 'flex';
+
+    let payload;
+    try {
+        payload = await api.getDiskHealth(diskId);
+    } catch (error) {
+        body.innerHTML = `<p class="empty-hint">Failed to load details: ${escapeHtml(error.message)}</p>`;
+        return;
+    }
+    try {
+        renderDiskDetails(payload);
+    } catch (error) {
+        console.error('Failed to render disk details', error);
+        body.innerHTML = `<p class="empty-hint">Failed to render details: ${escapeHtml(error.message)}</p>`;
+    }
+}
+
+function closeDiskDetails() {
+    document.getElementById('disk-detail-modal').style.display = 'none';
+}
+
+function renderDiskDetails(payload) {
+    const body = document.getElementById('disk-detail-body');
+    body.innerHTML = `
+        <div class="disk-detail-grid">
+            <div class="detail-col">
+                <div class="disk-detail-section">
+                    <h4>Device</h4>
+                    <div id="dd-summary"></div>
+                </div>
+                <div class="disk-detail-section">
+                    <h4>SMART</h4>
+                    <div id="dd-smart"></div>
+                </div>
+            </div>
+            <div class="detail-col">
+                <div class="disk-detail-section">
+                    <h4>ZFS Error History</h4>
+                    <div id="dd-zfs"></div>
+                </div>
+            </div>
+        </div>`;
+
+    const d = payload.disk || {};
+    const deviceId = (d.by_id || '').replace('/dev/disk/by-id/', '') || 'unavailable';
+
+    document.getElementById('dd-summary').innerHTML = `
+        <div style="margin-bottom:6px"><span class="detail-key">Device</span><span class="detail-val">${escapeHtml(d.device_name || '—')}</span></div>
+        <div style="margin-bottom:6px"><span class="detail-key">Model</span><span class="detail-val">${escapeHtml(d.model || 'Unknown')}</span></div>
+        <div style="margin-bottom:6px"><span class="detail-key">Serial</span><span class="detail-val">${escapeHtml(d.serial || '—')}</span></div>
+        <div style="margin-bottom:6px"><span class="detail-key">Device ID</span><span class="detail-val mono">${escapeHtml(deviceId)}</span></div>
+        <div style="margin-bottom:6px"><span class="detail-key">Size</span><span class="detail-val">${formatBytes(d.size_bytes)}</span></div>
+        <div style="margin-bottom:6px"><span class="detail-key">Type</span><span class="detail-val">${escapeHtml(d.disk_type || '—')}</span></div>
+        <div style="margin-bottom:6px"><span class="detail-key">Role</span><span class="detail-val">${d.role === 'pool' ? `Pool: ${escapeHtml(d.role_detail || '?')}` : escapeHtml(d.role || '—')}</span></div>
+        <div><span class="detail-key">Health</span><span class="detail-val">${healthCell(d)}</span></div>`;
+
+    renderSmartSection(payload.smart);
+    renderZfsSection(payload.zfs);
+}
+
+function renderSmartSection(smart) {
+    const el = document.getElementById('dd-smart');
+    if (!smart) {
+        el.innerHTML = '<p class="empty-hint">No SMART data available (disk not present or no device path).</p>';
+        return;
+    }
+    const parts = [];
+    const status = smart.health_status === 'failing'
+        ? '<span class="status status-failing">Failing</span>'
+        : (smart.health_status === 'ok' ? '<span class="status status-ok">OK</span>' : '<span class="status status-unknown">Unknown</span>');
+    parts.push(`<div style="margin-bottom:6px"><span class="detail-key">Overall health</span><span class="detail-val">${status}</span></div>`);
+    if (smart.temperature !== null && smart.temperature !== undefined) {
+        parts.push(`<div style="margin-bottom:6px"><span class="detail-key">Temperature</span><span class="detail-val">${escapeHtml(smart.temperature)} °C</span></div>`);
+    }
+    if (smart.power_on_hours !== null && smart.power_on_hours !== undefined) {
+        parts.push(`<div style="margin-bottom:6px"><span class="detail-key">Power-on hours</span><span class="detail-val">${escapeHtml(smart.power_on_hours)}</span></div>`);
+    }
+    if (smart.nvme) {
+        parts.push(`<div style="margin-bottom:6px"><span class="detail-key">NVMe</span><span class="detail-val">warning ${escapeHtml(smart.nvme.critical_warning)} &middot; used ${escapeHtml(smart.nvme.percentage_used)}% &middot; media errors ${escapeHtml(smart.nvme.media_errors)}</span></div>`);
+    }
+
+    if (smart.problems && smart.problems.length) {
+        parts.push('<div style="margin-bottom:6px"><span class="detail-key">Problems</span><div class="detail-val">'
+            + smart.problems.map(p => `<p class="problem-item problem-warn">${escapeHtml(p)}</p>`).join('')
+            + '</div></div>');
+    } else if (smart.attributes && smart.attributes.length) {
+        parts.push('<p class="empty-hint" style="margin:4px 0 8px">No SMART problems detected.</p>');
+    }
+
+    if (smart.attributes && smart.attributes.length) {
+        parts.push('<table class="smart-attr-table"><thead><tr><th>Attr</th><th>Value</th><th>Worst</th><th style="text-align:right">Raw</th><th></th></tr></thead><tbody>'
+            + smart.attributes.map(a => {
+                const bad = a.when_failed
+                    ? `<span class="problem-fatal" title="${escapeHtml(a.when_failed)}">FAILED</span>`
+                    : (a.raw ? '<span class="problem-warn">attention</span>' : '');
+                return `<tr><td>${escapeHtml(a.name || a.id)}</td><td class="num">${a.value ?? '—'}</td><td class="num">${a.worst ?? '—'}</td><td class="num" style="text-align:right">${a.raw ?? '—'}</td><td>${bad}</td></tr>`;
+            }).join('')
+            + '</tbody></table>');
+    }
+
+    if (smart.self_test && smart.self_test.length) {
+        parts.push('<h4 style="margin:12px 0 6px;font-size:12px;color:#777;text-transform:uppercase">Self-test log</h4>'
+            + '<table class="event-table"><thead><tr><th>Type</th><th>Status</th><th>Remaining</th><th>Hours</th></tr></thead><tbody>'
+            + smart.self_test.map(t => `<tr><td>${escapeHtml(t.type || '—')}</td><td class="${t.failed ? 'problem-fatal' : ''}">${escapeHtml(t.status)}</td><td>${escapeHtml(t.remaining ?? '—')}</td><td class="num">${escapeHtml(t.lifetime_hours ?? '—')}</td></tr>`).join('')
+            + '</tbody></table>');
+    }
+
+    el.innerHTML = parts.join('');
+}
+
+function renderZfsSection(zfs) {
+    const el = document.getElementById('dd-zfs');
+    if (!zfs || (zfs.pool === null && !zfs.errors && (!zfs.events || zfs.events.length === 0))) {
+        el.innerHTML = '<p class="empty-hint">This disk is not part of a ZFS pool.</p>';
+        return;
+    }
+    const parts = [];
+    if (zfs.pool !== null && zfs.pool !== undefined) {
+        parts.push(`<div style="margin-bottom:6px"><span class="detail-key">Pool</span><span class="detail-val">${escapeHtml(zfs.pool)}</span></div>`);
+    }
+    const e = zfs.errors;
+    if (e !== null && e !== undefined) {
+        const total = (e.cksum || 0) + (e.read || 0) + (e.write || 0);
+        const statusHtml = total > 0
+            ? '<span class="badge badge-health-attention">Errors detected</span>'
+            : '<span class="status status-ok">No errors</span>';
+        parts.push(`<div style="margin-bottom:8px"><span class="detail-key">Counters</span><span class="detail-val">${statusHtml}</span></div>`);
+        parts.push('<table class="event-table"><tbody>'
+            + `<tr><td>Read errors</td><td class="num">${e.read || 0}</td></tr>`
+            + `<tr><td>Write errors</td><td class="num">${e.write || 0}</td></tr>`
+            + `<tr><td>Checksum errors</td><td class="num">${e.cksum || 0}</td></tr>`
+            + '</tbody></table>');
+    }
+
+    parts.push('<h4 style="margin:12px 0 6px;font-size:12px;color:#777;text-transform:uppercase">Recent ZFS error events</h4>');
+    if (zfs.events && zfs.events.length) {
+        parts.push('<table class="event-table"><thead><tr><th>Time</th><th>Event</th></tr></thead><tbody>'
+            + zfs.events.slice(0, 50).map(ev => `<tr><td class="mono num">${escapeHtml(formatEventTime(ev.time))}</td><td>${escapeHtml(shortEventClass(ev.class))}</td></tr>`).join('')
+            + '</tbody></table>');
+    } else {
+        parts.push('<p class="empty-hint">No recent ZFS error events recorded for this disk.</p>');
+    }
+    if (zfs.pool) {
+        parts.push('<p class="empty-hint" style="margin-top:8px">Counters are cumulative since the last <code>zpool clear</code>; events cover only activity retained in the recent ring buffer.</p>');
+    }
+    el.innerHTML = parts.join('');
+}
+
+function formatEventTime(t) {
+    if (!t) return '—';
+    const date = new Date(t);
+    return isNaN(date.getTime()) ? t : date.toLocaleString();
+}
+
+function shortEventClass(cls) {
+    return (cls || '').split('.').pop();
+}
+
 // ── Disk Actions ─────────────────────────────────────────────
 
 async function markDead(diskId) {
@@ -344,7 +563,7 @@ async function markDead(diskId) {
     try {
         await api.updateDisk(diskId, { status: 'dead' });
         showAlert(`${disk.device_name} marked as dead`, 'success');
-        await loadDisks();
+        await loadDisksPage();
     } catch (error) {
         showAlert('Failed: ' + error.message, 'error');
     }
@@ -354,7 +573,7 @@ async function resurrectDisk(diskId) {
     try {
         await api.resurrectDisk(diskId);
         showAlert('Disk resurrected', 'success');
-        await loadDisks();
+        await loadDisksPage();
     } catch (error) {
         showAlert('Failed: ' + error.message, 'error');
     }
@@ -366,7 +585,7 @@ async function dropDisk(diskId) {
     try {
         await api.deleteDisk(diskId);
         showAlert('Disk record dropped', 'success');
-        await loadDisks();
+        await loadDisksPage();
     } catch (error) {
         showAlert('Failed: ' + error.message, 'error');
     }

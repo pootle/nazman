@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import nfs_manager
+from ..managers.nfs_manager import NfsManager
+from ..wiring import get_nfs_manager
 
 router = APIRouter(prefix="/api/nfs", tags=["nfs"], dependencies=[Depends(get_current_user)])
 
@@ -40,7 +41,7 @@ class ActiveExportResponse(BaseModel):
 @router.get("/", response_model=List[NfsShareResponse])
 async def list_exports(
     db: Session = Depends(get_db),
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """List every dataset and its live ZFS sharenfs value."""
     return await nfs_manager.list_exports(db)
@@ -48,7 +49,7 @@ async def list_exports(
 
 @router.get("/active", response_model=List[ActiveExportResponse])
 async def list_active_exports(
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """List currently active NFS exports from the kernel export table."""
     return await nfs_manager.get_active_exports()
@@ -58,7 +59,7 @@ async def list_active_exports(
 async def create_export(
     share: NfsShareCreate,
     db: Session = Depends(get_db),
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Create/update a dataset's NFS share via sharenfs."""
     try:
@@ -77,7 +78,7 @@ async def update_export(
     dataset_name: str,
     update: NfsShareUpdate,
     db: Session = Depends(get_db),
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Update a dataset's NFS share (options, client, enable/disable)."""
     try:
@@ -97,7 +98,7 @@ async def update_export(
 async def delete_export(
     dataset_name: str,
     db: Session = Depends(get_db),
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Permanently remove a dataset's NFS share (sharenfs -> off)."""
     try:
@@ -109,7 +110,7 @@ async def delete_export(
 
 @router.get("/presence")
 async def get_presence(
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Return whether the NFS kernel server (exportfs) is installed."""
     return {"installed": nfs_manager.is_server_present()}
@@ -122,7 +123,7 @@ class InstallResponse(BaseModel):
 
 @router.post("/install", response_model=InstallResponse)
 async def install_server(
-
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Install the NFS kernel server (nfs-kernel-server) on this server via apt."""
     try:

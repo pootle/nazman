@@ -20,8 +20,13 @@ def metric_store(tmp_path):
     store.record("tank", "disk", "sda", now, 12.5)
     store.record("tank", "disk", "sdb", now, 88.3)
     store.flush()
-    with patch("nazman.managers.metrics_store.metrics_store", store):
+    from nazman.main import app
+    from nazman.wiring import get_metrics_store
+    app.dependency_overrides[get_metrics_store] = lambda: store
+    try:
         yield store
+    finally:
+        app.dependency_overrides.pop(get_metrics_store, None)
     store.close()
 
 

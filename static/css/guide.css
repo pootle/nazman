@@ -1,0 +1,198 @@
+/* User Guide styles - scoped to the guide pages only. */
+
+.guide-page {
+    max-width: 920px;
+}
+
+.guide-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 20px;
+    background: var(--card-bg, #fff);
+    border: 1px solid var(--border-color, #e2e8f0);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.guide-nav-title {
+    font-weight: 600;
+    margin-right: 6px;
+    align-self: center;
+}
+
+.guide-nav-link {
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    text-decoration: none;
+    color: var(--text-color, #334155);
+    background: #f1f5f9;
+    border: 1px solid transparent;
+    transition: background 0.15s ease;
+}
+
+.guide-nav-link:hover {
+    background: #e2e8f0;
+    text-decoration: none;
+}
+
+.guide-nav-link.active {
+    background: var(--primary-color, #2563eb);
+    color: #fff;
+}
+
+.guide-content {
+    line-height: 1.7;
+    font-size: 0.98rem;
+    color: var(--text-color, #1e293b);
+}
+
+.guide-content h1 {
+    font-size: 1.7rem;
+    margin: 0 0 0.4em;
+    padding-bottom: 0.3em;
+    border-bottom: 2px solid #e2e8f0;
+}
+
+.guide-content h2 {
+    font-size: 1.3rem;
+    margin: 1.6em 0 0.5em;
+    padding-bottom: 0.2em;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.guide-content h3 {
+    font-size: 1.1rem;
+    margin: 1.4em 0 0.4em;
+}
+
+.guide-content p {
+    margin: 0.7em 0;
+}
+
+.guide-content ul,
+.guide-content ol {
+    margin: 0.7em 0;
+    padding-left: 1.5em;
+}
+
+.guide-content li {
+    margin: 0.3em 0;
+}
+
+.guide-content ol {
+    counter-reset: step;
+}
+
+.guide-content ol > li {
+    margin: 0.45em 0;
+}
+
+.guide-content a {
+    color: var(--primary-color, #2563eb);
+}
+
+.guide-content code {
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+    font-size: 0.9em;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    color: #0f172a;
+}
+
+.guide-content pre {
+    background: #0f172a;
+    color: #e2e8f0;
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    margin: 0.9em 0;
+}
+
+.guide-content pre code {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: inherit;
+}
+
+.guide-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0;
+    font-size: 0.92rem;
+}
+
+.guide-content th,
+.guide-content td {
+    border: 1px solid #e2e8f0;
+    padding: 8px 10px;
+    text-align: left;
+}
+
+.guide-content th {
+    background: #f8fafc;
+    font-weight: 600;
+}
+
+.guide-content blockquote {
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 4px;
+    margin: 1em 0;
+    padding: 10px 14px;
+}
+
+.guide-content blockquote p {
+    margin: 0.2em 0;
+}
+
+.guide-content blockquote.callout-warning {
+    background: #fffbeb;
+    border-left-color: #f59e0b;
+}
+
+.guide-content blockquote.callout-danger {
+    background: #fef2f2;
+    border-left-color: #dc2626;
+}
+
+.guide-content blockquote.callout-info {
+    background: #f0f9ff;
+    border-left-color: #0ea5e9;
+}
+
+.guide-content blockquote.callout-success {
+    background: #f0fdf4;
+    border-left-color: #16a34a;
+}
+
+.guide-content hr {
+    border: 0;
+    border-top: 1px solid #e2e8f0;
+    margin: 1.6em 0;
+}
+
+.guide-content kbd {
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 0.1em 0.4em;
+    font-size: 0.9em;
+    font-family: inherit;
+}
+
+.guide-footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 30px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-color, #e2e8f0);
+}

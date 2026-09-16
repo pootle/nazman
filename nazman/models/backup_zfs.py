@@ -67,13 +67,14 @@ class BackupRun(Base):
     dataset_name = Column(String, nullable=False, index=True)  # ZFS dataset name, e.g. tank/data
     backup_disk_id = Column(Integer, ForeignKey("backup_disks.id", ondelete="CASCADE"), nullable=False, index=True)
     backup_type = Column(String, nullable=False)  # full | incremental
-    stream_file = Column(String, nullable=False)  # path on backup disk, e.g. tank/ds/incr-...zfs.gz
-    snapshot = Column(String, nullable=False)  # ZFS snapshot sent, e.g. tank/ds@backup-...
+    stream_file = Column(String, nullable=True)  # path on backup disk, e.g. tank/ds/incr-...zfs.gz
+    snapshot = Column(String, nullable=True)  # ZFS snapshot sent, e.g. tank/ds@backup-...
     base_snapshot = Column(String, nullable=True)  # anchor for incremental
     full_anchor = Column(String, nullable=True)  # full snapshot this chain derives from
     size_bytes = Column(BigInteger, default=0)  # stream file size (compressed)
     changed_bytes = Column(BigInteger, default=0)  # incremental size = changed data
-    status = Column(String, default="running")  # running | success | failed
+    phase = Column(String, nullable=True)  # pending | snapshotting | sending | pruning
+    status = Column(String, default="running")  # running | success | failed | skipped
     error = Column(String, nullable=True)
     started_at = Column(DateTime, default=_utcnow)
     completed_at = Column(DateTime, nullable=True)

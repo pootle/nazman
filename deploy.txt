@@ -5,6 +5,8 @@ nazman/config.py
 nazman/auth.py
 nazman/main.py
 nazman/database.py
+nazman/migrations.py
+nazman/wiring.py
 nazman/models/__init__.py
 nazman/models/disk.py
 nazman/models/pool.py
@@ -22,14 +24,22 @@ nazman/managers/snapshot_manager.py
 nazman/managers/metrics_manager.py
 nazman/managers/metrics_store.py
 nazman/managers/smb_manager.py
+nazman/services/__init__.py
+nazman/services/destruction.py
+nazman/services/disk_view.py
 
 nazman/utils/__init__.py
+nazman/utils/sizes.py
 nazman/utils/commands.py
 nazman/utils/validation.py
 nazman/utils/exceptions.py
 nazman/utils/command_log.py
 nazman/utils/command_tags.py
 nazman/utils/command_log_store.py
+nazman/utils/guide.py
+nazman/utils/devices.py
+nazman/utils/zfs_query.py
+nazman/utils/provisioning.py
 nazman/api/__init__.py
 nazman/api/auth.py
 nazman/api/disks.py
@@ -49,6 +59,7 @@ static/js/app.js
 static/js/components.js
 static/js/charts.js
 static/css/style.css
+static/css/guide.css
 
 # Templates
 templates/pools.html
@@ -63,6 +74,19 @@ templates/dashboard.html
 templates/base.html
 templates/monitoring.html
 templates/events.html
+
+# User guide (Markdown sources for /guide routes)
+templates/guide.html
+docs/overview.md
+docs/pools.md
+docs/datasets.md
+docs/shares.md
+docs/snapshots.md
+docs/backup.md
+docs/disk-failure.md
+docs/recover-dataset.md
+docs/recover-system.md
+docs/troubleshooting.md
 
 # Tests
 tests/__init__.py
@@ -79,6 +103,8 @@ tests/test_commands.py
 tests/test_validation.py
 tests/test_zfs_manager.py
 tests/test_disk_by_id.py
+tests/test_destruction.py
+tests/test_scheduler.py
 tests/test_metrics_manager.py
 tests/test_metrics_store.py
 tests/test_api_metrics.py
@@ -86,6 +112,11 @@ tests/test_smb_manager.py
 tests/test_api_smb.py
 tests/test_command_log.py
 tests/test_zfs_backup.py
+tests/test_guide.py
+tests/test_sizes.py
+tests/test_database_migration.py
+tests/test_auth_coverage.py
+tests/test_api_vdevs.py
 
 # Config & deps
 requirements.txt

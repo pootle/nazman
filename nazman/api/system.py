@@ -8,18 +8,19 @@ import asyncio
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import zfs_manager, disk_manager, metrics_manager
+from ..managers.disk_manager import DiskManager
+from ..managers.metrics_manager import (
+    MetricsManager,
+    list_network_interfaces,
+    get_selected_network_interface,
+)
+from ..managers.zfs_manager import ZfsManager
 from ..config import get_settings
 from ..utils.command_log import command_log
 from ..utils.command_log_store import command_log_store
 from ..utils.command_tags import VALID_OPS, VALID_STATUSES
-from ..models.pool import Pool
-from ..managers.metrics_manager import (
-    list_network_interfaces,
-    get_selected_network_interface,
-    get_disk_series_names,
-    normalize_base_name,
-)
+from ..utils import zfs_query
+from ..wiring import get_disk_manager, get_metrics_manager, get_zfs_manager
 
 router = APIRouter(prefix="/api/system", tags=["system"], dependencies=[Depends(get_current_user)])
 
@@ -69,7 +70,8 @@ async def health_check():
 @router.get("/status", response_model=SystemStatusResponse)
 async def get_system_status(
     db: Session = Depends(get_db),
-
+    zfs_manager: ZfsManager = Depends(get_zfs_manager),
+    disk_manager: DiskManager = Depends(get_disk_manager),
 ):
     """Get system status overview."""
     try:
@@ -116,7 +118,8 @@ async def get_system_status(
 @router.get("/metrics")
 async def get_system_metrics(
     db: Session = Depends(get_db),
-
+    zfs_manager: ZfsManager = Depends(get_zfs_manager),
+    metrics_manager: MetricsManager = Depends(get_metrics_manager),
 ):
     """Metrics for dashboard graphs: full recorded history + current values."""
     try:
@@ -125,7 +128,7 @@ async def get_system_metrics(
         net_series = metrics_manager.get_series("net")
 
         # Per-disk series + map to base device names
-        disk_series_names = get_disk_series_names()
+        disk_series_names = metrics_manager.disk_series_names()
         disks = {}
         for base, series in disk_series_names.items():
             disks[base] = metrics_manager.get_series(series)
@@ -133,31 +136,16 @@ async def get_system_metrics(
         # Interfaces available for selection
         interfaces = list_network_interfaces()
 
-        # Map each pool to its disk base names, prioritised: data vdev disks
-        # first, then special vdev disks, then the rest (log/cache).  Capped to
+        # Map each pool to its disk base names (data vdevs first), capped to
         # keep the dashboard minicard readable.
-        def _collect_pool_bases(status, disk_series_names, limit=4):
-            bases = []
-            groups = ["data_vdevs", "special_vdevs", "log_vdevs", "cache_vdevs"]
-            for group in groups:
-                for vdev in status.get(group, []):
-                    for child in vdev.get("children", []):
-                        leaf = child.get("name") or child.get("path") or ""
-                        base = normalize_base_name(leaf)
-                        if base in disk_series_names and base not in bases:
-                            bases.append(base)
-                        if len(bases) >= limit:
-                            return bases[:limit]
-            return bases[:limit]
-
         pools_map = {}
-        pools_db = db.query(Pool).all() if db else []
-        for pool in pools_db:
+        for pool_name in zfs_manager.list_pool_names(db) if db else []:
             try:
-                status = await zfs_manager.get_pool_status(pool.name)
-                pools_map[pool.name] = _collect_pool_bases(status, disk_series_names)
+                status = await zfs_manager.get_pool_status(pool_name)
+                pools_map[pool_name] = zfs_query.pool_vdev_bases(
+                    status, list(disk_series_names), limit=4)
             except Exception:
-                pools_map[pool.name] = []
+                pools_map[pool_name] = []
 
         memory = await asyncio.to_thread(psutil.virtual_memory)
 

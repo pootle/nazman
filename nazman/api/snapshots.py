@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import snapshot_manager
+from ..managers.snapshot_manager import SnapshotManager
+from ..wiring import get_snapshot_manager
 
 router = APIRouter(prefix="/api/snapshots", tags=["snapshots"], dependencies=[Depends(get_current_user)])
 
@@ -28,7 +29,7 @@ class SnapshotResponse(BaseModel):
 async def list_snapshots(
     dataset_name: Optional[str] = None,
     db: Session = Depends(get_db),
-
+    snapshot_manager: SnapshotManager = Depends(get_snapshot_manager),
 ):
     """List all snapshots from ZFS (live query)."""
     return await snapshot_manager.list_snapshots(db, dataset_name)
@@ -38,7 +39,7 @@ async def list_snapshots(
 async def create_snapshot(
     snapshot: SnapshotCreate,
     db: Session = Depends(get_db),
-
+    snapshot_manager: SnapshotManager = Depends(get_snapshot_manager),
 ):
     """Create a new snapshot."""
     return await snapshot_manager.create_snapshot(
@@ -52,7 +53,7 @@ async def create_snapshot(
 async def destroy_snapshot(
     snapshot_name: str,
     db: Session = Depends(get_db),
-
+    snapshot_manager: SnapshotManager = Depends(get_snapshot_manager),
 ):
     """Destroy a snapshot (DESTRUCTIVE)."""
     await snapshot_manager.destroy_snapshot(db, snapshot_name)

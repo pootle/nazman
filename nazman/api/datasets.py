@@ -5,8 +5,10 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import zfs_manager
-from ..utils.exceptions import DatasetError
+from ..managers.zfs_manager import ZfsManager
+from ..services.destruction import DestructionService
+from ..utils.exceptions import DatasetError, DatasetNotFoundError
+from ..wiring import get_destruction_service, get_zfs_manager
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"], dependencies=[Depends(get_current_user)])
 
@@ -56,7 +58,7 @@ class DatasetResponse(BaseModel):
 async def list_datasets(
     pool_name: Optional[str] = None,
     db: Session = Depends(get_db),
-
+    zfs_manager: ZfsManager = Depends(get_zfs_manager),
 ):
     """List all datasets."""
     return await zfs_manager.list_datasets(db, pool_name)
@@ -66,14 +68,14 @@ async def list_datasets(
 async def get_dataset(
     dataset_name: str,
     db: Session = Depends(get_db),
-
+    zfs_manager: ZfsManager = Depends(get_zfs_manager),
 ):
     """Get dataset by name with live ZFS properties."""
-    if not await zfs_manager._dataset_live_exists(dataset_name):
+    if not await zfs_manager.dataset_exists(dataset_name):
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     # Get live ZFS properties
-    live_props = await zfs_manager._get_dataset_properties(dataset_name)
+    live_props = await zfs_manager.get_dataset_properties(dataset_name)
 
     return {
         "name": dataset_name,
@@ -85,7 +87,7 @@ async def get_dataset(
 async def create_dataset(
     dataset: DatasetCreate,
     db: Session = Depends(get_db),
-
+    zfs_manager: ZfsManager = Depends(get_zfs_manager),
 ):
     """Create a new dataset."""
     return await zfs_manager.create_dataset(
@@ -108,7 +110,7 @@ async def update_dataset(
     dataset_name: str,
     update: DatasetUpdate,
     db: Session = Depends(get_db),
-
+    zfs_manager: ZfsManager = Depends(get_zfs_manager),
 ):
     """Update dataset properties via zfs set (no DB persistence for ZFS properties)."""
     try:
@@ -123,10 +125,8 @@ async def update_dataset(
             canmount=update.canmount,
             readonly=update.readonly,
         )
-    except DatasetError as e:
-        if "not found" in str(e).lower():
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+    except DatasetNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.delete("/{dataset_name:path}")
@@ -134,11 +134,11 @@ async def destroy_dataset(
     dataset_name: str,
     recursive: bool = False,
     db: Session = Depends(get_db),
-
+    destruction: DestructionService = Depends(get_destruction_service),
 ):
     """Destroy a dataset (DESTRUCTIVE)."""
     try:
-        await zfs_manager.destroy_dataset(db, dataset_name, recursive)
+        await destruction.destroy_dataset(db, dataset_name, recursive)
     except DatasetError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"message": f"Dataset {dataset_name} destroyed"}

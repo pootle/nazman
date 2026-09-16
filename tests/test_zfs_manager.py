@@ -1,8 +1,12 @@
 import pytest
 from unittest.mock import patch, AsyncMock
+import json
 
 from nazman.models.pool import Pool
-from nazman.managers.zfs_manager import zfs_manager
+from nazman.models.disk import Disk
+from nazman.managers.zfs_manager import ZfsManager
+
+zfs_manager = ZfsManager()
 
 
 REALISTIC_STATUS_JSON = '{"pools":{"photos1":{"state":"ONLINE","vdevs":{"photos1":{"name":"photos1","vdev_type":"root","class":"normal","state":"ONLINE","vdevs":{"mirror-0":{"name":"mirror-0","vdev_type":"mirror","class":"normal","state":"ONLINE","total_space":"1016G","vdevs":{"sdc":{"name":"sdc","vdev_type":"disk","class":"normal","state":"ONLINE"},"sdd":{"name":"sdd","vdev_type":"disk","class":"normal","state":"ONLINE"}}}}}},"special":{"special-0":{"name":"special-0","vdev_type":"mirror","class":"special","state":"ONLINE","total_space":"222G","vdevs":{"sda2":{"name":"sda2","vdev_type":"disk","class":"special","state":"ONLINE"},"sdb2":{"name":"sdb2","vdev_type":"disk","class":"special","state":"ONLINE"}}}},"log":{"log-0":{"name":"log-0","vdev_type":"mirror","class":"log","state":"ONLINE","total_space":"100G","vdevs":{"sda1":{"name":"sda1","vdev_type":"disk","class":"log","state":"ONLINE"},"sdb1":{"name":"sdb1","vdev_type":"disk","class":"log","state":"ONLINE"}}}}}}}'
@@ -100,148 +104,6 @@ async def test_get_pool_status_data_pool_fallback():
     assert result["data_vdevs"][0]["type"] == "stripe"
     names = [c["name"] for c in result["data_vdevs"][0]["children"]]
     assert names == ["sdc", "sdd"]
-
-
-@pytest.mark.asyncio
-async def test_destroy_pool_deletes_record(db_session):
-    """destroy_pool should remove the Pool DB row."""
-    pool = Pool(name="oldpool")
-    db_session.add(pool)
-    db_session.commit()
-
-    async def fake_run_zpool(*args, **kwargs):
-        return ("", "", 0)
-
-    async def fake_run_zfs(*args, **kwargs):
-        return ("", "", 0)
-
-    async def fake_run_command(*args, **kwargs):
-        return ("", "", 0)
-
-    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
-         patch("nazman.managers.zfs_manager.run_zfs", side_effect=fake_run_zfs), \
-         patch("nazman.managers.zfs_manager.run_command", side_effect=fake_run_command):
-        await zfs_manager.destroy_pool(db_session, "oldpool")
-
-    assert db_session.query(Pool).filter(Pool.name == "oldpool").count() == 0
-
-
-@pytest.mark.asyncio
-async def test_destroy_pool_unexports_nfs_before_destroy(db_session):
-    """destroy_pool should unexport NFS shares belonging to the pool first."""
-    pool = Pool(name="photolib1")
-    db_session.add(pool)
-    db_session.commit()
-
-    zfs_calls = []
-
-    async def fake_run_zfs(*args, **kwargs):
-        cmd = list(args)
-        zfs_calls.append(cmd)
-        # Enumerate the pool's child datasets.
-        if cmd and cmd[0] == "list" and "-r" in cmd:
-            return ("photolib1\nphotolib1/data\n", "", 0)
-        return ("", "", 0)
-
-    async def fake_run_command(*args, **kwargs):
-        return ("", "", 0)
-
-    async def fake_run_zpool(*args, **kwargs):
-        return ("", "", 0)
-
-    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
-         patch("nazman.managers.zfs_manager.run_command", side_effect=fake_run_command), \
-         patch("nazman.managers.zfs_manager.run_zfs", side_effect=fake_run_zfs), \
-         patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_run_zfs):
-
-        await zfs_manager.destroy_pool(db_session, "photolib1")
-
-    assert db_session.query(Pool).filter(Pool.name == "photolib1").count() == 0
-
-    # NFS unexport should disable sharenfs and unshare each pool dataset.
-    off_sets = [c for c in zfs_calls if c[0] == "set" and "sharenfs=off" in c[1]]
-    unshares = [c for c in zfs_calls if c[0] == "unshare"]
-    assert any("photolib1" in c[2] for c in off_sets), zfs_calls
-    assert any("photolib1/data" in c[2] for c in off_sets), zfs_calls
-    assert len(unshares) >= 2, zfs_calls
-
-
-@pytest.mark.asyncio
-async def test_destroy_pool_blocks_on_mounted_datasets(db_session):
-    """destroy_pool should refuse when a child dataset is mounted, before any destroy runs."""
-    pool = Pool(name="dt")
-    db_session.add(pool)
-    db_session.commit()
-
-    async def fake_run_zfs(*args, **kwargs):
-        cmd = list(args)
-        # Enumerate child datasets, then report dt/p1 as mounted.
-        if cmd and cmd[0] == "list" and "-r" in cmd:
-            return ("dt\ndt/p1\n", "", 0)
-        if cmd and cmd[0] == "get":
-            return ("yes", "", 0)
-        return ("", "", 0)
-
-    async def fake_run_command(*args, **kwargs):
-        # showmount -a returns no connected clients
-        return ("", "", 0)
-
-    async def fake_run_zpool(*args, **kwargs):
-        raise AssertionError("zpool destroy should not run when blocked")
-
-    from nazman.utils.exceptions import PoolError
-
-    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
-         patch("nazman.managers.zfs_manager.run_zfs", side_effect=fake_run_zfs), \
-         patch("nazman.managers.zfs_manager.run_command", side_effect=fake_run_command):
-
-        with pytest.raises(PoolError, match="still mounted"):
-            await zfs_manager.destroy_pool(db_session, "dt")
-
-    # Pool record left intact (destroy did not proceed).
-    assert db_session.query(Pool).filter(Pool.name == "dt").count() == 1
-
-
-@pytest.mark.asyncio
-async def test_get_pool_destroy_info_reports_space_export_and_clients(db_session):
-    """destroy-info should surface space used, active export, and connected clients."""
-    pool = Pool(name="photolib1")
-    db_session.add(pool)
-    db_session.commit()
-
-    async def fake_run_zpool(*args, **kwargs):
-        if args[0] == "list":
-            return ("photolib1\t3000000000000\t100000000000\t2900000000000", "", 0)
-        return ("", "", 0)
-
-    async def fake_run_command(cmd, timeout=300, check=True, capture_output=True, input=None):
-        if cmd[0] == "showmount":
-            return ("192.168.32.50:/photolib1\n192.168.32.51:/photolib1/media\n", "", 0)
-        return ("", "", 0)
-
-    async def fake_run_zfs(*args, **kwargs):
-        cmd = list(args)
-        if cmd and cmd[0] == "list" and "-r" in cmd:
-            return ("photolib1\nphotolib1/media\n", "", 0)
-        # Any 'get sharenfs' returns a live share so the export is reported.
-        return ("on", "", 0)
-
-    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
-         patch("nazman.managers.nfs_manager.run_command", side_effect=fake_run_command), \
-         patch("nazman.managers.nfs_manager.run_zfs", side_effect=fake_run_zfs):
-
-        info = await zfs_manager.get_pool_destroy_info(db_session, "photolib1")
-
-    assert info["pool_name"] == "photolib1"
-    assert info["size_bytes"] == 3000000000000
-    assert info["used_bytes"] == 100000000000
-    assert info["free_bytes"] == 2900000000000
-    assert info["has_active_export"] is True
-    export_paths = {e["export_path"] for e in info["exports"]}
-    assert export_paths == {"/photolib1", "/photolib1/media"}
-    assert any(e["export_path"] == "/photolib1/media" for e in info["exports"])
-    clients = {c["client"] for c in info["active_clients"]}
-    assert clients == {"192.168.32.50", "192.168.32.51"}
 
 
 @pytest.mark.asyncio
@@ -472,56 +334,6 @@ async def test_create_pool_log_vdev(db_session):
     assert log_idx > pool_name_idx, "log must come after pool name"
 
 
-@pytest.mark.asyncio
-async def test_destroy_dataset_runs_destroy(db_session):
-    """destroy_dataset should issue a zfs destroy when there are no obstacles."""
-    async def fake_run_zfs(*args, **kwargs):
-        return ("", "", 0)
-
-    with patch("nazman.managers.zfs_manager.run_zfs", side_effect=fake_run_zfs) as mock_run_zfs, \
-         patch.object(zfs_manager, "_dataset_destroy_obstacles", AsyncMock(return_value={
-             "mounted": False, "exports": [], "active_clients": [],
-         })):
-        await zfs_manager.destroy_dataset(db_session, "tank/media")
-
-    destroy_calls = [c for c in mock_run_zfs.call_args_list if c.args and c.args[0] == "destroy"]
-    assert destroy_calls, "expected at least one zfs destroy call"
-    assert any("tank/media" in c.args[1] for c in destroy_calls)
-
-
-@pytest.mark.asyncio
-async def test_destroy_dataset_blocked_when_mounted(db_session):
-    """destroy_dataset must hard-block (no destroy) while the dataset is mounted."""
-    from nazman.utils.exceptions import DatasetError
-
-    with patch.object(zfs_manager, "_dataset_destroy_obstacles", AsyncMock(return_value={
-        "mounted": True, "exports": [], "active_clients": [],
-    })), \
-         patch("nazman.managers.zfs_manager.run_zfs", AsyncMock(return_value=("", "", 0))) as mock_run_zfs:
-        with pytest.raises(DatasetError, match="still mounted"):
-            await zfs_manager.destroy_dataset(db_session, "tank/media")
-
-    # No destroy command should have been issued.
-    destroy_calls = [c for c in mock_run_zfs.call_args_list if c.args and c.args[0] == "destroy"]
-    assert destroy_calls == []
-
-
-@pytest.mark.asyncio
-async def test_destroy_dataset_blocked_when_active_nfs_client(db_session):
-    """destroy_dataset must hard-block while an NFS client holds the mount. """
-    from nazman.utils.exceptions import DatasetError
-
-    with patch.object(zfs_manager, "_dataset_destroy_obstacles", AsyncMock(return_value={
-        "mounted": False,
-        "exports": [],
-        "active_clients": [{"client": "192.168.1.10", "path": "/tank/media"}],
-    })), \
-         patch("nazman.managers.zfs_manager.run_zfs", AsyncMock(return_value=("", "", 0))) as mock_run_zfs:
-        with pytest.raises(DatasetError, match="NFS client"):
-            await zfs_manager.destroy_dataset(db_session, "tank/media")
-
-    destroy_calls = [c for c in mock_run_zfs.call_args_list if c.args and c.args[0] == "destroy"]
-    assert destroy_calls == []
 
 
 @pytest.mark.asyncio
@@ -685,3 +497,157 @@ async def test_create_pool_rejects_invalid_role(db_session):
             db_session, name="badpool",
             vdevs=[{"role": "bogus", "topology": "stripe", "devices": [{"disk_id": disk.id, "slot_uuid": None}]}],
         )
+
+
+@pytest.mark.asyncio
+async def test_get_pool_error_counts_parses_leaves():
+    """get_pool_error_counts should read read/write/cksum counters per leaf."""
+    status_json = json.dumps({
+        "pools": {
+            "data1": {
+                "state": "ONLINE",
+                "vdevs": {
+                    "data1": {
+                        "name": "data1", "vdev_type": "root",
+                        "vdevs": {
+                            "mirror-0": {
+                                "name": "mirror-0", "vdev_type": "mirror",
+                                "vdevs": {
+                                    "ata-X": {
+                                        "name": "ata-X", "vdev_type": "disk",
+                                        "path": "/dev/disk/by-id/ata-X-part1",
+                                        "read": 3, "write": 5, "cksum": 7, "guid": "1234",
+                                    },
+                                    "ata-Y": {
+                                        "name": "ata-Y", "vdev_type": "disk",
+                                        "path": "/dev/disk/by-id/ata-Y-part1",
+                                        "read": 0, "write": 0, "cksum": 0, "guid": "5678",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    })
+
+    async def fake_run_zpool(*args, **kwargs):
+        return (status_json, "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        counts = await zfs_manager.get_pool_error_counts()
+
+    assert counts == {
+        "/dev/disk/by-id/ata-X-part1": {
+            "pool": "data1", "read": 3, "write": 5, "cksum": 7, "guid": "1234",
+        },
+        "/dev/disk/by-id/ata-Y-part1": {
+            "pool": "data1", "read": 0, "write": 0, "cksum": 0, "guid": "5678",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_pool_error_counts_returns_empty_on_failure():
+    async def fake_run_zpool(*args, **kwargs):
+        return ("", "boom", 1)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        counts = await zfs_manager.get_pool_error_counts()
+
+    assert counts == {}
+
+
+def test_pool_errors_for_disk_aggregates_partition_children():
+    counts = {
+        "/dev/disk/by-id/ata-X-part1": {"read": 3, "write": 5, "cksum": 7},
+        "/dev/disk/by-id/ata-X-part2": {"read": 1, "write": 0, "cksum": 2},
+        "/dev/disk/by-id/ata-OTHER-part1": {"read": 99, "write": 99, "cksum": 99},
+    }
+    disk = Disk(by_id="/dev/disk/by-id/ata-X", model="M", size_bytes=1, disk_type="hdd")
+    totals = zfs_manager.pool_errors_for_disk(counts, disk)
+
+    assert totals == {"read": 4, "write": 5, "cksum": 9}
+
+
+def test_pool_errors_for_disk_returns_none_when_not_in_pool():
+    counts = {"/dev/disk/by-id/ata-X-part1": {"read": 3, "write": 5, "cksum": 7}}
+    disk = Disk(by_id="/dev/disk/by-id/ata-Z", model="M", size_bytes=1, disk_type="hdd")
+    assert zfs_manager.pool_errors_for_disk(counts, disk) is None
+
+
+def test_leaf_identities_for_disk_guid_and_path():
+    counts = {
+        "/dev/disk/by-id/ata-X-part1": {"guid": "1234"},
+        "/dev/disk/by-id/ata-OTHER-part1": {"guid": "9999"},
+    }
+    disk = Disk(by_id="/dev/disk/by-id/ata-X", model="M", size_bytes=1, disk_type="hdd")
+    identities = zfs_manager.leaf_identities_for_disk(counts, disk)
+
+    assert identities["guids"] == {"1234"}
+    assert identities["paths"] == {"/dev/disk/by-id/ata-X-part1"}
+
+
+@pytest.mark.asyncio
+async def test_get_pool_error_events_parses_verbose_text():
+    events_output = (
+        "2025-01-02T03:04:05.123456000Z\tereport.fs.zfs.checksum\n"
+        "    class = ereport.fs.zfs.checksum\n"
+        "    pool = data1\n"
+        "    vdev_guid = 1234\n"
+        "    vdev_path = /dev/disk/by-id/ata-X-part1\n"
+        "2025-01-02T03:04:06.987654321Z\tereport.fs.zfs.io_failure\n"
+        "    class = ereport.fs.zfs.io_failure\n"
+        "    pool = data1\n"
+        "    vdev_guid = 5678\n"
+        "    vdev_path = /dev/disk/by-id/ata-Y-part1\n"
+        "2025-01-02T03:04:07.000000000Z\tereport.fs.zfs.pool.create\n"
+        "    class = ereport.fs.zfs.pool.create\n"
+        "    pool = data1\n"
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        return (events_output, "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        events = await zfs_manager.get_pool_error_events("data1")
+
+    # Only checksum/io error classes survive; pool.create is filtered out.
+    assert [e["class"] for e in events] == [
+        "ereport.fs.zfs.checksum", "ereport.fs.zfs.io_failure",
+    ]
+    assert events[0]["vdev_guid"] == "1234"
+    assert events[0]["vdev_path"] == "/dev/disk/by-id/ata-X-part1"
+    assert events[1]["vdev_path"] == "/dev/disk/by-id/ata-Y-part1"
+
+
+@pytest.mark.asyncio
+async def test_get_pool_error_events_returns_empty_on_failure():
+    async def fake_run_zpool(*args, **kwargs):
+        return ("", "no such pool", 1)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        events = await zfs_manager.get_pool_error_events("data1")
+
+    assert events == []
+
+
+def test_events_for_disk_matches_guid_or_path_newest_first():
+    identities = {
+        "guids": {"1234"},
+        "paths": {"/dev/disk/by-id/ata-X-part1"},
+    }
+    events = [
+        {"time": "2025-01-02T03:04:05Z", "class": "ereport.fs.zfs.checksum",
+         "vdev_guid": "1234", "vdev_path": "/dev/disk/by-id/ata-X-part1"},
+        {"time": "2025-01-02T03:04:06Z", "class": "ereport.fs.zfs.checksum",
+         "vdev_guid": "9999", "vdev_path": "/dev/sdb"},
+        {"time": "2025-01-02T03:04:07Z", "class": "ereport.fs.zfs.checksum",
+         "vdev_guid": "7777", "vdev_path": "/dev/disk/by-id/ata-X-part1"},
+    ]
+    matched = zfs_manager.events_for_disk(events, identities)
+
+    assert [e["time"] for e in matched] == [
+        "2025-01-02T03:04:07Z", "2025-01-02T03:04:05Z",
+    ]
