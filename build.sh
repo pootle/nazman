@@ -164,10 +164,7 @@ cat > /etc/nazman/nazman.conf << 'EOF'
 DATABASE_PATH = /var/lib/nazman/nazman.db
 
 # Backup
-BACKUP_ENABLED = true
-BACKUP_REPO_PATH = /mnt/backup/nazman-config
-BACKUP_AUTO_COMMIT = true
-BACKUP_PUSH_ON_COMMIT = true
+BACKUP_MOUNT_BASE = /mnt/backup
 
 # Auth
 AUTH_ENABLED = true
@@ -176,6 +173,14 @@ AUTH_PASSWORD_HASH =
 # Monitoring
 MONITORING_REFRESH_INTERVAL = 5
 MONITORING_ENABLE_WEBSOCKET = true
+
+# Alerting (Telegram)
+# ALERTS_ENABLED = false
+# TELEGRAM_BOT_TOKEN =
+# TELEGRAM_CHAT_ID =
+# ALERT_POOL_USAGE_THRESHOLD = 90
+# ALERT_COOLDOWN_MINUTES = 60
+# ALERTS_POLL_INTERVAL = 60
 
 # Logging
 LOGGING_LEVEL = INFO

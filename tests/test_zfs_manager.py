@@ -651,3 +651,38 @@ def test_events_for_disk_matches_guid_or_path_newest_first():
     assert [e["time"] for e in matched] == [
         "2025-01-02T03:04:07Z", "2025-01-02T03:04:05Z",
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_pool_recreate_specs_includes_partition_geometry(db_session):
+    """A rebuild needs the slot UUID *and* partition size/number for vdevs that
+    sit on partitions, so the GPT layout can be reproduced."""
+    disk = Disk(by_id="/dev/disk/by-id/ata-X", serial="SX",
+                size_bytes=1000, disk_type="hdd")
+    db_session.add(disk)
+    db_session.commit()
+
+    status = {"data_vdevs": [{
+        "name": "raidz1-0", "type": "raidz1",
+        "children": [{"name": "ata-X", "path": "/dev/disk/by-id/ata-X-part1"}],
+    }]}
+    slot_map = {
+        "/dev/disk/by-id/ata-X-part1": {
+            "slot_uuid": "slot-1", "size_bytes": 123456, "partition_number": 1,
+        },
+    }
+
+    with patch.object(zfs_manager, "list_pool_names", return_value=["tank"]), \
+         patch.object(zfs_manager, "get_pool_status", new_callable=AsyncMock, return_value=status), \
+         patch.object(zfs_manager, "_get_pool_ashift", new_callable=AsyncMock, return_value=12), \
+         patch.object(zfs_manager, "_slot_uuid_map", new_callable=AsyncMock, return_value=slot_map):
+        specs = await zfs_manager.get_pool_recreate_specs(db_session)
+
+    assert specs[0]["name"] == "tank"
+    assert specs[0]["ashift"] == 12
+    assert specs[0]["vdevs"][0]["topology"] == "raidz1"
+    device = specs[0]["vdevs"][0]["devices"][0]
+    assert device["by_id"] == "/dev/disk/by-id/ata-X"
+    assert device["slot_uuid"] == "slot-1"
+    assert device["partition_number"] == 1
+    assert device["partition_size_bytes"] == 123456

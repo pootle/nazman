@@ -73,6 +73,24 @@ def test_migrate_backup_tables_adds_phase_to_backup_runs(tmp_path):
     assert row.status == "success"
 
 
+def test_migrate_backup_tables_adds_sha256_to_backup_runs(tmp_path):
+    engine = _engine(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE backup_runs ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "dataset_name VARCHAR NOT NULL,"
+            "backup_disk_id INTEGER NOT NULL,"
+            "backup_type VARCHAR NOT NULL,"
+            "status VARCHAR DEFAULT 'running')"
+        ))
+    engine2 = _engine(tmp_path)
+    with engine2.connect() as conn:
+        migrate_backup_tables(engine2, conn)
+        cols = {c["name"] for c in inspect(engine2).get_columns("backup_runs")}
+    assert "sha256" in cols
+
+
 def test_migrate_backup_tables_warns_when_skipping_nn_column(tmp_path, caplog):
     engine = _engine(tmp_path)
     with engine.begin() as conn:
@@ -97,6 +115,20 @@ def test_migrate_backup_tables_warns_when_skipping_nn_column(tmp_path, caplog):
 
     assert "mount_point" not in cols
     assert any("mount_point" in r.message for r in caplog.records)
+
+
+def test_run_migrations_drops_obsolete_backup_commits(tmp_path):
+    """The git-era backup_commits table is dropped on startup."""
+    from nazman.migrations import run_migrations
+
+    engine = _engine(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE backup_commits (id INTEGER PRIMARY KEY, commit_hash VARCHAR)"
+        ))
+    with engine.connect() as conn:
+        run_migrations(engine, conn)
+    assert not inspect(engine).has_table("backup_commits")
 
 
 def test_migrate_backup_tables_idempotent_and_missing_tables_ok(tmp_path):

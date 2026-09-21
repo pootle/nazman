@@ -59,8 +59,6 @@ def override_settings():
         settings = Settings(
             database_path=os.path.join(tmpdir, "test.db"),
             logging_file=os.path.join(tmpdir, "test.log"),
-            backup_repo_path=os.path.join(tmpdir, "backup"),
-            backup_enabled=False,
             auth_enabled=False,
             command_log_path=os.path.join(tmpdir, "command_log.db"),
         )

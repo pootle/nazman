@@ -5,8 +5,9 @@ import logging
 import shutil
 from sqlalchemy.orm import Session
 
-from ..models.backup import BackupCommit
+from ..models.backup_zfs import BackupDisk
 from ..config import get_settings
+from ..utils import backup_manifest as bm
 from ..utils.commands import run_command, run_zpool
 from ..utils.exceptions import BackupError
 
@@ -14,307 +15,220 @@ logger = logging.getLogger(__name__)
 
 
 class BackupManager:
-    """Manages Git-based configuration backup."""
-    
-    def __init__(self):
+    """Captures configuration bundles onto backup volumes (no git).
+
+    A "configuration bundle" is a full ``nazman.db`` snapshot plus the host
+    config files, pool exports and partition tables, written under
+    ``<volume>/config/<timestamp>/``.  Each capture is recorded in the volume's
+    aggregate manifest and in a ``config.info.json`` sidecar so a fresh install
+    can discover and restore it.  Old bundles are pruned to a retention count.
+    """
+
+    def __init__(self, zfs=None):
         self.settings = get_settings()
-        self.repo_path = Path(self.settings.backup_repo_path)
-    
-    async def initialize_backup_repo(self) -> None:
-        """Initialize the backup repository."""
+        self.zfs = zfs
+
+    # ── Config capture ──────────────────────────────────────────────────
+    async def capture_config_bundle(
+        self,
+        db: Session,
+        volume_root: str | Path,
+        media: Optional[Dict[str, Any]] = None,
+        message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Snapshot the configuration onto one volume and update its manifest."""
+        volume_root = Path(volume_root)
+        volume_root.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        bundle = volume_root / bm.CONFIG_DIR / ts
+        bundle.mkdir(parents=True, exist_ok=True)
+
+        # Consistent DB snapshot (a raw copy of a WAL DB can be torn).
+        db_path = Path(self.settings.database_path)
+        backup_db_path = bundle / "nazman.db"
+        if db_path.exists():
+            await self._snapshot_db(db_path, backup_db_path)
+
+        # Host configuration files.
+        config_files = ["/etc/exports", "/etc/default/nfs-kernel-server"]
+        config_dir = bundle / "system-config"
+        config_dir.mkdir(exist_ok=True)
+        copied = []
+        for config_file in config_files:
+            if Path(config_file).exists():
+                dest = config_dir / Path(config_file).name
+                shutil.copy2(config_file, dest)
+                copied.append(str(dest.relative_to(volume_root)))
+
+        await self._export_pool_configs(bundle)
+        await self._export_partition_tables(bundle)
+
+        manifest = bm.scan_volume(
+            volume_root,
+            media=media or bm.media_identity(mount_point=str(volume_root)),
+            nazman_version=self.settings.app_version,
+        )
+        await self._merge_live_specs(db, manifest)
+
+        entry = {
+            "id": ts,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "message": message or f"Configuration backup - {ts}",
+            "path": f"{bm.CONFIG_DIR}/{ts}",
+            "db_file": f"{bm.CONFIG_DIR}/{ts}/nazman.db",
+            "system_config": copied,
+        }
+        bm.upsert_config_backup(manifest, entry)
+        bm.save_manifest(volume_root, manifest)
+        bm.write_sidecar(bundle / "config", {"kind": "config", "config": entry})
+
+        self._prune_config_bundles(volume_root, manifest)
+        return entry
+
+    async def _merge_live_specs(self, db: Session, manifest: Dict[str, Any]) -> None:
+        """Fold current pool/dataset topology into a manifest (best effort)."""
+        if self.zfs is None:
+            return
         try:
-            # Create backup directory if it doesn't exist
-            self.repo_path.mkdir(parents=True, exist_ok=True)
-            
-            # Initialize git repo if not already initialized
-            git_dir = self.repo_path / ".git"
-            if not git_dir.exists():
-                await self._run_git("init")
-                await self._run_git("config", "user.email", "nazman@localhost")
-                await self._run_git("config", "user.name", "NAZMan")
-                
-                # Create initial commit
-                readme_path = self.repo_path / "README.md"
-                readme_path.write_text("# NAZMan Configuration Backup\n\nThis repository contains NAZMan configuration backups.\n")
-                
-                await self._run_git("add", "README.md")
-                await self._run_git("commit", "-m", "Initial backup repository")
-            
+            bm.merge_pools(manifest, await self.zfs.get_pool_recreate_specs(db))
+            known = {d.get("name") for d in manifest.get("datasets", [])}
+            for ds in await self.zfs.get_dataset_recreate_specs(db):
+                if ds["name"] not in known:
+                    manifest.setdefault("datasets", []).append({
+                        "name": ds["name"], "pool": ds["pool"],
+                        "properties": ds["properties"], "mountpoint": ds.get("mountpoint"),
+                        "backups": [],
+                    })
         except Exception as e:
-            raise BackupError(f"Failed to initialize backup repository: {str(e)}")
-    
-    async def backup_configuration(self, db: Session, message: Optional[str] = None) -> BackupCommit:
-        """Backup current configuration to Git repository."""
-        try:
-            # Ensure repo is initialized
-            await self.initialize_backup_repo()
-            
-            # Copy database to backup location (consistent snapshot via sqlite3
-            # .backup — a raw shutil.copy2 of a WAL-mode DB can be torn).
-            db_path = Path(self.settings.database_path)
-            backup_db_path = self.repo_path / "nazman.db"
-            backup_db_path.parent.mkdir(parents=True, exist_ok=True)
-            if db_path.exists():
-                _, _, rc = await self._run_command(
-                    ["sqlite3", str(db_path), f".backup {str(backup_db_path)}"]
-                )
-                if rc != 0:
-                    shutil.copy2(db_path, backup_db_path)
-            
-            # Copy system configuration files
-            config_files = [
-                "/etc/exports",
-                "/etc/default/nfs-kernel-server"
+            logger.warning("failed to collect live specs for manifest: %s", e)
+
+    def _prune_config_bundles(self, volume_root: Path, manifest: Dict[str, Any]) -> None:
+        """Keep only the newest N config bundles on a volume."""
+        keep = int(getattr(self.settings, "backup_config_retention", 5) or 5)
+        config_root = volume_root / bm.CONFIG_DIR
+        if not config_root.exists():
+            return
+        bundles = sorted(
+            (p for p in config_root.iterdir() if p.is_dir()),
+            key=lambda p: p.name, reverse=True,
+        )
+        removed = set()
+        for old in bundles[keep:]:
+            shutil.rmtree(old, ignore_errors=True)
+            removed.add(old.name)
+        if removed:
+            manifest["config_backups"] = [
+                e for e in manifest.get("config_backups", []) if e.get("id") not in removed
             ]
-            
-            config_dir = self.repo_path / "system-config"
-            config_dir.mkdir(exist_ok=True)
-            
-            for config_file in config_files:
-                if Path(config_file).exists():
-                    dest_path = config_dir / Path(config_file).name
-                    shutil.copy2(config_file, dest_path)
-            
-            # Export pool configurations
-            await self._export_pool_configs()
-            
-            # Export partition tables
-            await self._export_partition_tables()
-            
-            # Stage all changes
-            await self._run_git("add", "-A")
-            
-            # Check if there are changes to commit
-            stdout, stderr, returncode = await self._run_git("status", "--porcelain")
-            
-            if not stdout.strip():
-                # No changes to commit
-                return BackupCommit(
-                    commit_hash="none",
-                    commit_message="No changes to backup",
-                    files_changed=0
-                )
-            
-            # Create commit
-            commit_message = message or f"Configuration backup - {datetime.now(timezone.utc).isoformat()}"
-            await self._run_git("commit", "-m", commit_message)
-            
-            # Get commit hash
-            stdout, stderr, returncode = await self._run_git("rev-parse", "HEAD")
-            commit_hash = stdout.strip()
-            
-            # Push if configured
-            if self.settings.backup_push_on_commit:
-                await self._push_backup()
-            
-            # Record in database
-            backup_commit = BackupCommit(
-                commit_hash=commit_hash,
-                commit_message=commit_message,
-                files_changed=len(stdout.strip().split('\n')) if stdout.strip() else 0
-            )
-            db.add(backup_commit)
-            db.commit()
-            db.refresh(backup_commit)
-            
-            return backup_commit
-            
-        except Exception as e:
-            if isinstance(e, BackupError):
-                raise
-            raise BackupError(f"Failed to backup configuration: {str(e)}")
-    
-    async def restore_configuration(
-        self, 
-        db: Session, 
-        commit_hash: str
+            bm.save_manifest(volume_root, manifest)
+
+    # ── Restore ─────────────────────────────────────────────────────────
+    async def restore_configuration_bundle(
+        self, db: Session, bundle_path: str | Path, restore_db: bool = True
     ) -> bool:
-        """Restore configuration from a specific commit."""
+        """Restore DB and host config files from a config bundle directory."""
+        bundle = Path(bundle_path)
+        if not bundle.is_dir():
+            raise BackupError(f"Config bundle not found: {bundle_path}")
+
+        backup_db = bundle / "nazman.db"
+        if restore_db and backup_db.exists():
+            shutil.copy2(backup_db, Path(self.settings.database_path))
+
+        config_dir = bundle / "system-config"
+        if config_dir.exists():
+            for config_file in config_dir.iterdir():
+                if config_file.is_file():
+                    shutil.copy2(config_file, f"/etc/{config_file.name}")
+
+        exports_file = config_dir / "exports"
+        if exports_file.exists():
+            await self._apply_exports(exports_file)
+        return True
+
+    async def restore_configuration(self, db: Session, commit_hash: str) -> bool:
+        """Restore the config bundle whose id (or commit hash) is ``commit_hash``."""
+        for volume_root in self._all_volume_roots(db):
+            bundle = volume_root / bm.CONFIG_DIR / commit_hash
+            if bundle.is_dir():
+                return await self.restore_configuration_bundle(db, bundle)
+        raise BackupError(f"Config backup {commit_hash} not found")
+
+    def _all_volume_roots(self, db: Session) -> List[Path]:
+        """Mount points of every declared backup disk (no local fallback)."""
+        return [Path(rec.mount_point) for rec in db.query(BackupDisk).all()]
+
+    def find_config_bundles(self, db: Session) -> List[Dict[str, Any]]:
+        """Every config bundle across all declared volumes, newest first."""
+        out = []
+        for root in self._all_volume_roots(db):
+            manifest = bm.load_manifest(root)
+            if manifest:
+                for entry in manifest.get("config_backups", []):
+                    out.append({**entry, "volume_root": str(root)})
+        out.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+        return out
+
+    # ── Helpers ─────────────────────────────────────────────────────────
+    async def _snapshot_db(self, db_path: Path, dest: Path) -> None:
+        """Consistent SQLite snapshot via ``sqlite3 .backup`` (falls back to copy)."""
+        _, _, rc = await self._run_command(
+            ["sqlite3", str(db_path), f".backup {str(dest)}"]
+        )
+        if rc != 0:
+            shutil.copy2(db_path, dest)
+
+    async def _export_pool_configs(self, bundle: Path) -> None:
+        """Export ZFS pool status/properties JSON into a bundle."""
         try:
-            # Verify commit exists
-            stdout, stderr, returncode = await self._run_git(
-                "rev-parse", "--verify", commit_hash
-            )
-            
-            if returncode != 0:
-                raise BackupError(f"Commit {commit_hash} not found")
-            
-            # Checkout the commit
-            await self._run_git("checkout", commit_hash, "--", ".")
-            
-            # Restore database
-            backup_db_path = self.repo_path / "nazman.db"
-            if backup_db_path.exists():
-                db_path = Path(self.settings.database_path)
-                shutil.copy2(backup_db_path, db_path)
-            
-            # Restore system configuration files
-            config_dir = self.repo_path / "system-config"
-            if config_dir.exists():
-                for config_file in config_dir.iterdir():
-                    if config_file.is_file():
-                        dest_path = f"/etc/{config_file.name}"
-                        shutil.copy2(config_file, dest_path)
-            
-            # Apply NFS exports
-            exports_file = config_dir / "exports"
-            if exports_file.exists():
-                await self._apply_exports(exports_file)
-            
-            return True
-            
-        except Exception as e:
-            if isinstance(e, BackupError):
-                raise
-            raise BackupError(f"Failed to restore configuration: {str(e)}")
-    
-    async def get_backup_history(self, db: Session, limit: int = 50) -> List[BackupCommit]:
-        """Get backup commit history."""
-        return db.query(BackupCommit)\
-            .order_by(BackupCommit.created_at.desc())\
-            .limit(limit)\
-            .all()
-    
-    async def get_backup_status(self) -> Dict[str, Any]:
-        """Get backup system status."""
-        try:
-            # Check if repo exists
-            git_dir = self.repo_path / ".git"
-            repo_exists = git_dir.exists()
-            
-            # Get last commit
-            last_commit = None
-            if repo_exists:
-                stdout, stderr, returncode = await self._run_git(
-                    "log", "-1", "--format=%H %ci %s"
-                )
-                if returncode == 0 and stdout.strip():
-                    parts = stdout.strip().split(' ', 2)
-                    if len(parts) >= 3:
-                        last_commit = {
-                            "hash": parts[0],
-                            "date": parts[1],
-                            "message": parts[2]
-                        }
-            
-            # Check if there are uncommitted changes
-            has_changes = False
-            if repo_exists:
-                stdout, stderr, returncode = await self._run_git("status", "--porcelain")
-                has_changes = bool(stdout.strip())
-            
-            return {
-                "repo_exists": repo_exists,
-                "repo_path": str(self.repo_path),
-                "last_commit": last_commit,
-                "has_uncommitted_changes": has_changes,
-                "backup_enabled": self.settings.backup_enabled
-            }
-            
-        except Exception as e:
-            return {
-                "repo_exists": False,
-                "error": str(e),
-                "backup_enabled": self.settings.backup_enabled
-            }
-    
-    async def _export_pool_configs(self) -> None:
-        """Export ZFS pool configurations."""
-        try:
-            # Export pool list
             stdout, stderr, returncode = await run_zpool(
-                "list", "-H", "-o", "name", check=False
+                "list", "-H", "-o", "name", check=False, op="read",
             )
-            
-            if returncode == 0:
-                pools = stdout.strip().split('\n')
-                
-                config_dir = self.repo_path / "pool-configs"
-                config_dir.mkdir(exist_ok=True)
-                
-                for pool_name in pools:
-                    if pool_name:
-                        # Export pool status
-                        stdout, stderr, returncode = await run_zpool(
-                            "status", "-j", pool_name, check=False
-                        )
-                        
-                        if returncode == 0:
-                            pool_config_path = config_dir / f"{pool_name}.json"
-                            pool_config_path.write_text(stdout)
-                        
-                        # Export pool properties
-                        stdout, stderr, returncode = await run_zpool(
-                            "get", "-j", "all", pool_name, check=False
-                        )
-                        
-                        if returncode == 0:
-                            pool_props_path = config_dir / f"{pool_name}-props.json"
-                            pool_props_path.write_text(stdout)
-            
+            if returncode != 0:
+                return
+            config_dir = bundle / "pool-configs"
+            config_dir.mkdir(exist_ok=True)
+            for pool_name in stdout.strip().split('\n'):
+                if not pool_name:
+                    continue
+                out, _, rc = await run_zpool("status", "-j", pool_name, check=False, op="read")
+                if rc == 0:
+                    (config_dir / f"{pool_name}.json").write_text(out)
+                out, _, rc = await run_zpool("get", "-j", "all", pool_name, check=False, op="read")
+                if rc == 0:
+                    (config_dir / f"{pool_name}-props.json").write_text(out)
         except Exception as e:
-            # Log error but don't fail backup
             logger.warning("Failed to export pool configs: %s", e)
-    
-    async def _export_partition_tables(self) -> None:
-        """Export partition tables for all disks."""
+
+    async def _export_partition_tables(self, bundle: Path) -> None:
+        """Export sfdisk partition tables for all disks into a bundle."""
         try:
-            # Get list of disks
             stdout, stderr, returncode = await self._run_command(
                 ["lsblk", "-d", "-n", "-o", "NAME"]
             )
-            
-            if returncode == 0:
-                disks = stdout.strip().split('\n')
-                
-                config_dir = self.repo_path / "partition-tables"
-                config_dir.mkdir(exist_ok=True)
-                
-                for disk in disks:
-                    disk = disk.strip()
-                    if disk:
-                        # Export partition table using sfdisk
-                        stdout, stderr, returncode = await self._run_command(
-                            ["sfdisk", "-d", f"/dev/{disk}"]
-                        )
-                        
-                        if returncode == 0:
-                            partition_path = config_dir / f"{disk}.sfdisk"
-                            partition_path.write_text(stdout)
-            
+            if returncode != 0:
+                return
+            config_dir = bundle / "partition-tables"
+            config_dir.mkdir(exist_ok=True)
+            for disk in stdout.strip().split('\n'):
+                disk = disk.strip()
+                if not disk:
+                    continue
+                out, _, rc = await self._run_command(["sfdisk", "-d", f"/dev/{disk}"])
+                if rc == 0:
+                    (config_dir / f"{disk}.sfdisk").write_text(out)
         except Exception as e:
-            # Log error but don't fail backup
             logger.warning("Failed to export partition tables: %s", e)
-    
+
     async def _apply_exports(self, exports_file: Path) -> None:
-        """Apply NFS exports from file."""
         try:
-            # Copy exports file
             shutil.copy2(exports_file, "/etc/exports")
-            
-            # Reload exports
             await self._run_command(["exportfs", "-ra"], op="system", category="nfs")
-            
         except Exception as e:
             raise BackupError(f"Failed to apply exports: {str(e)}")
-    
-    async def _push_backup(self) -> None:
-        """Push backup to remote repository."""
-        # For now, this is a local-only backup
-        # Could be extended to push to remote Git repos
-        pass
-    
-    async def _run_git(self, *args) -> tuple:
-        """Run a git command (tagged write/backup unless a read-only subcommand)."""
-        cmd = ["git", "-C", str(self.repo_path)] + list(args)
-        sub = str(args[0]) if args else ""
-        if sub in ("status", "rev-parse", "log", "show", "diff", "ls-files"):
-            return await self._run_command(cmd, op="read", category="backup")
-        return await self._run_command(cmd, op="write", category="backup")
-    
+
     @staticmethod
     async def _run_command(cmd: list, **kwargs) -> tuple:
-        """Run a system command (via run_command so it is captured in the command log)."""
         try:
             return await run_command(cmd, timeout=60, check=False, **kwargs)
         except Exception as e:

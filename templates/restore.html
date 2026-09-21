@@ -1,0 +1,681 @@
+{% extends "base.html" %}
+
+{% block title %}Restore - NAZMan{% endblock %}
+{% block page_title %}Restore{% endblock %}
+
+{% block content %}
+<div class="restore-page">
+
+    <!-- Configuration restore -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-file-import"></i> Restore Configuration</h2>
+            <button class="btn btn-secondary" onclick="loadConfigBundles()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <p class="text-muted">Restore the NAZMan database and host configuration from a bundle stored on a backup
+                volume. This overwrites the current configuration.</p>
+            <div id="config-bundles" class="history-table"><p class="loading">Loading configuration bundles...</p></div>
+        </div>
+    </div>
+
+    <!-- Dataset restore -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-rotate-left"></i> Restore a Dataset</h2>
+            <button class="btn btn-secondary" onclick="loadRestoreRuns()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+        <div class="card-body">
+            <p class="text-muted">Restore a single dataset from a recorded backup run, or from a stream file on a
+                mounted backup disk.</p>
+            <div id="restore-runs" class="history-table"><p class="loading">Loading backup runs...</p></div>
+
+            <h4 style="margin:18px 0 8px;">From a stream file</h4>
+            <div class="row mb-3">
+                <div class="col-md-4">
+                    <select id="restore-disk" class="form-select" onchange="loadDiskStreams()">
+                        <option value="">Select backup disk...</option>
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <select id="restore-stream" class="form-select">
+                        <option value="">Select stream file...</option>
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <input id="restore-name" class="form-control" placeholder="Target dataset, e.g. tank/data">
+                </div>
+            </div>
+            <button class="btn btn-warning" onclick="restoreFromFile()">Restore from file</button>
+            <div id="restore-note" class="mt-2"></div>
+        </div>
+    </div>
+
+    <hr style="margin:24px 0;border:none;border-top:2px solid var(--border);">
+
+    <!-- System restore wizard -->
+    <h2 style="margin-bottom:4px;"><i class="fas fa-server"></i> Rebuild This System</h2>
+    <p class="text-muted">Recover a complete NAS from backup disks after new hardware or a fresh install: scan for
+        backup info sets, recreate pools and their vdevs, then restore datasets and configuration.</p>
+
+    <!-- Step 1 -->
+    <div class="card wizard-step" id="step-1">
+        <div class="card-header">
+            <h2><span class="step-badge">1</span> Find Backup Sets</h2>
+            <button class="btn btn-primary" onclick="scanBackupSets()">
+                <i class="fas fa-magnifying-glass"></i> Scan disks
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="backup-sets"><p class="text-muted">Connect your backup disks, then click Scan.</p></div>
+        </div>
+    </div>
+
+    <!-- Step 2 -->
+    <div class="card wizard-step" id="step-2" style="display:none;">
+        <div class="card-header">
+            <h2><span class="step-badge">2</span> Review Backup Set</h2>
+        </div>
+        <div class="card-body">
+            <div id="set-detail"></div>
+        </div>
+    </div>
+
+    <!-- Step 3 -->
+    <div class="card wizard-step" id="step-3" style="display:none;">
+        <div class="card-header">
+            <h2><span class="step-badge">3</span> Recreate Pools</h2>
+            <button class="btn btn-secondary" onclick="loadPoolPlans()">
+                <i class="fas fa-sync-alt"></i> Reload
+            </button>
+        </div>
+        <div class="card-body">
+            <p class="text-muted">Assign an attached disk to each recorded vdev slot. Partitioned vdevs keep their
+                recorded slot UUIDs; use <em>Prepare partitions</em> before creating the pool. Pools can be skipped.</p>
+            <div id="pool-plans"><p class="text-muted">No pools in this set.</p></div>
+        </div>
+    </div>
+
+    <!-- Step 4 -->
+    <div class="card wizard-step" id="step-4" style="display:none;">
+        <div class="card-header">
+            <h2><span class="step-badge">4</span> Restore Datasets</h2>
+            <button class="btn btn-secondary" onclick="loadDatasetPlan()">
+                <i class="fas fa-sync-alt"></i> Reload
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="required-media"></div>
+            <div id="dataset-plan"><p class="text-muted">Loading datasets...</p></div>
+            <div class="mt-3">
+                <button class="btn btn-warning" onclick="restoreSelected()">
+                    <i class="fas fa-rotate-left"></i> Restore selected
+                </button>
+            </div>
+            <div id="restore-results" class="mt-2"></div>
+        </div>
+    </div>
+
+    <!-- Step 5 -->
+    <div class="card wizard-step" id="step-5" style="display:none;">
+        <div class="card-header">
+            <h2><span class="step-badge">5</span> Finish</h2>
+        </div>
+        <div class="card-body">
+            <p class="text-muted">Optional: re-register the restored backup volume so future backups work, and
+                reconcile the restored schedules into running jobs.</p>
+            <button class="btn btn-secondary" onclick="adoptMedia()">
+                <i class="fas fa-hdd"></i> Adopt backup media
+            </button>
+            <button class="btn btn-secondary" onclick="rebuildSchedules()">
+                <i class="fas fa-calendar-check"></i> Rebuild schedules
+            </button>
+            <div id="finish-note" class="mt-2"></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let restoreRuns = [];
+let configBundles = [];
+let backupSets = [];
+let selectedSetId = null;
+let selectedSet = null;
+let poolPlans = {};
+let poolIndex = {};
+let datasetPlan = [];
+let mediaList = [];
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadRestorePage();
+});
+
+async function loadRestorePage() {
+    await Promise.all([
+        loadConfigBundles(),
+        loadRestoreRuns(),
+        refreshRestoreDisks(),
+    ]);
+}
+
+// ── Configuration restore ────────────────────────────────────────────
+async function loadConfigBundles() {
+    try {
+        configBundles = await api.listConfigBundles();
+        renderConfigBundles();
+    } catch (e) {
+        showError('config-bundles', 'Failed to load configuration bundles');
+    }
+}
+
+function renderConfigBundles() {
+    const c = document.getElementById('config-bundles');
+    if (configBundles.length === 0) {
+        c.innerHTML = createEmptyState('No configuration bundles found on any backup volume.');
+        return;
+    }
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr><th>Bundle</th><th>Message</th><th>Volume</th><th>Date</th><th></th></tr></thead>
+            <tbody>
+                ${configBundles.map(b => `
+                    <tr>
+                        <td><code>${escapeHtml(b.id)}</code></td>
+                        <td>${escapeHtml(b.message || '')}</td>
+                        <td><small class="text-muted">${escapeHtml(b.volume_root || '')}</small></td>
+                        <td>${formatDate(b.created_at)}</td>
+                        <td><button class="btn btn-danger btn-sm" onclick="restoreConfig('${escapeHtml(b.id)}')">Restore</button></td>
+                    </tr>`).join('')}
+            </tbody>
+        </table>`;
+}
+
+async function restoreConfig(bundleId) {
+    if (!confirm('Restore configuration from bundle ' + bundleId + '? This overwrites the current configuration.')) return;
+    if (!confirm('Are you REALLY sure? This cannot be undone.')) return;
+    try {
+        await api.restoreBackup(bundleId);
+        showAlert('Configuration restored', 'success');
+        await loadConfigBundles();
+    } catch (e) {
+        showAlert('Restore failed: ' + e.message, 'error');
+    }
+}
+
+// ── Dataset restore from runs / files ────────────────────────────────
+async function loadRestoreRuns() {
+    try {
+        restoreRuns = await api.listBackupRuns();
+        renderRestoreRuns();
+    } catch (e) {
+        showError('restore-runs', 'Failed to load backup runs');
+    }
+}
+
+function renderRestoreRuns() {
+    const c = document.getElementById('restore-runs');
+    const runs = restoreRuns.filter(r => r.status === 'success');
+    if (runs.length === 0) {
+        c.innerHTML = createEmptyState('No successful backup runs available.');
+        return;
+    }
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr><th>Dataset</th><th>Type</th><th>Stream Size</th><th>Date</th><th></th></tr></thead>
+            <tbody>
+                ${runs.map(r => `
+                    <tr>
+                        <td><code>${escapeHtml(r.dataset_name)}</code></td>
+                        <td><span class="badge">${r.backup_type}</span></td>
+                        <td>${formatBytes(r.size_bytes)}</td>
+                        <td>${formatDate(r.completed_at || r.started_at)}</td>
+                        <td><button class="btn btn-danger btn-sm" onclick="restoreRun(${r.id})">Restore</button></td>
+                    </tr>`).join('')}
+            </tbody>
+        </table>`;
+}
+
+async function restoreRun(runId) {
+    const run = restoreRuns.find(r => r.id === runId);
+    if (!run) return;
+    const target = prompt('Target dataset name:', run.dataset_name);
+    if (!target) return;
+    if (!confirm('Restore "' + target + '" from this backup run? This overwrites the live dataset.')) return;
+    if (!confirm('Are you REALLY sure? Live data will be replaced.')) return;
+    try {
+        await api.restoreBackupRun(runId, target);
+        showAlert('Restore complete', 'success');
+    } catch (e) {
+        showAlert('Restore failed: ' + e.message, 'error');
+    }
+}
+
+async function refreshRestoreDisks() {
+    try {
+        const disks = await api.listBackupDisks();
+        const sel = document.getElementById('restore-disk');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">Select backup disk...</option>';
+        disks.filter(d => d.status === 'mounted').forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d.id;
+            opt.textContent = d.label || d.mount_point || ('Disk ' + d.id);
+            opt.selected = String(d.id) === current;
+            sel.appendChild(opt);
+        });
+    } catch (e) { /* optional */ }
+}
+
+async function loadDiskStreams() {
+    const diskId = document.getElementById('restore-disk').value;
+    const streamSel = document.getElementById('restore-stream');
+    streamSel.innerHTML = '<option value="">Select stream file...</option>';
+    if (!diskId) return;
+    try {
+        const streams = await api.listDiskStreams(diskId);
+        streams.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.path;
+            opt.textContent = s.dataset + ' | ' + s.path.split('/').pop() + ' (' + formatBytes(s.size_bytes) + ')';
+            streamSel.appendChild(opt);
+        });
+    } catch (e) {
+        showAlert('Failed to list streams: ' + e.message, 'error');
+    }
+}
+
+async function restoreFromFile() {
+    const diskId = document.getElementById('restore-disk').value;
+    const streamFile = document.getElementById('restore-stream').value;
+    const name = document.getElementById('restore-name').value.trim();
+    if (!diskId || !streamFile || !name) { showAlert('Select disk, stream, and enter a target dataset', 'error'); return; }
+    if (!confirm('Restore dataset "' + name + '" from ' + streamFile.split('/').pop() + '? This overwrites any existing dataset.')) return;
+    try {
+        const res = await api.restoreFromFile(parseInt(diskId, 10), streamFile, name);
+        document.getElementById('restore-note').innerHTML =
+            '<p class="text-success">Restored: ' + escapeHtml(res.dataset) + '</p>';
+        showAlert('Restore complete', 'success');
+    } catch (e) {
+        document.getElementById('restore-note').innerHTML =
+            '<p class="text-danger">Restore failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+// ── System restore wizard ────────────────────────────────────────────
+async function scanBackupSets() {
+    const c = document.getElementById('backup-sets');
+    c.innerHTML = createLoading();
+    try {
+        backupSets = await api.listBackupSets();
+        renderBackupSets();
+    } catch (e) {
+        c.innerHTML = createErrorState('Scan failed: ' + e.message);
+    }
+}
+
+function renderBackupSets() {
+    const c = document.getElementById('backup-sets');
+    if (backupSets.length === 0) {
+        c.innerHTML = createEmptyState('No backup info sets found. Is a backup disk connected?');
+        return;
+    }
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr>
+                <th>Volume</th><th>Device</th><th>Pools</th><th>Datasets</th>
+                <th>Configs</th><th>Updated</th><th></th>
+            </tr></thead>
+            <tbody>
+                ${backupSets.map(s => `
+                    <tr>
+                        <td>${escapeHtml((s.media && s.media.label) || s.label || '—')}<br>
+                            <small class="text-muted">${escapeHtml(s.fs_uuid || '')}</small></td>
+                        <td><code>${escapeHtml(s.device || '')}</code></td>
+                        <td>${(s.pool_names || []).map(escapeHtml).join(', ') || '—'}</td>
+                        <td>${s.dataset_count || 0}</td>
+                        <td>${s.config_backup_count || 0}</td>
+                        <td>${formatDate(s.updated_at)}</td>
+                        <td><button class="btn btn-primary btn-sm" onclick="selectBackupSet('${escapeHtml(s.set_id)}')">Select</button></td>
+                    </tr>`).join('')}
+            </tbody>
+        </table>`;
+}
+
+async function selectBackupSet(setId) {
+    selectedSetId = setId;
+    selectedSet = null;
+    poolPlans = {};
+    poolIndex = {};
+    document.getElementById('step-2').style.display = '';
+    document.getElementById('set-detail').innerHTML = createLoading();
+    try {
+        selectedSet = await api.getBackupSet(setId);
+        renderSetDetail(selectedSet);
+        document.getElementById('step-3').style.display = '';
+        await loadPoolPlans();
+    } catch (e) {
+        document.getElementById('set-detail').innerHTML = createErrorState('Failed to load set: ' + e.message);
+    }
+}
+
+function renderSetDetail(set) {
+    const m = set.manifest || {};
+    const pools = m.pools || [];
+    const datasets = m.datasets || [];
+    const configs = m.config_backups || [];
+    const media = set.required_media || [];
+    document.getElementById('set-detail').innerHTML = `
+        <div class="status-grid">
+            <div class="status-item"><label>Set:</label><span>${escapeHtml(set.set_id)}</span></div>
+            <div class="status-item"><label>Pools:</label><span>${pools.length}</span></div>
+            <div class="status-item"><label>Datasets:</label><span>${datasets.length}</span></div>
+            <div class="status-item"><label>Config bundles:</label><span>${configs.length}</span></div>
+        </div>
+        ${pools.length ? `<h4 style="margin:14px 0 6px">Pools</h4>${pools.map(p => `
+            <div class="manifest-line"><strong>${escapeHtml(p.name)}</strong>
+                <small class="text-muted">ashift ${p.ashift || '—'} · ${(p.vdevs || []).map(v => `${v.role}/${v.topology}`).join(', ')}</small></div>`).join('')}` : ''}
+        ${configs.length ? `<h4 style="margin:14px 0 6px">Configuration</h4>${configs.map(c => `
+            <div class="manifest-line"><code>${escapeHtml(c.id)}</code>
+                <button class="btn btn-danger btn-sm" style="margin-left:8px" onclick="restoreSetConfig('${escapeHtml(c.id)}')">Restore</button></div>`).join('')}` : ''}
+        ${media.length ? `<h4 style="margin:14px 0 6px">Required media</h4>${media.map(md => `
+            <div class="media-row">
+                <span>${escapeHtml(md.label || md.media_fs_uuid || 'unknown')}</span>
+                <span class="${md.connected ? 'status-online' : 'status-faulted'}">${md.connected ? 'connected' : 'not connected'}</span>
+                <small class="text-muted">${md.datasets.length} dataset(s)</small>
+            </div>`).join('')}` : ''}
+    `;
+}
+
+async function loadPoolPlans() {
+    if (!selectedSetId) return;
+    const pools = (selectedSet.manifest && selectedSet.manifest.pools) || [];
+    const c = document.getElementById('pool-plans');
+    if (pools.length === 0) {
+        c.innerHTML = '<p class="text-muted">No pools in this set. Continue to datasets.</p>';
+        document.getElementById('step-4').style.display = '';
+        await loadDatasetPlan();
+        return;
+    }
+    c.innerHTML = '';
+    poolIndex = {};
+    pools.forEach((p, i) => {
+        poolIndex[p.name] = i;
+        const div = document.createElement('div');
+        div.className = 'wizard-block';
+        div.id = 'pool-plan-' + i;
+        div.innerHTML = createLoading();
+        c.appendChild(div);
+    });
+    for (const p of pools) {
+        await loadPoolPlan(p.name);
+    }
+}
+
+async function loadPoolPlan(poolName) {
+    const i = poolIndex[poolName];
+    const div = document.getElementById('pool-plan-' + i);
+    try {
+        const plan = await api.planPoolMapping(selectedSetId, poolName);
+        poolPlans[poolName] = plan;
+        renderPoolPlan(poolName, plan);
+    } catch (e) {
+        div.innerHTML = createErrorState('Could not plan pool: ' + e.message);
+    }
+}
+
+function renderPoolPlan(poolName, plan) {
+    const i = poolIndex[poolName];
+    const div = document.getElementById('pool-plan-' + i);
+    const disks = plan.attached_disks || [];
+    const opts = (selectedId) => disks.map(d => {
+        const label = `${d.device_path || d.by_id} · ${formatBytes(d.size_bytes)}`;
+        return `<option value="${d.disk_id}" ${selectedId === d.disk_id ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
+
+    const vdevsHtml = (plan.vdevs || []).map((v, vi) => `
+        <div class="vdev-block">
+            <div class="vdev-title"><span class="badge badge-${v.role}">${v.role}</span> ${v.topology}</div>
+            ${(v.devices || []).map((d, di) => {
+                const spec = d.spec || {};
+                const recorded = `${spec.by_id || '?'}${spec.serial ? ' / ' + spec.serial : ''}`
+                    + (spec.partition_number ? ` · partition ${spec.partition_number}` : ' · whole disk');
+                return `<div class="vdev-row">
+                    <span class="vdev-spec" title="${escapeHtml(recorded)}">${escapeHtml(recorded)}
+                        <small class="text-muted">(${spec.size_bytes ? formatBytes(spec.size_bytes) : 'size unknown'})</small></span>
+                    <select class="form-control" data-vdev="${vi}" data-dev="${di}">
+                        <option value="">— select disk —</option>
+                        ${opts(d.matched_disk_id)}
+                    </select>
+                    ${d.matched_disk_id ? `<span class="badge badge-muted" title="matched by ${d.match}">${d.match}</span>` : '<span class="badge badge-log">unmatched</span>'}
+                </div>`;
+            }).join('')}
+        </div>`).join('');
+
+    const hasPartitions = (plan.vdevs || []).some(v => (v.devices || []).some(d => d.spec && d.spec.slot_uuid));
+    div.innerHTML = `
+        <div class="pool-head">
+            <strong>${escapeHtml(poolName)}</strong>
+            <small class="text-muted">ashift ${plan.ashift || '—'}</small>
+        </div>
+        ${vdevsHtml}
+        <div class="pool-actions">
+            ${hasPartitions ? `<button class="btn btn-secondary btn-sm" onclick="preparePartitions('${escapeHtml(poolName)}')">
+                <i class="fas fa-wrench"></i> Prepare partitions</button>` : ''}
+            <button class="btn btn-primary btn-sm" onclick="createPool('${escapeHtml(poolName)}')">
+                <i class="fas fa-plus"></i> Create pool</button>
+            <button class="btn btn-secondary btn-sm" onclick="skipPool('${escapeHtml(poolName)}')">Skip</button>
+        </div>`;
+}
+
+function buildPoolVdevs(poolName) {
+    const plan = poolPlans[poolName];
+    const i = poolIndex[poolName];
+    const container = document.getElementById('pool-plan-' + i);
+    const vdevs = [];
+    let missing = false;
+    (plan.vdevs || []).forEach((v, vi) => {
+        const devices = [];
+        (v.devices || []).forEach((d, di) => {
+            const sel = container.querySelector(`select[data-vdev="${vi}"][data-dev="${di}"]`);
+            const diskId = sel && sel.value ? parseInt(sel.value, 10) : null;
+            if (!diskId) { missing = true; return; }
+            devices.push({ disk_id: diskId, slot_uuid: (d.spec && d.spec.slot_uuid) || null });
+        });
+        vdevs.push({ role: v.role, topology: v.topology, ashift: v.ashift, devices });
+    });
+    return { vdevs, missing };
+}
+
+async function preparePartitions(poolName) {
+    const plan = poolPlans[poolName];
+    const i = poolIndex[poolName];
+    const container = document.getElementById('pool-plan-' + i);
+    const perDisk = {};
+    (plan.vdevs || []).forEach((v, vi) => {
+        (v.devices || []).forEach((d, di) => {
+            const spec = d.spec || {};
+            if (!spec.slot_uuid) return;
+            const sel = container.querySelector(`select[data-vdev="${vi}"][data-dev="${di}"]`);
+            const diskId = sel && sel.value ? parseInt(sel.value, 10) : null;
+            if (!diskId) return;
+            (perDisk[diskId] = perDisk[diskId] || []).push({
+                size_mb: spec.partition_size_bytes ? Math.round(spec.partition_size_bytes / 1048576) : null,
+                slot_uuid: spec.slot_uuid,
+                number: spec.partition_number || 0,
+            });
+        });
+    });
+    const diskIds = Object.keys(perDisk);
+    if (diskIds.length === 0) { showAlert('Assign disks to the partition slots first', 'error'); return; }
+    if (!confirm('This will WIPE and re-partition ' + diskIds.length + ' disk(s), recreating the recorded slot layouts. Continue?')) return;
+    try {
+        for (const diskId of diskIds) {
+            const parts = perDisk[diskId].sort((a, b) => a.number - b.number)
+                .map(p => ({ size_mb: p.size_mb, slot_uuid: p.slot_uuid }));
+            await api.recreatePartitions(parseInt(diskId, 10), parts);
+        }
+        showAlert('Partition layouts recreated', 'success');
+    } catch (e) {
+        showAlert('Partition recreate failed: ' + e.message, 'error');
+    }
+}
+
+async function createPool(poolName) {
+    const { vdevs, missing } = buildPoolVdevs(poolName);
+    if (missing) { showAlert('Assign a disk to every vdev slot first', 'error'); return; }
+    if (!confirm('Create pool "' + poolName + '" from the selected disks? This destroys data on those devices.')) return;
+    try {
+        await api.createPoolFromBackup(selectedSetId, poolName, vdevs);
+        showAlert('Pool "' + poolName + '" created', 'success');
+        const div = document.getElementById('pool-plan-' + poolIndex[poolName]);
+        div.classList.add('wizard-done');
+        document.getElementById('step-4').style.display = '';
+        await loadDatasetPlan();
+    } catch (e) {
+        showAlert('Pool create failed: ' + e.message, 'error');
+    }
+}
+
+function skipPool(poolName) {
+    const div = document.getElementById('pool-plan-' + poolIndex[poolName]);
+    div.classList.add('wizard-skipped');
+    document.getElementById('step-4').style.display = '';
+    loadDatasetPlan();
+}
+
+async function restoreSetConfig(configId) {
+    if (!confirm('Restore configuration bundle ' + configId + '? This overwrites the current configuration.')) return;
+    try {
+        await api.restoreSetConfig(selectedSetId, configId);
+        showAlert('Configuration restored', 'success');
+    } catch (e) {
+        showAlert('Restore failed: ' + e.message, 'error');
+    }
+}
+
+// ── Step 4: datasets ─────────────────────────────────────────────────
+async function loadDatasetPlan() {
+    if (!selectedSetId) return;
+    document.getElementById('dataset-plan').innerHTML = createLoading();
+    try {
+        datasetPlan = await api.getDatasetRestorePlan(selectedSetId);
+        mediaList = await api.getRequiredMedia(selectedSetId);
+        renderRequiredMedia();
+        renderDatasetPlan();
+        document.getElementById('step-5').style.display = '';
+    } catch (e) {
+        document.getElementById('dataset-plan').innerHTML = createErrorState('Failed to load datasets: ' + e.message);
+    }
+}
+
+function renderRequiredMedia() {
+    const c = document.getElementById('required-media');
+    if (mediaList.length === 0) { c.innerHTML = ''; return; }
+    c.innerHTML = `<h4 style="margin:0 0 6px">Required backup media</h4>` + mediaList.map(m => `
+        <div class="media-row">
+            <span>${escapeHtml(m.label || m.media_fs_uuid || 'unknown')}</span>
+            <span class="${m.connected ? 'status-online' : 'status-faulted'}">${m.connected ? 'connected' : 'insert disk'}</span>
+            <small class="text-muted">${m.datasets.length} dataset(s)</small>
+            ${m.connected ? `<button class="btn btn-secondary btn-sm" onclick="restoreFromMedia('${escapeHtml(m.media_fs_uuid || '')}')">Restore from this disk</button>` : ''}
+        </div>`).join('');
+}
+
+function renderDatasetPlan() {
+    const c = document.getElementById('dataset-plan');
+    if (datasetPlan.length === 0) {
+        c.innerHTML = createEmptyState('No datasets with backups in this set.');
+        return;
+    }
+    c.innerHTML = `
+        <table class="data-table">
+            <thead><tr>
+                <th>Restore</th><th>Source dataset</th><th>Target pool</th><th>Streams</th><th>Media</th>
+            </tr></thead>
+            <tbody>
+                ${datasetPlan.map((d, i) => `
+                    <tr>
+                        <td><input type="checkbox" class="ds-enabled" data-i="${i}" ${d.enabled ? 'checked' : ''}></td>
+                        <td><code>${escapeHtml(d.source_dataset)}</code></td>
+                        <td>
+                            <select class="form-control ds-pool" data-i="${i}">
+                                <option value="">— skip —</option>
+                                ${(d.pools || []).map(p => `<option value="${escapeHtml(p)}" ${d.suggested_pool === p ? 'selected' : ''}>${escapeHtml(p)}</option>`).join('')}
+                            </select>
+                        </td>
+                        <td>${(d.chain || []).length}</td>
+                        <td><small class="text-muted">${(d.media_fs_uuids || []).map(escapeHtml).join(', ') || '—'}</small></td>
+                    </tr>`).join('')}
+            </tbody>
+        </table>`;
+}
+
+function collectSelections() {
+    return datasetPlan.map((d, i) => {
+        const enabled = document.querySelector(`.ds-enabled[data-i="${i}"]`).checked;
+        const pool = document.querySelector(`.ds-pool[data-i="${i}"]`).value;
+        return { source_dataset: d.source_dataset, target_pool: pool || null, enabled };
+    }).filter(s => s.enabled);
+}
+
+async function restoreSelected() {
+    const selections = collectSelections();
+    if (selections.length === 0) { showAlert('No datasets selected', 'error'); return; }
+    if (selections.some(s => !s.target_pool)) { showAlert('Every selected dataset needs a target pool', 'error'); return; }
+    if (!confirm('Restore ' + selections.length + ' dataset(s)? Existing datasets will be overwritten.')) return;
+    await runRestore(selections, null);
+}
+
+async function restoreFromMedia(mediaUuid) {
+    const selections = collectSelections();
+    if (selections.some(s => !s.target_pool)) { showAlert('Every selected dataset needs a target pool', 'error'); return; }
+    if (!confirm('Restore datasets stored on this disk?')) return;
+    await runRestore(selections, mediaUuid);
+}
+
+async function runRestore(selections, mediaUuid) {
+    const c = document.getElementById('restore-results');
+    c.innerHTML = createLoading();
+    try {
+        const res = await api.restoreDatasets(selectedSetId, selections, mediaUuid);
+        const rows = res.results || [];
+        c.innerHTML = `
+            <table class="data-table">
+                <thead><tr><th>Source</th><th>Target</th><th>Status</th></tr></thead>
+                <tbody>${rows.map(r => `
+                    <tr><td><code>${escapeHtml(r.source)}</code></td><td><code>${escapeHtml(r.target)}</code></td>
+                    <td>${r.status === 'success' ? '<span class="status-online">success</span>' : '<span class="status-faulted" title="' + escapeHtml(r.error || '') + '">failed</span>'}</td></tr>`).join('')}
+                </tbody>
+            </table>`;
+        showAlert('Restore finished', 'success');
+    } catch (e) {
+        c.innerHTML = createErrorState('Restore failed: ' + e.message);
+    }
+}
+
+// ── Step 5: finish ───────────────────────────────────────────────────
+async function adoptMedia() {
+    try {
+        const res = await api.adoptSetMedia(selectedSetId);
+        document.getElementById('finish-note').innerHTML =
+            '<p class="text-success">' + escapeHtml(res.message || (res.adopted ? 'Backup volume adopted' : 'Already declared')) + '</p>';
+    } catch (e) {
+        document.getElementById('finish-note').innerHTML = '<p class="text-danger">' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+async function rebuildSchedules() {
+    try {
+        await api.rebuildSetSchedules(selectedSetId);
+        document.getElementById('finish-note').innerHTML = '<p class="text-success">Schedules reconciled.</p>';
+    } catch (e) {
+        document.getElementById('finish-note').innerHTML = '<p class="text-danger">' + escapeHtml(e.message) + '</p>';
+    }
+}
+</script>
+{% endblock %}

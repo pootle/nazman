@@ -480,18 +480,41 @@ class DiskManager:
         device_path = self.live_device_path(disk, action="partition")
 
         await self._reset_partition_table(device_path)
+        await self._apply_partition_specs(device_path, partitions_spec)
 
+        return {"disk_id": disk.id, "device_name": get_device_name(disk) or disk.model or disk.serial, "success": True}
+
+    async def recreate_partition_layout(
+        self, db: Session, disk_id: int, partitions_spec: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Recreate a disk's GPT layout, preserving recorded slot UUIDs.
+
+        Used during a system rebuild so partition-based pool vdevs resolve to
+        the same ``nazman:<uuid>`` slots recorded in the backup manifest.  Each
+        spec is ``{"size_mb": int|None, "slot_uuid": str}``; a missing slot UUID
+        is generated.
+        """
+        disk = await self._assert_writable(db, disk_id)
+        device_path = self.live_device_path(disk, action="recreate partition layout")
+        await self._reset_partition_table(device_path)
+        await self._apply_partition_specs(device_path, partitions_spec, preserve_uuids=True)
+        return {
+            "disk_id": disk.id,
+            "device_name": get_device_name(disk) or disk.model or disk.serial,
+            "success": True,
+        }
+
+    async def _apply_partition_specs(
+        self, device_path: str, partitions_spec: List[Dict[str, Any]],
+        preserve_uuids: bool = False,
+    ) -> None:
+        """Create partitions and write their ``nazman:<slot_uuid>`` GPT labels."""
         partition_number = 1
         current_sector = 2048
-
         for spec in partitions_spec:
             size_mb = spec.get("size_mb")
-
             start_sector = current_sector
-            if size_mb:
-                end_sector = start_sector + (size_mb * 2048)
-            else:
-                end_sector = -1
+            end_sector = start_sector + (size_mb * 2048) if size_mb else -1
 
             if end_sector == -1:
                 await run_command([
@@ -504,15 +527,12 @@ class DiskManager:
                     f"{start_sector}s", f"{end_sector}s"
                 ], timeout=60)
 
-            slot_uuid = str(uuid.uuid4())
-            await write_slot_uuid(device_path, partition_number, slot_uuid)
+            slot_uuid = spec.get("slot_uuid") if preserve_uuids else None
+            await write_slot_uuid(device_path, partition_number, slot_uuid or str(uuid.uuid4()))
 
             if end_sector != -1:
                 current_sector = end_sector + 1
-
             partition_number += 1
-
-        return {"disk_id": disk.id, "device_name": get_device_name(disk) or disk.model or disk.serial, "success": True}
 
     async def batch_wipe_disks(self, db: Session, disk_ids: List[int]) -> List[Dict[str, Any]]:
         """Wipe partition tables from multiple disks (no new partitions created)."""

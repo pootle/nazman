@@ -305,6 +305,36 @@ async def list_disk_streams(
     return await zfs_backup_manager.list_stream_files(db, backup_disk_id)
 
 
+@router.get("/disks/{backup_disk_id}/manifest", response_model=dict)
+async def get_disk_manifest(
+    backup_disk_id: int,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    """The volume's aggregate backup manifest (pools, datasets, config)."""
+    try:
+        return await zfs_backup_manager.get_volume_manifest(db, backup_disk_id)
+    except Exception as e:
+        logger.error("get_manifest failed for disk %s: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/disks/{backup_disk_id}/rebuild-manifest", response_model=dict)
+async def rebuild_disk_manifest(
+    backup_disk_id: int,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    """Regenerate the manifest by scanning streams and sidecars on the volume."""
+    try:
+        return await zfs_backup_manager.rebuild_manifest(db, backup_disk_id)
+    except Exception as e:
+        logger.error("rebuild_manifest failed for disk %s: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/restore-file")
 async def restore_from_file(
     req: RestoreFileRequest,

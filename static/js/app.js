@@ -87,6 +87,11 @@ function refreshCurrentPage() {
                 loadBackupPage();
             }
             break;
+        case '/restore':
+            if (typeof loadRestorePage === 'function') {
+                loadRestorePage();
+            }
+            break;
         case '/monitoring':
             if (typeof loadMonitoringPage === 'function') {
                 loadMonitoringPage();

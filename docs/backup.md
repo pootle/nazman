@@ -1,38 +1,37 @@
 # Set Up Backups
 
-NAZMan protects you at two levels:
+NAZMan protects you at two levels, both stored on your **external backup
+disks**:
 
-1. **Configuration backup** — the app's own settings, stored in a git repo.
-2. **Data backup** — full and incremental streams of your datasets, sent to a
-   declared **external backup disk**.
+1. **Configuration backup** — a bundle of the app's database and host config.
+2. **Data backup** — full and incremental streams of your datasets.
 
-Both live on the **Backup** page (titled *Configuration Backup*).
+Backups live on the **Backup** page; recovery lives on the separate
+[Restore](restore) page.
 
-## 1. Configuration backup (git)
+## 1. Configuration backup
 
-### Enable it
+Every backup volume carries its own configuration bundle, so any single disk
+can rebuild the whole system. A bundle contains:
 
-The repository lives at a path set in the server config (`backup_repo_path`).
-On this page, the **Backup Status** card shows **Repository:** **Initialized**
-or **Not Initialized**, the **Path:**, and **Last Backup:** (**Never** before
-the first).
+- a consistent snapshot of the NAZMan database,
+- `/etc/exports` and the NFS server defaults,
+- `zpool status`/`zpool get` exports and `sfdisk` partition tables.
 
-- Click **Backup Now** to make a manual commit now (optional commit message).
-- **Uncommitted Changes:** **Yes** means settings changed since the last
-  commit — click **Backup Now** to capture them.
+Bundles are written **automatically**, never to a local path:
 
-### History and restore
+- when a backup disk is declared/formatted, the new volume is seeded with the
+  current configuration, and
+- after every successful dataset backup, so a volume used for data always
+  carries the matching configuration.
 
-- **Backup History** lists commits: **Commit** (8-char hash), **Message**,
-  **Files Changed**, **Date**.
-- **Restore Configuration** rolls the app's configuration back to a previous
-  commit: pick the backup in **Select Backup:**, click **Restore**, and confirm
-  *twice* (it overwrites the current configuration).
+There is no separate "configuration backup" button. To see what a volume
+holds, use its **Manifest** action in the **Backup Disks** card. Old bundles
+are pruned to a retention count (`backup_config_retention`, default 5) per
+volume.
 
-> **Warning:** The configuration backup stores *settings* (and which datasets
-
-> are shared/backed up), **not** the pools' data. Restoring it does not touch
-> your files.
+> **Info:** Restoring a configuration bundle overwrites the running
+> configuration. It is done from the [Restore](restore) page.
 
 ## 2. Data backup — declare a backup disk
 
@@ -84,6 +83,11 @@ accurate numbers.
 - **Wake / Replug** — force a sleeping or dropped USB disk to re-enumerate
   (software reset, no power cycle). Shown for **Not connected** disks.
 - **Scan** — re-probe the disk and refresh status/capacity.
+- **Manifest** — view the backup info (pools, datasets, config bundles) stored
+  on the volume. Each volume keeps a `nazman-backup.json` index plus a
+  self-describing sidecar beside every stream.
+- **Rebuild** — regenerate the manifest by scanning the streams and sidecars on
+  the volume (useful if the index was lost).
 - **Unmount after backup** checkbox — if ticked, NAZMan unmounts the disk after
   each backup/restore so it can be unplugged safely.
 - **Remove** — deregisters the disk from NAZMan. Files on the disk are
@@ -111,19 +115,14 @@ The status badge per block shows **running…**, **last OK**, **last failed**, o
 **no runs yet**. **Changed since full** shows how much has changed since the
 last anchoring full, and **Last backup** shows the latest run.
 
-> **Note:** **/data is mounted** — freshly declared disks that were formatted
-> whole-unmounted first make no changes until you run a backup or mount them.
-
-## 4. Backup runs and restore
+## 4. Backup runs
 
 The **Backup Runs** card lists every run — **Dataset**, **Type** (full/incr),
 **Status** (`success`, `running`, `failed`), **Stream Size**, **Changed**,
-**Snapshot** (the snapshot sent), **Date**, and **Restore**.
+**Snapshot** (the snapshot sent), and **Date**. Each stream is checksummed
+(SHA-256) and recorded in the volume manifest.
 
-- **Restore** on a run recreates that dataset from the run's stream. It asks
-  twice because it **overwrites the live dataset** with the backup stream.
-
-See [Recover a Dataset](recover-dataset) for the full workflow.
+To restore a dataset, use the [Restore](restore) page.
 
 > **Info:** If full/incremental crons are enough, backups run unattended. The
 > UI refreshes run status every 5 seconds while a run is in progress, so you
@@ -136,4 +135,4 @@ stream). A disk fills up only when a full no longer fits. If a backup disk
 reports **Full**, thin out old stream files or use a larger disk for the next
 full.
 
-Next: [Handle a Disk Failure](disk-failure)
+Next: [Restore & Rebuild](restore)

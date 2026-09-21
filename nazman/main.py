@@ -14,7 +14,8 @@ from .wiring import get_container
 from .api import (
     disks_router, pools_router, datasets_router,
     nfs_router, smb_router, snapshots_router, backup_router, zfs_backup_router,
-    system_router, health_router, metrics_router, auth_router,
+    system_restore_router,
+    system_router, health_router, metrics_router, auth_router, alerts_router,
 )
 
 # Get application settings
@@ -34,6 +35,9 @@ async def lifespan(app: FastAPI):
     await container.scheduler.start()
     await container.metrics.start()
 
+    # Start the alert poller (no-op while alerting is disabled).
+    await container.alerts.start()
+
     # Initialise + prune the persistent command log store.
     from .utils.command_log_store import command_log_store
     command_log_store.connect()
@@ -43,6 +47,7 @@ async def lifespan(app: FastAPI):
 
     await container.scheduler.stop()
     await container.metrics.stop()
+    await container.alerts.stop()
     container.metrics_store.close()
 
     from .utils.command_log_store import command_log_store
@@ -95,8 +100,10 @@ app.include_router(smb_router)
 app.include_router(snapshots_router)
 app.include_router(backup_router)
 app.include_router(zfs_backup_router)
+app.include_router(system_restore_router)
 app.include_router(metrics_router)
 app.include_router(auth_router)
+app.include_router(alerts_router)
 
 
 # Web UI routes
@@ -152,6 +159,12 @@ async def snapshots_page(request: Request):
 async def backup_page(request: Request):
     """Backup management page."""
     return templates.TemplateResponse(request, "backup.html")
+
+
+@app.get("/restore", response_class=HTMLResponse)
+async def restore_page(request: Request):
+    """Restore / system rebuild page."""
+    return templates.TemplateResponse(request, "restore.html")
 
 
 @app.get("/settings", response_class=HTMLResponse)

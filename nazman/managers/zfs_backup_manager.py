@@ -19,6 +19,7 @@ from ..utils.devices import (
     os_reserved_partition_names, kernel_base_name,
 )
 from ..utils import zfs_query
+from ..utils import backup_manifest as bm
 from ..models.disk import Disk
 from ..models.backup_zfs import BackupDisk, BackupSchedule, BackupRun
 from ..models.scheduler import ScheduledTask, TaskType
@@ -62,12 +63,13 @@ class ZfsBackupManager:
     prunes it only after the next incremental is successfully written.
     """
 
-    def __init__(self, zfs=None, scheduler=None):
+    def __init__(self, zfs=None, scheduler=None, backup=None):
         self.settings = get_settings()
         # Collaborators injected at wiring time (constructor injection keeps
         # the manager independently testable and free of import cycles).
         self.zfs = zfs
         self.scheduler = scheduler
+        self.backup = backup
         self._pending_declares: Dict[int, Dict[str, Any]] = {}
         self._declare_tasks: set = set()
         self._backup_tasks: set = set()
@@ -370,9 +372,26 @@ class ZfsBackupManager:
         db.add(rec)
         db.commit()
         db.refresh(rec)
+        await self._seed_volume(db, rec)
         if rec.unmount_after_backup:
             await self._unmount_rec(rec)
         return await self.serialize_now(rec)
+
+    async def _seed_volume(self, db: Session, rec: BackupDisk) -> None:
+        """Seed a freshly declared volume with the current configuration.
+
+        Falls back to an empty manifest when no backup manager is injected, so
+        the volume is discoverable on a fresh install either way.
+        """
+        if self.backup is not None:
+            try:
+                await self.backup.capture_config_bundle(
+                    db, rec.mount_point, media=self._media_identity(rec),
+                )
+                return
+            except Exception as e:
+                logger.warning("failed to seed config bundle on %s: %s", rec.mount_point, e)
+        self._write_initial_manifest(rec)
 
     def _partition_number(self, dev: str) -> int:
         """Parse the partition number from a by-id (-partN) or kernel path."""
@@ -973,6 +992,8 @@ class ZfsBackupManager:
                 return
 
             run.size_bytes = Path(stream_file).stat().st_size if Path(stream_file).exists() else 0
+            if Path(stream_file).exists():
+                run.sha256 = await asyncio.to_thread(bm.sha256_file, stream_file)
             run.base_snapshot = base_snapshot
             run.full_anchor = full_anchor
             if backup_type == "incremental":
@@ -988,6 +1009,19 @@ class ZfsBackupManager:
                 await self._prune_old_anchors(run.dataset_name, snap)
             else:
                 await self._prune_old_anchors(run.dataset_name, snap, keep_full=snap)
+
+            # Persist self-describing metadata and snapshot the config on this
+            # volume so the disk can rebuild the whole system on its own.
+            run.phase = None
+            db.commit()
+            await self._record_manifest(db, run, rec)
+            if self.backup is not None:
+                try:
+                    await self.backup.capture_config_bundle(
+                        db, rec.mount_point, media=self._media_identity(rec),
+                    )
+                except Exception as e:
+                    logger.warning("config capture on volume failed: %s", e)
             return
 
         except Exception as e:
@@ -1088,6 +1122,125 @@ class ZfsBackupManager:
 
     def _snap_ts(self, snapshot: str) -> str:
         return snapshot.rsplit("@", 1)[-1].replace(BACKUP_SNAP_PREFIX, "")
+
+    # ── Backup manifest ─────────────────────────────────────────────────
+    def _media_identity(self, rec: BackupDisk) -> Dict[str, Any]:
+        disk = rec.disk
+        return bm.media_identity(
+            fs_uuid=rec.fs_uuid, label=rec.label,
+            by_id=disk.by_id if disk else None,
+            serial=disk.serial if disk else None,
+            size_bytes=disk.size_bytes if disk else None,
+            mount_point=rec.mount_point,
+        )
+
+    def _relative_stream(self, rec: BackupDisk, stream_file: str) -> str:
+        try:
+            return str(Path(stream_file).relative_to(rec.mount_point))
+        except (ValueError, TypeError):
+            return stream_file
+
+    def _write_initial_manifest(self, rec: BackupDisk) -> None:
+        """Seed an empty manifest on a freshly declared volume."""
+        try:
+            manifest = bm.scan_volume(
+                rec.mount_point, media=self._media_identity(rec),
+                nazman_version=self.settings.app_version,
+            )
+            bm.save_manifest(rec.mount_point, manifest)
+        except Exception as e:
+            logger.warning("failed to write initial manifest on %s: %s", rec.mount_point, e)
+
+    async def _record_manifest(self, db: Session, run: BackupRun, rec: BackupDisk) -> None:
+        """Write the per-stream sidecar and update the volume's aggregate manifest."""
+        try:
+            manifest = bm.scan_volume(
+                rec.mount_point, media=self._media_identity(rec),
+                nazman_version=self.settings.app_version,
+            )
+            if self.zfs is not None:
+                try:
+                    bm.merge_pools(manifest, await self.zfs.get_pool_recreate_specs(db))
+                except Exception:
+                    pass
+                try:
+                    dataset = await self.zfs.get_dataset_spec(run.dataset_name)
+                except Exception:
+                    dataset = {
+                        "name": run.dataset_name,
+                        "pool": run.dataset_name.split("/", 1)[0],
+                        "properties": {},
+                    }
+            else:
+                dataset = {
+                    "name": run.dataset_name,
+                    "pool": run.dataset_name.split("/", 1)[0],
+                    "properties": {},
+                }
+
+            run_entry = {
+                "type": run.backup_type,
+                "stream_file": self._relative_stream(rec, run.stream_file or ""),
+                "snapshot": run.snapshot,
+                "base_snapshot": run.base_snapshot,
+                "full_anchor": run.full_anchor,
+                "size_bytes": run.size_bytes,
+                "sha256": run.sha256,
+                "created_at": (run.completed_at or datetime.now(timezone.utc)).isoformat(),
+                "media_fs_uuid": rec.fs_uuid,
+                "media_label": rec.label,
+            }
+            bm.upsert_dataset_backup(manifest, dataset, run_entry)
+            bm.save_manifest(rec.mount_point, manifest)
+            if run.stream_file:
+                bm.write_sidecar(run.stream_file, {
+                    "kind": "dataset", "dataset": dataset, "run": run_entry,
+                })
+        except Exception as e:
+            logger.warning("failed to update backup manifest for run %s: %s", run.id, e)
+
+    async def get_volume_manifest(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
+        """Read (or reconstruct) a volume's aggregate manifest."""
+        rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
+        if not rec:
+            raise BackupDiskNotFoundError("Backup disk not found")
+        was_mounted = Path(rec.mount_point).is_mount()
+        if not was_mounted:
+            await self.mount_backup_disk(db, backup_disk_id)
+        try:
+            manifest = bm.load_manifest(rec.mount_point)
+            if manifest is None:
+                manifest = bm.scan_volume(
+                    rec.mount_point, media=self._media_identity(rec),
+                    nazman_version=self.settings.app_version,
+                )
+            return manifest
+        finally:
+            if not was_mounted:
+                await self._restore_idle_state(rec)
+
+    async def rebuild_manifest(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
+        """Regenerate a volume's manifest by scanning streams and sidecars."""
+        rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
+        if not rec:
+            raise BackupDiskNotFoundError("Backup disk not found")
+        if not Path(rec.mount_point).is_mount():
+            await self.mount_backup_disk(db, backup_disk_id)
+        try:
+            manifest = bm.build_from_sidecars(
+                rec.mount_point, media=self._media_identity(rec),
+                nazman_version=self.settings.app_version,
+            )
+            if self.zfs is not None:
+                try:
+                    bm.merge_pools(manifest, await self.zfs.get_pool_recreate_specs(db))
+                except Exception:
+                    pass
+            bm.save_manifest(rec.mount_point, manifest)
+            return manifest
+        finally:
+            await self._restore_idle_state(rec)
+
     # -- schedule synchronization ---------------------------------------------
     async def sync_scheduled_tasks(self, db: Session) -> None:
         """Reconcile backup_schedules rows into ScheduledTask (ZFS_BACKUP) jobs.
@@ -1199,18 +1352,34 @@ class ZfsBackupManager:
                 f"Stream file must reside under a registered backup disk's data directory"
             )
 
+        try:
+            return await self.receive_stream(str(fp), target_dataset, force=force)
+        finally:
+            await self._restore_idle_state(owner)
+
+    async def receive_stream(
+        self, stream_file: str, target_dataset: str, force: bool = False
+    ) -> Dict[str, Any]:
+        """Replay a gzip-compressed ZFS send stream into ``target_dataset``.
+
+        Owner-agnostic: the caller is responsible for mounting the media and
+        cleaning up idle state, so this also serves restores on a fresh install
+        where no ``BackupDisk`` row exists.
+        """
+        validate_dataset_name(target_dataset)
+        fp = Path(stream_file)
+        if not fp.exists():
+            raise BackupError(f"Stream file not found: {stream_file}")
+
         receive_cmd = ["zfs", "receive"]
         if force:
             receive_cmd.append("-F")
         receive_cmd.append(target_dataset)
 
-        try:
-            _, stderr, rc = await run_pipeline(
-                [["gunzip", "-c", str(fp)], receive_cmd],
-                timeout=86400, check=False, op="write", category="zfs",
-            )
-        finally:
-            await self._restore_idle_state(owner)
+        _, stderr, rc = await run_pipeline(
+            [["gunzip", "-c", str(fp)], receive_cmd],
+            timeout=86400, check=False, op="write", category="zfs",
+        )
         if rc != 0:
             raise BackupError(f"Restore failed: {stderr}")
         return {"dataset": target_dataset, "source": str(fp), "force": force}

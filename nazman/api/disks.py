@@ -103,6 +103,15 @@ class PartitionDiskRequest(BaseModel):
     partitions: List[PartitionRequest]
 
 
+class RecreatePartitionRequest(BaseModel):
+    size_mb: Optional[int] = None  # None = rest of disk
+    slot_uuid: Optional[str] = None  # recorded nazman:<uuid>; generated if absent
+
+
+class RecreatePartitionsRequest(BaseModel):
+    partitions: List[RecreatePartitionRequest]
+
+
 class BatchPartitionRequest(BaseModel):
     disk_ids: List[int]
     partitions: List[PartitionRequest]
@@ -198,6 +207,26 @@ async def partition_disk(
 
     # Read back the result
     return DiskPartitionsResponse(**await disk_view.partitions(db, disk_id))
+
+
+@router.post("/{disk_id}/recreate-partitions")
+async def recreate_partitions(
+    disk_id: int,
+    request: RecreatePartitionsRequest,
+    db: Session = Depends(get_db),
+    disk_manager: DiskManager = Depends(get_disk_manager),
+):
+    """Recreate a GPT layout, preserving recorded ``nazman:<uuid>`` slot labels.
+
+    Used during a system rebuild so partition-based pool vdevs resolve to the
+    same slots recorded in the backup manifest.  Destructive: wipes the disk.
+    """
+    try:
+        return await disk_manager.recreate_partition_layout(
+            db, disk_id, [p.model_dump() for p in request.partitions]
+        )
+    except DiskError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/batch-partition")

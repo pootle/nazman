@@ -47,7 +47,7 @@ def init_db():
         conn.commit()
 
     # Create all tables (adds any new columns the model defines)
-    from .models import pool, disk, backup, scheduler, backup_zfs
+    from .models import pool, disk, scheduler, backup_zfs, alert
     Base.metadata.create_all(bind=engine)
 
 

@@ -17,7 +17,8 @@ data, sharing, protection, and — when something goes wrong — recovery.
 | **Datasets** | Create and configure ZFS datasets (compression, quotas, record size) |
 | **NFS / SMB** | Share datasets over the network, restrict clients, pause/remove shares |
 | **Snapshots** | Take and destroy point-in-time snapshots of datasets |
-| **Backup** | Git-based configuration backups **and** full/incremental dataset backups to external disks |
+| **Backup** | Full/incremental dataset backups to external disks, with the configuration captured on each volume |
+| **Restore** | Restore configuration/datasets and rebuild a complete system from the backup disks |
 | **Command Log** | Every command NAZMan runs, with success/failure status (useful when diagnosing) |
 | **Settings** | System information card |
 
@@ -30,8 +31,9 @@ These pages are covered in detail next:
 2. [Create a dataset](datasets) — carve storage out of the pool with compression
    and quotas.
 3. [Share data](shares) — expose datasets over NFS and/or SMB.
-4. [Set up backups](backup) — configure the git repository for config, then
-   declare an external backup disk and schedule dataset backups.
+4. [Set up backups](backup) — declare an external backup disk (it is seeded
+   with the configuration automatically) and schedule dataset backups. Use
+   [Restore](restore) to recover or rebuild.
 
 ## Reading this guide
 

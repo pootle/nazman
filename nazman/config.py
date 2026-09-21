@@ -14,13 +14,10 @@ class Settings(BaseSettings):
     database_path: str = "/var/lib/nazman/nazman.db"
     
     # Backup
-    backup_enabled: bool = True
-    backup_repo_path: str = "/mnt/backup/nazman-config"
-    backup_auto_commit: bool = True
-    backup_push_on_commit: bool = True
     backup_mount_base: str = "/mnt/backup"  # parent dir under which backup disks are mounted
     backup_gzip_level: int = 6
     backup_full_margin: float = 1.2  # capacity safety margin multiplier for full backups
+    backup_config_retention: int = 5  # config bundles kept per backup volume
     
     # Auth
     auth_enabled: bool = True
@@ -31,6 +28,14 @@ class Settings(BaseSettings):
     monitoring_history_size: int = 12
     monitoring_enable_websocket: bool = True
     network_interface: str = ""
+
+    # Alerting (Telegram)
+    alerts_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    alert_pool_usage_threshold: int = 90
+    alert_cooldown_minutes: int = 60
+    alerts_poll_interval: int = 60
 
     # Metrics logging (per-pool disk + system metrics to disk)
     metrics_log_enabled: bool = False
@@ -154,10 +159,5 @@ def ensure_directories():
         # Metrics log directory
         metrics_dir = Path(settings.metrics_log_path).parent
         metrics_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Backup directory
-        if settings.backup_enabled:
-            backup_dir = Path(settings.backup_repo_path)
-            backup_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         pass

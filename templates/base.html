@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}NAZMan{% endblock %}</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=6">
+    <link rel="stylesheet" href="/static/css/style.css?v=7">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     {% block head_extra %}{% endblock %}
 </head>
@@ -68,6 +68,12 @@
                     <a href="/backup" class="nav-link {% if request.url.path == '/backup' %}active{% endif %}">
                         <i class="fas fa-save"></i>
                         <span>Backup</span>
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/restore" class="nav-link {% if request.url.path == '/restore' %}active{% endif %}">
+                        <i class="fas fa-rotate-left"></i>
+                        <span>Restore</span>
                     </a>
                 </li>
                 <li class="nav-item">
@@ -146,9 +152,9 @@
     </div>
 
     <script src="/static/js/charts.js?v=3"></script>
-    <script src="/static/js/api.js?v=5"></script>
+    <script src="/static/js/api.js?v=6"></script>
     <script src="/static/js/components.js?v=4"></script>
-    <script src="/static/js/app.js?v=4"></script>
+    <script src="/static/js/app.js?v=5"></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

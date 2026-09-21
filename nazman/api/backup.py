@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List
 from pydantic import BaseModel
 
 from ..database import get_db
@@ -11,54 +11,17 @@ from ..wiring import get_backup_manager
 router = APIRouter(prefix="/api/backup", tags=["backup"], dependencies=[Depends(get_current_user)])
 
 
-class BackupCommitResponse(BaseModel):
-    id: int
-    commit_hash: str
-    commit_message: str
-    author: str
-    files_changed: int
-    
-    model_config = {"from_attributes": True}
-
-
-class BackupStatusResponse(BaseModel):
-    repo_exists: bool
-    repo_path: str
-    last_commit: Optional[dict]
-    has_uncommitted_changes: bool
-    backup_enabled: bool
-
-
 class RestoreRequest(BaseModel):
     commit_hash: str
 
 
-@router.get("/status", response_model=BackupStatusResponse)
-async def get_backup_status(
-    backup_manager: BackupManager = Depends(get_backup_manager),
-):
-    """Get backup system status."""
-    return await backup_manager.get_backup_status()
-
-
-@router.get("/history", response_model=List[BackupCommitResponse])
-async def get_backup_history(
-    limit: int = 50,
+@router.get("/bundles", response_model=List[dict])
+async def list_config_bundles(
     db: Session = Depends(get_db),
     backup_manager: BackupManager = Depends(get_backup_manager),
 ):
-    """Get backup commit history."""
-    return await backup_manager.get_backup_history(db, limit)
-
-
-@router.post("/backup", response_model=BackupCommitResponse)
-async def create_backup(
-    message: Optional[str] = None,
-    db: Session = Depends(get_db),
-    backup_manager: BackupManager = Depends(get_backup_manager),
-):
-    """Create a new backup."""
-    return await backup_manager.backup_configuration(db, message)
+    """Config bundles available across all declared backup volumes, newest first."""
+    return backup_manager.find_config_bundles(db)
 
 
 @router.post("/restore")
@@ -67,9 +30,8 @@ async def restore_backup(
     db: Session = Depends(get_db),
     backup_manager: BackupManager = Depends(get_backup_manager),
 ):
-    """Restore configuration from a specific commit."""
+    """Restore configuration from the bundle with the given id."""
     success = await backup_manager.restore_configuration(db, request.commit_hash)
     if success:
-        return {"message": f"Configuration restored from commit {request.commit_hash}"}
-    else:
-        return {"message": "Restore failed"}
+        return {"message": f"Configuration restored from bundle {request.commit_hash}"}
+    return {"message": "Restore failed"}

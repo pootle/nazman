@@ -1,5 +1,6 @@
 from typing import List, Optional, Dict, Any
 import json
+import re
 from sqlalchemy.orm import Session
 
 from ..models.pool import Pool
@@ -7,6 +8,7 @@ from ..models.disk import Disk
 from ..utils.commands import run_zpool, run_zfs
 from ..utils.devices import (
     read_slot_uuids, resolve_slot_to_device, get_device_path, get_device_name,
+    partition_by_id, kernel_base_name,
 )
 from ..utils.exceptions import (
     PoolError, PoolNotFoundError, DatasetError, DatasetNotFoundError, ValidationError,
@@ -503,6 +505,157 @@ class ZfsManager:
             if isinstance(e, PoolError):
                 raise
             raise PoolError(f"Error getting pool status: {str(e)}")
+
+    async def _get_pool_ashift(self, pool_name: str) -> int:
+        """Pool-level ashift as an int (0 when ZFS reports the default)."""
+        stdout, _, rc = await run_zpool(
+            "get", "-Hp", "-o", "value", "ashift", pool_name, check=False, op="read",
+        )
+        if rc != 0:
+            return 0
+        try:
+            return int(stdout.strip())
+        except ValueError:
+            return 0
+
+    async def _slot_uuid_map(self, db: Session) -> Dict[str, Dict[str, Any]]:
+        """Map every present partition's by-id path to its slot identity.
+
+        Values are ``{slot_uuid, size_bytes, partition_number}`` so a rebuild can
+        reproduce the exact ``nazman:<uuid>`` GPT layout before pool create.
+        """
+        disks = db.query(Disk).all()
+        live = [get_device_path(d) for d in disks]
+        live = [p for p in live if p]
+        info = await read_slot_uuids(live)
+        result: Dict[str, Dict[str, Any]] = {}
+        for disk in disks:
+            path = get_device_path(disk)
+            if not path:
+                continue
+            for part in info.get(path, {}).get("partitions", []):
+                m = re.search(r"(\d+)$", part.get("name") or "")
+                if not m or not part.get("slot_uuid"):
+                    continue
+                number = int(m.group(1))
+                dev = partition_by_id(disk.by_id, number)
+                if dev:
+                    result[dev] = {
+                        "slot_uuid": part["slot_uuid"],
+                        "size_bytes": part.get("size_bytes", 0),
+                        "partition_number": number,
+                    }
+        return result
+
+    @staticmethod
+    def _resolve_disk_for_leaf(db: Session, leaf: str) -> Optional[Disk]:
+        """Resolve a zpool-reported leaf device to its ``Disk`` row."""
+        if not leaf:
+            return None
+        if leaf.startswith("/dev/disk/by-id/"):
+            m = re.search(r"-part(\d+)$", leaf)
+            base = leaf[:m.start()] if m else leaf
+            return db.query(Disk).filter(Disk.by_id == base).first()
+        # Bare by-id basename (zpool drops the directory prefix).
+        disk = db.query(Disk).filter(Disk.by_id == f"/dev/disk/by-id/{leaf}").first()
+        if disk:
+            return disk
+        # Kernel name (e.g. sda1, nvme0n1p2): match against the live device map.
+        base = kernel_base_name(leaf)
+        for d in db.query(Disk).all():
+            path = get_device_path(d)
+            if not path:
+                continue
+            if path == f"/dev/{leaf}" or kernel_base_name(path.rsplit("/", 1)[-1]) == base:
+                return d
+        return None
+
+    async def get_pool_recreate_specs(self, db: Session) -> List[Dict[str, Any]]:
+        """Pool/vdev topology needed to recreate every imported pool.
+
+        Each pool is ``{name, ashift, vdevs:[{role, topology, ashift,
+        devices:[{by_id, serial, size_bytes, slot_uuid, partition_number,
+        partition_size_bytes}]}]}``.  Device identity is stored as by-id +
+        serial + size so a moved disk can be matched on new hardware even if its
+        by-id path changes.  Partitioned vdevs also carry the slot UUID and the
+        partition's size so the GPT layout can be reproduced on the new disk.
+        """
+        slot_map = await self._slot_uuid_map(db)
+        specs: List[Dict[str, Any]] = []
+        for pool_name in self.list_pool_names(db):
+            try:
+                status = await self.get_pool_status(pool_name)
+            except Exception:
+                continue
+            ashift = await self._get_pool_ashift(pool_name)
+            vdevs: List[Dict[str, Any]] = []
+            for role, key in (
+                ("data", "data_vdevs"), ("special", "special_vdevs"),
+                ("log", "log_vdevs"), ("cache", "cache_vdevs"),
+            ):
+                for vdev in status.get(key, []):
+                    topology = vdev.get("type") or "stripe"
+                    if topology in ("root", ""):
+                        topology = "stripe"
+                    devices = []
+                    for child in vdev.get("children", []):
+                        leaf = child.get("path") or child.get("name") or ""
+                        disk = self._resolve_disk_for_leaf(db, leaf)
+                        if not disk:
+                            continue
+                        slot = slot_map.get(leaf) if leaf.startswith("/") else None
+                        devices.append({
+                            "by_id": disk.by_id,
+                            "serial": disk.serial,
+                            "size_bytes": disk.size_bytes,
+                            "slot_uuid": slot["slot_uuid"] if slot else None,
+                            "partition_number": slot["partition_number"] if slot else None,
+                            "partition_size_bytes": slot["size_bytes"] if slot else None,
+                        })
+                    if devices:
+                        vdevs.append({
+                            "role": role, "topology": topology,
+                            "ashift": ashift, "devices": devices,
+                        })
+            specs.append({"name": pool_name, "ashift": ashift, "vdevs": vdevs})
+        return specs
+
+    async def get_dataset_recreate_specs(self, db: Session) -> List[Dict[str, Any]]:
+        """Dataset names, owning pool, mountpoint and recreatable properties."""
+        _PROP_KEYS = (
+            "compression", "recordsize", "sync_mode", "quota",
+            "special_small_blocks", "atime", "canmount", "readonly",
+        )
+        specs: List[Dict[str, Any]] = []
+        for ds in await self.list_datasets(db):
+            name = ds.get("name")
+            if not name or "/" not in name:
+                continue
+            specs.append({
+                "name": name,
+                "pool": name.split("/", 1)[0],
+                "mountpoint": ds.get("mountpoint"),
+                "properties": {k: ds[k] for k in _PROP_KEYS if k in ds},
+            })
+        return specs
+
+    async def get_dataset_spec(self, dataset_name: str) -> Dict[str, Any]:
+        """Single dataset's recreate spec (name, pool, mountpoint, properties)."""
+        props = await self.get_dataset_properties(dataset_name)
+        mountpoint = None
+        stdout, _, rc = await run_zfs(
+            "get", "-Hp", "-o", "value", "mountpoint", dataset_name, check=False, op="read",
+        )
+        if rc == 0:
+            value = stdout.strip()
+            if value and value not in ("-", "none"):
+                mountpoint = value
+        return {
+            "name": dataset_name,
+            "pool": dataset_name.split("/", 1)[0],
+            "mountpoint": mountpoint,
+            "properties": props,
+        }
 
     async def _get_pool_compressratio(self, pool_name: str) -> Optional[float]:
         """Return the pool root dataset's compression ratio (e.g. 1.83)."""

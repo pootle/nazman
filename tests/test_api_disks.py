@@ -557,3 +557,28 @@ async def test_get_smart_details_unavailable():
     assert details["health_status"] == "unknown"
     assert details["attributes"] == []
     assert details["problems"] == ["SMART data unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_recreate_partitions_endpoint(client, db_session):
+    disk = _mk_disk()
+    db_session.add(disk)
+    db_session.commit()
+    db_session.refresh(disk)
+
+    with patch.object(DiskManager, "recreate_partition_layout", new_callable=AsyncMock,
+                      return_value={"disk_id": disk.id, "success": True}) as m:
+        resp = client.post(f"/api/disks/{disk.id}/recreate-partitions", json={
+            "partitions": [
+                {"size_mb": 100, "slot_uuid": "slot-1"},
+                {"size_mb": None, "slot_uuid": "slot-2"},
+            ]
+        })
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["success"] is True
+    assert m.await_args.args[1] == disk.id
+    assert m.await_args.args[2] == [
+        {"size_mb": 100, "slot_uuid": "slot-1"},
+        {"size_mb": None, "slot_uuid": "slot-2"},
+    ]

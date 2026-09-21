@@ -267,6 +267,35 @@ async def test_discover_marks_both_raid_mirrors_as_os_disk():
 
 
 @pytest.mark.asyncio
+async def test_recreate_partition_layout_preserves_slot_uuids(db_session):
+    """A rebuild must reproduce the recorded nazman:<uuid> slot labels so
+    partition-based vdevs resolve to the same slots as the manifest."""
+    dm = DiskManager()
+    disk = Disk(by_id="/dev/disk/by-id/ata-A", serial="SA", model="A",
+                size_bytes=1000, disk_type="hdd")
+    db_session.add(disk)
+    db_session.commit()
+
+    written = []
+
+    async def fake_write_slot_uuid(device_path, partition_number, slot_uuid):
+        written.append((device_path, partition_number, slot_uuid))
+
+    with patch.object(dm, "_assert_writable", new_callable=AsyncMock, return_value=disk), \
+         patch.object(dm, "live_device_path", return_value="/dev/sdb"), \
+         patch("nazman.managers.disk_manager.run_command", new_callable=AsyncMock,
+               return_value=("", "", 0)), \
+         patch("nazman.managers.disk_manager.write_slot_uuid", side_effect=fake_write_slot_uuid):
+        result = await dm.recreate_partition_layout(db_session, disk.id, [
+            {"size_mb": 100, "slot_uuid": "slot-1"},
+            {"size_mb": None, "slot_uuid": "slot-2"},
+        ])
+
+    assert result["success"] is True
+    assert written == [("/dev/sdb", 1, "slot-1"), ("/dev/sdb", 2, "slot-2")]
+
+
+@pytest.mark.asyncio
 async def test_read_slot_uuids_uses_partuuid_for_no_fs_partitions():
     """Partitions without a filesystem have a PARTUUID but a null UUID, so
     read_slot_uuids must key off PARTUUID or they silently disappear."""

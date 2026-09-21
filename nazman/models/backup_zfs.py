@@ -73,6 +73,7 @@ class BackupRun(Base):
     full_anchor = Column(String, nullable=True)  # full snapshot this chain derives from
     size_bytes = Column(BigInteger, default=0)  # stream file size (compressed)
     changed_bytes = Column(BigInteger, default=0)  # incremental size = changed data
+    sha256 = Column(String, nullable=True)  # checksum of the compressed stream file
     phase = Column(String, nullable=True)  # pending | snapshotting | sending | pruning
     status = Column(String, default="running")  # running | success | failed | skipped
     error = Column(String, nullable=True)

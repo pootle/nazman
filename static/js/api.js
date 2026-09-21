@@ -264,17 +264,8 @@ class NasManAPI {
     }
 
     // Backup
-    async getBackupStatus() {
-        return this.request('GET', '/api/backup/status');
-    }
-
-    async getBackupHistory(limit = 50) {
-        return this.request('GET', `/api/backup/history?limit=${limit}`);
-    }
-
-    async createBackup(message = null) {
-        const params = message ? `?message=${encodeURIComponent(message)}` : '';
-        return this.request('POST', `/api/backup/backup${params}`);
+    async listConfigBundles() {
+        return this.request('GET', '/api/backup/bundles');
     }
 
     async restoreBackup(commitHash) {
@@ -343,7 +334,15 @@ class NasManAPI {
     }
 
     async restoreBackupRun(runId, datasetName) {
-        return this.request('POST', `/api/backup-zfs/runs/${runId}/restore`, { dataset_name: datasetName });
+        return this.request('POST', `/api/backup-zfs/runs/${runId}/restore`, { target_dataset: datasetName });
+    }
+
+    async getDiskManifest(backupDiskId) {
+        return this.request('GET', `/api/backup-zfs/disks/${backupDiskId}/manifest`);
+    }
+
+    async rebuildDiskManifest(backupDiskId) {
+        return this.request('POST', `/api/backup-zfs/disks/${backupDiskId}/rebuild-manifest`);
     }
 
     async upsertBackupSchedule(payload) {
@@ -359,10 +358,75 @@ class NasManAPI {
         return this.request('GET', `/api/backup-zfs/disks/${backupDiskId}/streams`);
     }
 
-    async restoreFromFile(backupDiskId, streamFile, datasetName) {
+    async restoreFromFile(backupDiskId, streamFile, datasetName, force = false) {
         return this.request('POST', '/api/backup-zfs/restore-file', {
-            stream_file: streamFile, dataset_name: datasetName
+            stream_file: streamFile, target_dataset: datasetName, force
         });
+    }
+
+    // Disk partition layout (system rebuild)
+    async recreatePartitions(diskId, partitions) {
+        return this.request('POST', `/api/disks/${diskId}/recreate-partitions`, { partitions });
+    }
+
+    // System restore / rebuild
+    async listBackupSets() {
+        return this.request('GET', '/api/system-restore/sets');
+    }
+
+    async getBackupSet(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}`);
+    }
+
+    async planPoolMapping(setId, poolName) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/pools/${encodeURIComponent(poolName)}/plan`);
+    }
+
+    async createPoolFromBackup(setId, poolName, vdevs) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/pools/${encodeURIComponent(poolName)}/create`, { vdevs });
+    }
+
+    async getDatasetRestorePlan(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/datasets/plan`);
+    }
+
+    async getRequiredMedia(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/media`);
+    }
+
+    async restoreDatasets(setId, selections, mediaFsUuid = null) {
+        const payload = { selections };
+        if (mediaFsUuid) payload.media_fs_uuid = mediaFsUuid;
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/datasets/restore`, payload);
+    }
+
+    async restoreSetConfig(setId, configId) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/config/restore`, { config_id: configId });
+    }
+
+    async adoptSetMedia(setId) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/adopt`);
+    }
+
+    async rebuildSetSchedules(setId) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/rebuild-schedules`);
+    }
+
+    // Alerts
+    async getAlertsConfig() {
+        return this.request('GET', '/api/alerts/config');
+    }
+
+    async updateAlertsConfig(data) {
+        return this.request('PUT', '/api/alerts/config', data);
+    }
+
+    async sendTestAlert(message = null) {
+        return this.request('POST', '/api/alerts/test', { message });
+    }
+
+    async getAlertHistory(limit = 20) {
+        return this.request('GET', `/api/alerts/history?limit=${limit}`);
     }
 
     // Authentication

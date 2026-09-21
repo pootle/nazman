@@ -22,9 +22,11 @@ from .managers.zfs_backup_manager import ZfsBackupManager
 from .managers.scheduler import SchedulerManager
 from .managers.metrics_manager import MetricsManager, register_default_collectors
 from .managers.metrics_store import MetricsStore
+from .managers.alert_manager import AlertManager
 from .models.scheduler import TaskType
 from .services.destruction import DestructionService
 from .services.disk_view import DiskViewService
+from .services.system_restore import SystemRestoreService
 from .utils.exceptions import NAZManError
 
 logger = logging.getLogger(__name__)
@@ -42,8 +44,10 @@ class Container:
     scheduler: SchedulerManager
     metrics: MetricsManager
     metrics_store: MetricsStore
+    alerts: AlertManager
     destruction: DestructionService
     disk_view: DiskViewService
+    system_restore: SystemRestoreService
 
 
 def build_container() -> Container:
@@ -54,17 +58,21 @@ def build_container() -> Container:
     nfs = NfsManager()
     smb = SmbManager()
     snapshot = SnapshotManager()
-    backup = BackupManager()
-    scheduler = SchedulerManager()
-    zfs_backup = ZfsBackupManager(zfs=zfs, scheduler=scheduler)
+    backup = BackupManager(zfs=zfs)
+    alerts = AlertManager()
+    scheduler = SchedulerManager(alerter=alerts)
+    zfs_backup = ZfsBackupManager(zfs=zfs, scheduler=scheduler, backup=backup)
     metrics_store = MetricsStore()
     metrics = MetricsManager(zfs=zfs, store=metrics_store)
     register_default_collectors(metrics)
 
     destruction = DestructionService(zfs=zfs, nfs=nfs, smb=smb)
     disk_view = DiskViewService(disk=disk, zfs=zfs, zfs_backup=zfs_backup)
+    system_restore = SystemRestoreService(
+        disk=disk, zfs=zfs, zfs_backup=zfs_backup, backup=backup, scheduler=scheduler,
+    )
 
-    _register_backup_jobs(scheduler, backup, zfs_backup)
+    _register_backup_jobs(scheduler, zfs_backup)
 
     return Container(
         disk=disk,
@@ -77,21 +85,19 @@ def build_container() -> Container:
         scheduler=scheduler,
         metrics=metrics,
         metrics_store=metrics_store,
+        alerts=alerts,
         destruction=destruction,
         disk_view=disk_view,
+        system_restore=system_restore,
     )
 
 
 def _register_backup_jobs(
     scheduler: SchedulerManager,
-    backup: BackupManager,
     zfs_backup: ZfsBackupManager,
 ) -> None:
     """Bind backup task types to scheduler executors (no manager imports below)."""
     dataset_locks: dict = {}
-
-    async def run_config_backup(task, db):
-        await backup.backup_configuration(db)
 
     async def run_zfs_backup(task, db):
         config = task.config or {}
@@ -112,7 +118,6 @@ def _register_backup_jobs(
                 backup_type=backup_type,
             )
 
-    scheduler.register_executor(TaskType.BACKUP.value, run_config_backup)
     scheduler.register_executor(TaskType.ZFS_BACKUP.value, run_zfs_backup)
 
 
@@ -175,9 +180,17 @@ def get_metrics_store() -> MetricsStore:
     return get_container().metrics_store
 
 
+def get_alert_manager() -> AlertManager:
+    return get_container().alerts
+
+
 def get_destruction_service() -> DestructionService:
     return get_container().destruction
 
 
 def get_disk_view_service() -> DiskViewService:
     return get_container().disk_view
+
+
+def get_system_restore_service() -> SystemRestoreService:
+    return get_container().system_restore

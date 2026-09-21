@@ -101,6 +101,18 @@ async def test_run_backup_full_writes_successful_run(db_session, tmp_path, monke
     assert not Path(tmp_path).is_mount()
     assert ("umount", str(tmp_path)) in [tuple(c) for c in cmds]
 
+    # A self-describing manifest + sidecar are written for the volume.
+    from nazman.utils import backup_manifest as bm
+    manifest = bm.load_manifest(tmp_path)
+    assert manifest is not None
+    assert manifest["datasets"][0]["name"] == "tank/media"
+    run_entry = manifest["datasets"][0]["backups"][0]
+    assert run_entry["sha256"] == run.sha256
+    assert run_entry["stream_file"] == str(Path(run.stream_file).relative_to(tmp_path))
+    sidecar = bm.read_sidecar(run.stream_file)
+    assert sidecar["kind"] == "dataset"
+    assert sidecar["run"]["sha256"] == run.sha256
+
 
 @pytest.mark.asyncio
 async def test_run_backup_capacity_insufficient_aborts(db_session, tmp_path, monkeypatch):
@@ -291,6 +303,34 @@ async def test_declare_whole_disk_wipes_and_formats_part1(db_session, tmp_path, 
     parted = [c for c in cmds if c[0] == "parted"]
     assert any("mklabel" in c for c in parted)
     assert ("mkfs.ext4", "-F", "/dev/disk/by-id/ata-X-part1") in [tuple(c) for c in cmds]
+
+
+@pytest.mark.asyncio
+async def test_declare_seeds_config_bundle_on_new_volume(db_session, tmp_path, monkeypatch):
+    """A freshly declared volume is seeded with the configuration so it can
+    rebuild the system even before any dataset backup runs."""
+    disk = await _add_declare_disk(db_session)
+    monkeypatch.setattr(zfs_backup_manager.settings, "backup_mount_base", str(tmp_path))
+
+    backup = MagicMock()
+    backup.capture_config_bundle = AsyncMock(return_value={"id": "x"})
+
+    async def fake_run_command(cmd, **kwargs):
+        return ("", "", 0)
+
+    with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
+         patch.object(ZfsManager, "get_pool_members", new=AsyncMock(return_value={})), \
+         patch.object(zfs_backup_manager, "_ensure_unused", new=AsyncMock()), \
+         patch("nazman.managers.zfs_backup_manager.get_device_path", return_value="/dev/sdb"), \
+         patch.object(zfs_backup_manager, "backup", backup), \
+         patch.object(zfs_backup_manager, "_fs_uuid", new=AsyncMock(return_value="FSID1")):
+        await zfs_backup_manager.declare_backup_disk(
+            db_session, disk.id, confirm=True, label="Backup 1")
+
+    backup.capture_config_bundle.assert_awaited_once()
+    args = backup.capture_config_bundle.await_args.args
+    assert args[0] is db_session
+    assert str(args[1]) == str(tmp_path / "FSID1")
 
 
 @pytest.mark.asyncio

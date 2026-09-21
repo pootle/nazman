@@ -16,6 +16,24 @@
             </div>
         </div>
     </div>
+
+    <!-- Alerts / Telegram -->
+    <div class="card">
+        <div class="card-header">
+            <h2><i class="fas fa-bell"></i> Telegram Alerts</h2>
+        </div>
+        <div class="card-body">
+            <p class="help-text">
+                Send failure alerts (unhealthy pools, scrub/resilver errors, high
+                usage, failed scheduled tasks) to your phone via a Telegram bot.
+                See the <a href="/guide/alerts">guide</a> to create a bot.
+            </p>
+            <div id="alerts-config" class="form-section">
+                <p class="loading">Loading alert configuration...</p>
+            </div>
+            <div id="alert-history" class="alert-history"></div>
+        </div>
+    </div>
 </div>
 {% endblock %}
 
@@ -23,6 +41,7 @@
 <script>
 document.addEventListener('DOMContentLoaded', function() {
     loadSystemInfo();
+    loadAlertsConfig();
 });
 
 async function loadSystemInfo() {
@@ -62,6 +81,137 @@ function renderSystemInfo(status) {
             </div>
         </div>
     `;
+}
+
+async function loadAlertsConfig() {
+    try {
+        const config = await api.getAlertsConfig();
+        renderAlertsConfig(config);
+        loadAlertHistory();
+    } catch (error) {
+        console.error('Failed to load alert configuration:', error);
+        showError('alerts-config', 'Failed to load alert configuration');
+    }
+}
+
+function renderAlertsConfig(cfg) {
+    const container = document.getElementById('alerts-config');
+    container.innerHTML = `
+        <div class="settings-form">
+            <input type="hidden" id="alerts-current-token" value="${escapeHtml(cfg.telegram_bot_token)}">
+            <label class="toggle-row">
+                <input type="checkbox" id="alerts-enabled" ${cfg.enabled ? 'checked' : ''}>
+                <span>Enable alerts</span>
+            </label>
+            <div class="form-group">
+                <label for="alerts-token">Bot token</label>
+                <input type="password" id="alerts-token" value="${escapeHtml(cfg.telegram_bot_token)}"
+                       placeholder="123456789:AA...">
+            </div>
+            <div class="form-group">
+                <label for="alerts-chat">Chat id</label>
+                <input type="text" id="alerts-chat" value="${escapeHtml(cfg.telegram_chat_id)}"
+                       placeholder="123456789">
+                <p class="help-text">Your personal chat id; see the guide for how to find it.</p>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="alerts-threshold">Usage alert threshold (%)</label>
+                    <input type="number" id="alerts-threshold" min="1" max="100"
+                           value="${escapeHtml(cfg.pool_usage_threshold)}">
+                </div>
+                <div class="form-group">
+                    <label for="alerts-cooldown">Cooldown (minutes)</label>
+                    <input type="number" id="alerts-cooldown" min="0"
+                           value="${escapeHtml(cfg.cooldown_minutes)}">
+                </div>
+            </div>
+            <div class="form-actions">
+                <button type="button" id="alerts-save" class="btn btn-primary" onclick="saveAlertsConfig()">
+                    <i class="fas fa-save"></i> Save
+                </button>
+                <button type="button" id="alerts-test" class="btn" onclick="sendTestAlert()">
+                    <i class="fas fa-paper-plane"></i> Send test
+                </button>
+            </div>
+            <p id="alerts-message" class="form-status"></p>
+        </div>
+    `;
+}
+
+function showAlertStatus(text, isError) {
+    const el = document.getElementById('alerts-message');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'form-status' + (isError ? ' error' : ' success');
+}
+
+async function saveAlertsConfig() {
+    const saveBtn = document.getElementById('alerts-save');
+    const enabled = document.getElementById('alerts-enabled').checked;
+    const currentMask = document.getElementById('alerts-current-token').value;
+    let token = document.getElementById('alerts-token').value.trim();
+    const chatId = document.getElementById('alerts-chat').value.trim();
+    const threshold = parseInt(document.getElementById('alerts-threshold').value, 10);
+    const cooldown = parseInt(document.getElementById('alerts-cooldown').value, 10);
+
+    if (token === currentMask) token = null;
+
+    saveBtn.disabled = true;
+    try {
+        const cfg = await api.updateAlertsConfig({
+            enabled,
+            telegram_bot_token: token,
+            telegram_chat_id: chatId,
+            pool_usage_threshold: threshold,
+            cooldown_minutes: cooldown,
+        });
+        showAlertStatus('Alert configuration saved.', false);
+        renderAlertsConfig(cfg);
+        loadAlertHistory();
+    } catch (error) {
+        showAlertStatus(error.message, true);
+    } finally {
+        saveBtn.disabled = false;
+    }
+}
+
+async function sendTestAlert() {
+    const testBtn = document.getElementById('alerts-test');
+    testBtn.disabled = true;
+    try {
+        await api.sendTestAlert();
+        showAlertStatus('Test message sent - check your phone.', false);
+    } catch (error) {
+        showAlertStatus('Test failed: ' + error.message, true);
+    } finally {
+        testBtn.disabled = false;
+    }
+}
+
+async function loadAlertHistory() {
+    const history = document.getElementById('alert-history');
+    try {
+        const entries = await api.getAlertHistory(20);
+        history.innerHTML = `
+            <h3><i class="fas fa-list"></i> Recent alerts</h3>
+            ${entries.length === 0
+                ? '<p class="help-text">No alerts sent yet.</p>'
+                : '<table class="data-table"><thead><tr><th>Time</th><th>Event</th><th>Message</th><th>Status</th></tr></thead><tbody>' +
+                  entries.map(e => `
+                    <tr>
+                        <td>${e.created_at ? escapeHtml(new Date(e.created_at).toLocaleString()) : '&mdash;'}</td>
+                        <td>${escapeHtml(e.event_key)}</td>
+                        <td>${escapeHtml(e.message)}</td>
+                        <td class="${e.delivered ? 'status-ok' : 'status-fail'}">
+                            ${e.delivered ? 'Delivered' : 'Failed' + (e.error ? ': ' + escapeHtml(e.error) : '')}
+                        </td>
+                    </tr>`).join('') +
+                  '</tbody></table>'}
+        `;
+    } catch (error) {
+        console.error('Failed to load alert history:', error);
+    }
 }
 
 function showError(elementId, message) {

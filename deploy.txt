@@ -10,9 +10,9 @@ nazman/wiring.py
 nazman/models/__init__.py
 nazman/models/disk.py
 nazman/models/pool.py
-nazman/models/backup.py
 nazman/models/backup_zfs.py
 nazman/models/scheduler.py
+nazman/models/alert.py
 nazman/managers/__init__.py
 nazman/managers/disk_manager.py
 nazman/managers/zfs_manager.py
@@ -24,9 +24,11 @@ nazman/managers/snapshot_manager.py
 nazman/managers/metrics_manager.py
 nazman/managers/metrics_store.py
 nazman/managers/smb_manager.py
+nazman/managers/alert_manager.py
 nazman/services/__init__.py
 nazman/services/destruction.py
 nazman/services/disk_view.py
+nazman/services/system_restore.py
 
 nazman/utils/__init__.py
 nazman/utils/sizes.py
@@ -39,7 +41,9 @@ nazman/utils/command_log_store.py
 nazman/utils/guide.py
 nazman/utils/devices.py
 nazman/utils/zfs_query.py
+nazman/utils/backup_manifest.py
 nazman/utils/provisioning.py
+nazman/utils/telegram.py
 nazman/api/__init__.py
 nazman/api/auth.py
 nazman/api/disks.py
@@ -49,9 +53,11 @@ nazman/api/nfs.py
 nazman/api/snapshots.py
 nazman/api/backup.py
 nazman/api/zfs_backup.py
+nazman/api/system_restore.py
 nazman/api/system.py
 nazman/api/metrics.py
 nazman/api/smb.py
+nazman/api/alerts.py
 
 # Frontend
 static/js/api.js
@@ -69,6 +75,7 @@ templates/disks.html
 templates/nfs.html
 templates/snapshots.html
 templates/backup.html
+templates/restore.html
 templates/settings.html
 templates/dashboard.html
 templates/base.html
@@ -83,6 +90,8 @@ docs/datasets.md
 docs/shares.md
 docs/snapshots.md
 docs/backup.md
+docs/restore.md
+docs/alerts.md
 docs/disk-failure.md
 docs/recover-dataset.md
 docs/recover-system.md
@@ -112,11 +121,15 @@ tests/test_smb_manager.py
 tests/test_api_smb.py
 tests/test_command_log.py
 tests/test_zfs_backup.py
+tests/test_backup_manifest.py
+tests/test_backup_manager.py
+tests/test_system_restore.py
 tests/test_guide.py
 tests/test_sizes.py
 tests/test_database_migration.py
 tests/test_auth_coverage.py
 tests/test_api_vdevs.py
+tests/test_alerts.py
 
 # Config & deps
 requirements.txt

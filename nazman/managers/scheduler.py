@@ -9,6 +9,7 @@ from ..models.scheduler import ScheduledTask, TaskHistory, TaskType
 from ..utils.commands import run_zpool, run_zfs
 from ..utils.validation import validate_schedule
 from ..utils.exceptions import NAZManError
+from ..managers.alert_manager import AlertManager
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +25,12 @@ class SchedulerManager:
     backup managers (which would create import cycles).
     """
 
-    def __init__(self):
+    def __init__(self, alerter: Optional["AlertManager"] = None):
         self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._started = False
         self._executors: Dict[str, TaskExecutor] = {}
+        # Optional collaborator for failure notifications; injected by wiring.
+        self._alerter = alerter
 
     def register_executor(self, task_type: str, executor: TaskExecutor) -> None:
         """Bind an async ``executor(task, db)`` to a task type value."""
@@ -236,6 +239,13 @@ class SchedulerManager:
                 history.status = "failed"
                 history.error = str(e)
                 history.completed_at = datetime.now(timezone.utc)
+                if self._alerter is not None:
+                    await self._alerter.notify(
+                        f"task:{task.name}",
+                        f"Scheduled task '{task.name}' ({task.task_type} for "
+                        f"{task.target}) failed: {e}",
+                        severity="error",
+                    )
             
             db.commit()
     

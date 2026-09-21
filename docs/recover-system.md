@@ -7,10 +7,10 @@ get back to exactly where you were — configuration, pools, datasets, and share
 
 Hot tip: everything you need was created during normal operation.
 
-- **Configuration backup** — git repo on this server (path shown on the
-  **Backup** page, `backup_repo_path` in the config).
-- **Data backups** — external backup disks declared on the [Backup](backup)
-  page, containing gzip'd ZFS streams.
+- **Configuration bundles** — stored on every backup volume (database + host
+  config + pool/partition exports).
+- **Data backups** — gzip'd, checksummed ZFS streams on your external backup
+  disks, described by a self-describing manifest.
 - **The pools' disks themselves** — if the pool was created from multiple
   disks that survived (e.g. mirror/RAIDZ), the pool can be imported with all
   its data.
@@ -27,10 +27,10 @@ Hot tip: everything you need was created during normal operation.
    fresh install accepts anything; set `AUTH_PASSWORD_HASH` in
    `/etc/nazman/nazman.conf` to lock it down).
 
-## Step 2 — Import the pools
+## Step 2 — Import surviving pools (if any)
 
 If the old data disks are still in the machine, import the pool rather than
-recreating:
+recreating it:
 
 ```bash
 sudo zpool import -a        # import all exported/unattached pools
@@ -43,53 +43,43 @@ zpool status                # ONLINE?
 > `zpool import <pool>` with `-F` (force) to roll back the tail of the log —
 > allow it.
 
-If a data disk died with the system (restoring the OS disk, for example), just
-**create a fresh pool** for the new data now — see [Set Up a Pool](pools) —
-and restore datasets into it from backup in step 4.
+If the pools are gone (new disks, or all members replaced), recreate them from
+the backup manifest in step 3.
 
-## Step 3 — Restore the configuration
+## Step 3 — Rebuild from a backup disk
 
-On the **Backup** page:
+Open the **Restore** page and use the **Rebuild This System** wizard — see
+[Restore & Rebuild](restore) for the full walkthrough:
 
-1. If **Repository:** reads **Not Initialized**, the `backup_repo_path` setting
-   points at a new location — point `/etc/nazman/nazman.conf` at the old repo
-   (e.g. the OS disk backup / the same external disk) and reload.
-2. In **Restore Configuration**, pick the last good commit, click **Restore**
-   and confirm **twice**.
-3. Prefer the **most recent commit with few uncommitted changes** — click
-   **Backup History** to list them, then restore the one before the crash.
+1. **Scan disks** to find the backup info set on your backup volume.
+2. **Review** the recorded pools, vdevs, datasets and configuration.
+3. **Recreate pools** — assign attached disks to each recorded vdev slot and
+   create each pool (or skip pools you imported in step 2). Pools on partitions
+   use **Prepare partitions** to reproduce the recorded slot layout first.
+4. **Restore datasets** — choose target pools and restore; insert each backup
+   disk when prompted.
+5. **Finish** — adopt the backup media and rebuild schedules.
 
-The configuration holds the dataset/share definitions and backup layout, so
-the UI now shows your familiar pools and shares.
+You can also **Restore Configuration** from any volume's bundle at any point to
+bring back shares and settings.
 
-## Step 4 — Recreate datasets and restore data
+## Step 4 — Re-create shares
 
-1. Create the pool(s) — again see [Set Up a Pool](pools).
-2. Create the datasets you had — see [Create a Dataset](datasets).
-3. Re-declare the external backup disks — plug each one in, then
-   **Declare New Backup Disk** (use the same labels; the disk's UUID must match
-   to show **Mounted**).
-4. Restore each dataset from the mounted disks — **Restore from Backup Disk**:
-   pick the disk, pick the stream file, type the dataset name, **Restore**.
-   See [Recover a Dataset](recover-dataset).
+Restoring the configuration records your NFS/SMB settings. Re-share the
+restored datasets over NFS and SMB — see [Share Data](shares). The running
+shares themselves are re-exported when you recreate/save each one.
 
-## Step 5 — Re-create shares
+## Step 5 — Confirm and resume
 
-Re-share the restored datasets over NFS and SMB — see
-[Share Data](shares). The config restore in step 3 *recorded* these settings;
-the running shares themselves are re-exported when you recreate/save each one.
-
-## Step 6 — Restart the backup cadence
-
-- Set the **Full/Incr cron** schedules again on the **Datasets to Back Up**
-  card.
-- Trigger a **Backup Now** on the configuration backup so your restore point
-  exists.
+- Set the **Full/Incr cron** schedules again on the **Backup** page if you did
+  not rebuild them.
+- Run a dataset backup so a fresh restore point exists (the configuration is
+  captured on the volume automatically).
 - Run a scrub after a few weeks to confirm the recovered pool is healthy.
 
-> **Summary:** OS back → pools imported → config restored → datasets back from
-> external backup disks → shares recreated → backups resumed. A full recovery is
-> possible from the external disks alone; the pool itself can only help if at
-> least one original vdev survived.
+> **Summary:** OS back → pools imported or recreated from the manifest →
+> datasets restored from the backup disks → configuration restored → shares
+> recreated → backups resumed. A full recovery is possible from the external
+> disks alone; surviving pool disks only save the restore step.
 
 Next: [Troubleshooting](troubleshooting)

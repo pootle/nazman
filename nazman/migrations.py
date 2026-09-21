@@ -11,7 +11,10 @@ from sqlalchemy import inspect, text
 logger = logging.getLogger(__name__)
 
 # Obsolete tables from prior schema versions, dropped unconditionally.
-_OBSOLETE_TABLES = ("vdevs", "disk_groups", "disk_partitions", "nfs_exports", "datasets")
+_OBSOLETE_TABLES = (
+    "vdevs", "disk_groups", "disk_partitions", "nfs_exports", "datasets",
+    "backup_commits",
+)
 
 
 def run_migrations(engine, conn) -> None:

@@ -13,6 +13,8 @@ GUIDE_PAGES: List[Tuple[str, str]] = [
     ("shares", "Share Data (NFS & SMB)"),
     ("snapshots", "Snapshots"),
     ("backup", "Set Up Backups"),
+    ("restore", "Restore & Rebuild"),
+    ("alerts", "Set Up Telegram Alerts"),
     ("disk-failure", "Handle a Disk Failure"),
     ("recover-dataset", "Recover a Dataset"),
     ("recover-system", "Recover a Complete System"),

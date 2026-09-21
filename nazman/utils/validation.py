@@ -145,3 +145,48 @@ def validate_schedule(schedule: str) -> str:
             raise ValidationError(f"Invalid schedule field: {part}")
     
     return schedule
+
+
+def validate_telegram_bot_token(token: str) -> str:
+    """Validate a Telegram bot token (``<bot_id>:<base64url secret>``)."""
+    token = (token or "").strip()
+    if ":" not in token:
+        raise ValidationError("Telegram bot token must look like '<bot id>:<secret>'")
+    bot_id, secret = token.split(":", 1)
+    if not bot_id.isdigit():
+        raise ValidationError("Telegram bot token id part must be numeric")
+    if not re.match(r'^[A-Za-z0-9_-]{30,}$', secret):
+        raise ValidationError("Telegram bot token secret part looks invalid")
+    return token
+
+
+def validate_telegram_chat_id(chat_id: str) -> str:
+    """Validate a Telegram chat id (numeric, optionally leading '-' for groups)."""
+    chat_id = (chat_id or "").strip()
+    if not chat_id:
+        raise ValidationError("Telegram chat id cannot be empty")
+    if not chat_id.lstrip("-").isdigit():
+        raise ValidationError("Telegram chat id must be a numeric id")
+    return chat_id
+
+
+def validate_alert_threshold(threshold) -> int:
+    """Validate a pool usage alert threshold (1-100 percent)."""
+    try:
+        value = int(threshold)
+    except (TypeError, ValueError):
+        raise ValidationError("Alert threshold must be a number between 1 and 100")
+    if value < 1 or value > 100:
+        raise ValidationError("Alert threshold must be between 1 and 100")
+    return value
+
+
+def validate_alert_cooldown(minutes) -> int:
+    """Validate an alert cooldown in minutes (>= 0, 0 disables suppression)."""
+    try:
+        value = int(minutes)
+    except (TypeError, ValueError):
+        raise ValidationError("Alert cooldown must be a whole number of minutes")
+    if value < 0:
+        raise ValidationError("Alert cooldown cannot be negative")
+    return value
