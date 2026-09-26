@@ -274,8 +274,14 @@ class DiskManager:
 
         refresh_device_map(discovered)
 
-        for disk_info in discovered:
-            disk_info["_health"] = await self.get_disk_health(disk_info["device_path"])
+        health_results = await asyncio.gather(
+            *(self.get_disk_health(disk_info["device_path"]) for disk_info in discovered),
+            return_exceptions=True,
+        )
+        for disk_info, result in zip(discovered, health_results):
+            if isinstance(result, BaseException):
+                raise result
+            disk_info["_health"] = result
 
         for attempt in range(5):
             try:

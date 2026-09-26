@@ -44,13 +44,10 @@ def mocked_disk_views(pool_members=None, error_counts=None, backup_disks=None,
     """
     with ExitStack() as stack:
         stack.enter_context(patch(
-            "nazman.managers.zfs_manager.ZfsManager.get_pool_members",
+            "nazman.managers.zfs_manager.ZfsManager.get_members_and_errors",
             new_callable=AsyncMock,
-            return_value={} if pool_members is None else pool_members))
-        stack.enter_context(patch(
-            "nazman.managers.zfs_manager.ZfsManager.get_pool_error_counts",
-            new_callable=AsyncMock,
-            return_value={} if error_counts is None else error_counts))
+            return_value=({} if pool_members is None else pool_members,
+                          {} if error_counts is None else error_counts)))
         stack.enter_context(patch(
             "nazman.managers.zfs_backup_manager.ZfsBackupManager.list_backup_disks",
             new_callable=AsyncMock,
@@ -92,6 +89,87 @@ async def test_list_disks_with_data(client, db_session):
         assert data[0]["partition_count"] == 3
         assert data[0]["free_percent"] == 25
         assert data[0]["role"] == "unused"
+
+
+@pytest.mark.asyncio
+async def test_enrich_lookups_run_concurrently(db_session):
+    """The pool-state, backup, and usage lookups in enrich() are gathered, not
+    awaited one after another."""
+    import asyncio as _asyncio
+    from nazman.managers.zfs_backup_manager import ZfsBackupManager
+    from nazman.managers.zfs_manager import ZfsManager
+    from nazman.services.disk_view import DiskViewService
+
+    service = DiskViewService(disk_manager, ZfsManager(), ZfsBackupManager())
+    disk = _mk_disk()
+    db_session.add(disk)
+    db_session.commit()
+    db_session.refresh(disk)
+    _present()
+
+    entered = {"members": 0, "backups": 0, "usage": 0}
+    release = _asyncio.Event()
+
+    async def fake_members_errors():
+        entered["members"] += 1
+        await release.wait()
+        return {}, {}
+
+    async def fake_list_backup_disks(db):
+        entered["backups"] += 1
+        await release.wait()
+        return []
+
+    async def fake_get_disk_usage(disks):
+        entered["usage"] += 1
+        await release.wait()
+        return {}
+
+    async def run_enrich():
+        with patch.object(service.zfs, "get_members_and_errors",
+                          side_effect=fake_members_errors), \
+             patch.object(service.zfs_backup, "list_backup_disks",
+                          side_effect=fake_list_backup_disks), \
+             patch.object(service.disk, "get_disk_usage",
+                          side_effect=fake_get_disk_usage):
+            return await service.enrich(db_session, [disk])
+
+    task = _asyncio.create_task(run_enrich())
+    for _ in range(5):
+        await _asyncio.sleep(0)
+    assert entered == {"members": 1, "backups": 1, "usage": 1}, \
+        "enrich lookups are not running concurrently"
+    release.set()
+    views = await task
+    assert views[0]["role"] == "unused"
+
+
+@pytest.mark.asyncio
+async def test_enrich_backup_lookup_failure_falls_back_empty(client, db_session):
+    """A failing backup-disk lookup must not break the disks page (-> [] fallback)."""
+    from nazman.managers.zfs_backup_manager import ZfsBackupManager
+    from nazman.managers.zfs_manager import ZfsManager
+    from nazman.services.disk_view import DiskViewService
+
+    service = DiskViewService(disk_manager, ZfsManager(), ZfsBackupManager())
+    disk = _mk_disk()
+    db_session.add(disk)
+    db_session.commit()
+    db_session.refresh(disk)
+    _present()
+
+    with patch.object(service.zfs, "get_members_and_errors",
+                      new_callable=AsyncMock, return_value=({}, {})), \
+         patch.object(service.zfs_backup, "list_backup_disks",
+                      new_callable=AsyncMock,
+                      side_effect=RuntimeError("boom")), \
+         patch.object(service.disk, "get_disk_usage",
+                      new_callable=AsyncMock,
+                      return_value={disk.id: {"partition_count": 0, "free_percent": 100}}):
+        views = await service.enrich(db_session, [disk])
+
+    assert views[0]["role"] == "unused"
+    assert views[0]["backup_state"] is None
 
 
 @pytest.mark.asyncio
@@ -195,6 +273,8 @@ async def test_get_disk_health_pool_member_surfaces_zfs_errors(client, db_sessio
     with mocked_disk_views(
             pool_members={disk.by_id: "tank", f"{disk.by_id}-part1": "tank"},
             error_counts=counts), \
+         patch("nazman.managers.zfs_manager.ZfsManager.get_pool_error_counts",
+               new_callable=AsyncMock, return_value=counts), \
          patch("nazman.managers.zfs_manager.ZfsManager.get_pool_error_events",
                new_callable=AsyncMock, return_value=events), \
          patch.object(DiskManager, "live_device_path", return_value="/dev/sda"), \

@@ -172,6 +172,49 @@ async def test_sync_reactivates_removed_disk_when_seen_again(db_session):
 
 
 @pytest.mark.asyncio
+async def test_sync_smart_batch_runs_concurrently(db_session):
+    """SMART reads for all discovered disks are gathered, not awaited serially."""
+    import asyncio as _asyncio
+    dm = DiskManager()
+
+    async def fake_discover_disks():
+        return [
+            _discovered(name="sda", by_id="/dev/disk/by-id/ata-A", serial="A1"),
+            _discovered(name="sdb", by_id="/dev/disk/by-id/ata-B", serial="B1"),
+            _discovered(name="sdc", by_id="/dev/disk/by-id/ata-C", serial="C1"),
+        ]
+
+    entered = 0
+    first_entry = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def fake_health(path):
+        nonlocal entered
+        entered += 1
+        if entered == 1:
+            first_entry.set()
+        await release.wait()
+        return {"temperature": 40, "power_on_hours": 10, "health_status": "ok"}
+
+    async def run_sync():
+        with patch.object(dm, "discover_disks", side_effect=fake_discover_disks), \
+             patch.object(dm, "get_disk_health", side_effect=fake_health):
+            await dm.sync_disks_to_database(db_session)
+
+    task = _asyncio.create_task(run_sync())
+    await _asyncio.wait_for(first_entry.wait(), timeout=2)
+    await _asyncio.sleep(0)
+    assert entered >= 2, "smartctl batch is not running concurrently"
+    release.set()
+    await task
+
+    rows = db_session.query(Disk).order_by(Disk.id).all()
+    assert [r.serial for r in rows] == ["A1", "B1", "C1"]
+    assert all(r.health_status == "ok" for r in rows)
+    clear_device_map()
+
+
+@pytest.mark.asyncio
 async def test_discover_skips_mmc_boot_subdevices():
     """mmcblk*boot*/rpmb must not be treated as independent disks (they share
     the parent eMMC's by-id/serial and caused UNIQUE device_name collisions)."""

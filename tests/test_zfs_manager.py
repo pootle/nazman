@@ -747,6 +747,72 @@ async def test_get_pool_error_counts_returns_empty_on_failure():
     assert counts == {}
 
 
+@pytest.mark.asyncio
+async def test_get_members_and_errors_parses_once():
+    """Combined read builds the member map and counters from one zpool status -j."""
+    status_json = json.dumps({
+        "pools": {
+            "allhdd": {
+                "state": "ONLINE",
+                "vdevs": {
+                    "allhdd": {
+                        "name": "allhdd", "vdev_type": "root",
+                        "vdevs": {
+                            "raidz1-0": {
+                                "name": "raidz1-0", "vdev_type": "raidz1",
+                                "vdevs": {
+                                    "ata-X": {
+                                        "name": "ata-X", "vdev_type": "disk",
+                                        "path": "/dev/disk/by-id/ata-X-part1",
+                                        "read": 3, "write": 5, "cksum": 7, "guid": "1234",
+                                    },
+                                    "ata-Y": {
+                                        "name": "ata-Y", "vdev_type": "disk",
+                                        "path": "/dev/disk/by-id/ata-Y-part1",
+                                        "read": 0, "write": 0, "cksum": 0, "guid": "5678",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    })
+
+    async def fake_run_zpool(*args, **kwargs):
+        return (status_json, "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool) as zp:
+        members, counts = await zfs_manager.get_members_and_errors()
+
+    assert zp.await_count == 1
+    assert members == {
+        "/dev/disk/by-id/ata-X-part1": "allhdd",
+        "/dev/disk/by-id/ata-Y-part1": "allhdd",
+    }
+    assert counts == {
+        "/dev/disk/by-id/ata-X-part1": {
+            "pool": "allhdd", "read": 3, "write": 5, "cksum": 7, "guid": "1234",
+        },
+        "/dev/disk/by-id/ata-Y-part1": {
+            "pool": "allhdd", "read": 0, "write": 0, "cksum": 0, "guid": "5678",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_members_and_errors_returns_empty_on_failure():
+    async def fake_run_zpool(*args, **kwargs):
+        return ("", "boom", 1)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        members, counts = await zfs_manager.get_members_and_errors()
+
+    assert members == {}
+    assert counts == {}
+
+
 def test_pool_errors_for_disk_aggregates_partition_children():
     counts = {
         "/dev/disk/by-id/ata-X-part1": {"read": 3, "write": 5, "cksum": 7},

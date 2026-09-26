@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import json
 import re
 from sqlalchemy.orm import Session
@@ -258,6 +258,45 @@ class ZfsManager:
             return members
         except Exception:
             return {}
+
+    async def get_members_and_errors(self) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+        """Pool member map + per-leaf error counters from a single ``zpool status -j``.
+
+        Combines :meth:`get_pool_members` and :meth:`get_pool_error_counts` into
+        one subprocess call and one parse, for callers that need both views
+        (e.g. the disks page).  Mirrors their self-defensive behaviour: returns
+        ``({}, {})`` on failure.
+        """
+        members: Dict[str, str] = {}
+        counts: Dict[str, Dict[str, Any]] = {}
+        try:
+            stdout, _, rc = await run_zpool("status", "-j", check=False, op="read")
+            if rc != 0:
+                return members, counts
+            data = json.loads(stdout)
+            pools = data.get("pools", {})
+            if not isinstance(pools, dict):
+                return members, counts
+            for pool_name, pool_data in pools.items():
+                vdevs = pool_data.get("vdevs", {})
+                if not isinstance(vdevs, dict):
+                    continue
+                for vdev in vdevs.values():
+                    for leaf, path, name in self._iter_vdev_disks(vdev):
+                        key = path or name
+                        if not key:
+                            continue
+                        members.setdefault(key, pool_name)
+                        counts.setdefault(key, {
+                            "pool": pool_name,
+                            "read": ZfsManager._leaf_counter(leaf, "read"),
+                            "write": ZfsManager._leaf_counter(leaf, "write"),
+                            "cksum": ZfsManager._leaf_counter(leaf, "cksum"),
+                            "guid": leaf.get("guid"),
+                        })
+        except Exception:
+            return {}, {}
+        return members, counts
 
     async def get_pool_error_counts(self) -> Dict[str, Dict[str, Any]]:
         """Per-leaf ZFS read/write/checksum error counters for all pools.

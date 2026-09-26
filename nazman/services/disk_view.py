@@ -6,6 +6,7 @@ different managers. That cross-domain join belongs in a service, not in the
 route handler.
 """
 
+import asyncio
 import re
 from typing import Any, Dict, List
 
@@ -36,17 +37,23 @@ class DiskViewService:
         single ``zpool status``, and the stored backup-disk rows) rather than
         per disk.
         """
-        pool_members = await self.zfs.get_pool_members()
-        try:
-            error_counts_raw = await self.zfs.get_pool_error_counts()
-        except Exception:
-            error_counts_raw = {}
-        try:
-            backup_rows = await self.zfs_backup.list_backup_disks(db)
-        except Exception:
-            backup_rows = []
+        results = await asyncio.gather(
+            self.zfs.get_members_and_errors(),
+            self.zfs_backup.list_backup_disks(db),
+            self.disk.get_disk_usage(disks),
+            return_exceptions=True,
+        )
+        members_errors, backup_result, usage_result = results
+        pool_members, error_counts_raw = (
+            members_errors
+            if not isinstance(members_errors, BaseException)
+            else ({}, {})
+        )
+        backup_rows = backup_result if not isinstance(backup_result, BaseException) else []
+        if isinstance(usage_result, BaseException):
+            raise usage_result
+        usage = usage_result
         backup_map = {rec["disk_id"]: rec for rec in backup_rows}
-        usage = await self.disk.get_disk_usage(disks)
 
         error_counts: Dict[int, Dict[str, int]] = {}
         for disk in disks:
