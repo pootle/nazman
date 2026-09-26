@@ -31,6 +31,7 @@ class DiskResponse(BaseModel):
     free_percent: Optional[int] = None
     role: str = "unused"
     role_detail: Optional[str] = None
+    pools: List[str] = []
     backup_state: Optional[str] = None
     zfs_errors: Optional[dict] = None
 
@@ -56,6 +57,7 @@ class DiskResponse(BaseModel):
             free_percent=view["free_percent"],
             role=view["role"],
             role_detail=view["role_detail"],
+            pools=view.get("pools") or [],
             backup_state=view["backup_state"],
             zfs_errors=view["zfs_errors"],
         )

@@ -225,8 +225,15 @@ function freeSpaceCell(disk) {
 
 function roleBadge(disk) {
     switch (disk.role) {
-        case 'pool':
-            return `<span class="badge badge-role-pool" title="Free space shown is per-disk (unallocated)">Pool: ${disk.role_detail || '?'}</span>`;
+        case 'pool': {
+            const pools = disk.pools && disk.pools.length ? disk.pools : [disk.role_detail || '?'];
+            let badge = `<span class="badge badge-role-pool" title="Free space shown is per-disk (unallocated)">Pool: ${escapeHtml(pools[0])}</span>`;
+            if (pools.length > 1) {
+                const others = pools.slice(1).join(', ');
+                badge += ` <span class="badge badge-role-more" title="Also a member of: ${escapeHtml(others)}">+${pools.length - 1}</span>`;
+            }
+            return badge;
+        }
         case 'backup':
             return disk.role_detail
                 ? `<span class="badge badge-role-backup">Backup: ${disk.role_detail}</span>`
@@ -443,6 +450,15 @@ function renderDiskDetails(payload) {
     const d = payload.disk || {};
     const deviceId = (d.by_id || '').replace('/dev/disk/by-id/', '') || 'unavailable';
 
+    const roleRows = (function () {
+        if (d.role === 'pool') {
+            const pools = d.pools && d.pools.length ? d.pools : [d.role_detail || '?'];
+            return pools.map(p =>
+                `<div style="margin-bottom:6px"><span class="detail-key">Role</span><span class="detail-val">Pool: ${escapeHtml(p)}</span></div>`).join('');
+        }
+        return `<div style="margin-bottom:6px"><span class="detail-key">Role</span><span class="detail-val">${escapeHtml(d.role || '—')}</span></div>`;
+    })();
+
     document.getElementById('dd-summary').innerHTML = `
         <div style="margin-bottom:6px"><span class="detail-key">Device</span><span class="detail-val">${escapeHtml(d.device_name || '—')}</span></div>
         <div style="margin-bottom:6px"><span class="detail-key">Model</span><span class="detail-val">${escapeHtml(d.model || 'Unknown')}</span></div>
@@ -450,7 +466,7 @@ function renderDiskDetails(payload) {
         <div style="margin-bottom:6px"><span class="detail-key">Device ID</span><span class="detail-val mono">${escapeHtml(deviceId)}</span></div>
         <div style="margin-bottom:6px"><span class="detail-key">Size</span><span class="detail-val">${formatBytes(d.size_bytes)}</span></div>
         <div style="margin-bottom:6px"><span class="detail-key">Type</span><span class="detail-val">${escapeHtml(d.disk_type || '—')}</span></div>
-        <div style="margin-bottom:6px"><span class="detail-key">Role</span><span class="detail-val">${d.role === 'pool' ? `Pool: ${escapeHtml(d.role_detail || '?')}` : escapeHtml(d.role || '—')}</span></div>
+        ${roleRows}
         <div><span class="detail-key">Health</span><span class="detail-val">${healthCell(d)}</span></div>`;
 
     renderSmartSection(payload.smart);

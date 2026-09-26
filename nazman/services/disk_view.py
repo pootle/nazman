@@ -63,6 +63,7 @@ class DiskViewService:
 
         views = []
         for disk in disks:
+            pools: List[str] = []
             if disk.status == "dead":
                 role, role_detail, backup_state = "dead", None, None
             elif disk.status == "removed" or not get_device_name(disk):
@@ -71,6 +72,7 @@ class DiskViewService:
                 role, role_detail, backup_state = "system", None, None
             else:
                 pool = self.zfs.pool_member_for_disk(pool_members, disk)
+                pools = self.zfs.pools_for_disk(pool_members, disk)
                 if pool:
                     role, role_detail, backup_state = "pool", pool, None
                 elif disk.id in backup_map:
@@ -89,6 +91,7 @@ class DiskViewService:
                 "free_percent": disk_usage.get("free_percent"),
                 "role": role,
                 "role_detail": role_detail,
+                "pools": pools if role == "pool" else [],
                 "backup_state": backup_state,
                 "zfs_errors": error_counts.get(disk.id),
             })

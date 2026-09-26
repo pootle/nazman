@@ -364,6 +364,7 @@ body {
 /* Disk role badges (disks page) */
 .badge-role-system { background-color: #8e44ad; color: white; }
 .badge-role-pool { background-color: #2980b9; color: white; }
+.badge-role-more { background-color: #34495e; color: white; }
 .badge-role-backup { background-color: #16a085; color: white; }
 .badge-role-unused { background-color: #95a5a6; color: white; }
 .badge-role-dead { background-color: #c0392b; color: white; }

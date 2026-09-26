@@ -204,6 +204,11 @@ class ZfsManager:
         return zfs_query.pool_member_for_disk(pool_members, disk)
 
     @staticmethod
+    def pools_for_disk(pool_members: Dict[str, str], disk: Disk) -> List[str]:
+        """Every distinct pool that owns ``disk`` (whole disk or any of its partitions)."""
+        return zfs_query.pools_for_disk(pool_members, disk)
+
+    @staticmethod
     def pool_member_for_by_id(pool_members: Dict[str, str], by_id: Optional[str]) -> Optional[str]:
         """Return the pool owning ``by_id`` (exact, basename, or any -partN child)."""
         return zfs_query.pool_member_for_by_id(pool_members, by_id)

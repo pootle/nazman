@@ -70,6 +70,27 @@ async def showmount_clients(paths: List[str]) -> List[Dict[str, str]]:
     return clients
 
 
+def pools_for_by_id(pool_members: Dict[str, str], by_id: Optional[str]) -> List[str]:
+    """Distinct pools that own ``by_id``, in the order ``pool_member_for_by_id`` prefers.
+
+    A partitioned disk can supply multiple pools at once (one ``-partN`` leaf in
+    each).  Preference matches :func:`pool_member_for_by_id`: an exact
+    whole-disk member first, then ``-partN`` children in map order.
+    """
+    if not by_id:
+        return []
+    basename = by_id.rsplit("/", 1)[-1]
+    pools: List[str] = []
+    for key in (by_id, basename):
+        pool = pool_members.get(key)
+        if pool and pool not in pools:
+            pools.append(pool)
+    for dev, pool in pool_members.items():
+        if dev.startswith((f"{by_id}-part", f"{basename}-part")) and pool not in pools:
+            pools.append(pool)
+    return pools
+
+
 def pool_member_for_by_id(pool_members: Dict[str, str], by_id: Optional[str]) -> Optional[str]:
     """Return the pool owning ``by_id`` (exact, basename, or any -partN child).
 
@@ -77,21 +98,18 @@ def pool_member_for_by_id(pool_members: Dict[str, str], by_id: Optional[str]) ->
     ``zpool status -j`` parsing.  Partitioned pool members are matched via
     their ``-partN`` children.
     """
-    if not by_id:
-        return None
-    basename = by_id.rsplit("/", 1)[-1]
-    for key in (by_id, basename):
-        if key in pool_members:
-            return pool_members[key]
-    for dev, pool in pool_members.items():
-        if dev.startswith((f"{by_id}-part", f"{basename}-part")):
-            return pool
-    return None
+    pools = pools_for_by_id(pool_members, by_id)
+    return pools[0] if pools else None
 
 
 def pool_member_for_disk(pool_members: Dict[str, str], disk) -> Optional[str]:
     """Return the name of the pool that owns ``disk`` (whole disk or any partition)."""
     return pool_member_for_by_id(pool_members, disk.by_id if disk else None)
+
+
+def pools_for_disk(pool_members: Dict[str, str], disk) -> List[str]:
+    """Every distinct pool that owns ``disk`` (whole disk or any of its partitions)."""
+    return pools_for_by_id(pool_members, disk.by_id if disk else None)
 
 
 def pool_vdev_bases(

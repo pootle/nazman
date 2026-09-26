@@ -554,6 +554,89 @@ async def test_disk_roles(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_disk_roles_multiple_pools(client, db_session):
+    """A disk whose partitions span two pools reports both memberships."""
+    multi = _mk_disk(by_id="/dev/disk/by-id/ata-Multi", serial="SN_MULTI")
+    db_session.add(multi)
+    db_session.commit()
+    db_session.refresh(multi)
+    _present(name="sdm", by_id=multi.by_id, serial=multi.serial)
+
+    with mocked_disk_views(
+            pool_members={
+                f"{multi.by_id}-part1": "tank",
+                f"{multi.by_id}-part2": "archive",
+            },
+            error_counts={
+                f"{multi.by_id}-part1": {"pool": "tank", "read": 1, "write": 0, "cksum": 2, "guid": "a"},
+                f"{multi.by_id}-part2": {"pool": "archive", "read": 0, "write": 3, "cksum": 0, "guid": "b"},
+            }), \
+         patch("nazman.managers.disk_manager.DiskManager.sync_disks_to_database",
+               new_callable=AsyncMock, return_value=[multi]):
+        response = client.get("/api/disks/")
+        assert response.status_code == 200
+        data = response.json()[0]
+
+    assert data["role"] == "pool"
+    assert data["role_detail"] == "tank"
+    assert data["pools"] == ["tank", "archive"]
+    assert data["zfs_errors"] == {"read": 1, "write": 3, "cksum": 2}
+
+
+@pytest.mark.asyncio
+async def test_disk_health_reports_all_pools(client, db_session):
+    """The details payload lists every pool the disk belongs to."""
+    multi = _mk_disk(by_id="/dev/disk/by-id/ata-Multi2", serial="SN_MULTI2")
+    db_session.add(multi)
+    db_session.commit()
+    db_session.refresh(multi)
+    _present(name="sdn", by_id=multi.by_id, serial=multi.serial)
+
+    with mocked_disk_views(
+            pool_members={f"{multi.by_id}-part1": "tank", f"{multi.by_id}-part2": "archive"}), \
+         patch("nazman.managers.zfs_manager.ZfsManager.get_pool_error_counts",
+               new_callable=AsyncMock, return_value={}), \
+         patch("nazman.managers.zfs_manager.ZfsManager.get_pool_error_events",
+               new_callable=AsyncMock, return_value=[]), \
+         patch.object(DiskManager, "live_device_path", return_value="/dev/sdn"), \
+         patch.object(DiskManager, "get_smart_details", new_callable=AsyncMock,
+                      return_value={"health_status": "ok", "passed": True,
+                                    "temperature": None, "power_on_hours": None,
+                                    "problems": [], "attributes": [], "self_test": [],
+                                    "model_name": None, "nvme": None}):
+        response = client.get(f"/api/disks/{multi.id}/health")
+        assert response.status_code == 200
+        data = response.json()["disk"]
+
+    assert data["role"] == "pool"
+    assert data["role_detail"] == "tank"
+    assert data["pools"] == ["tank", "archive"]
+
+
+def test_pools_for_by_id_returns_all_memberships():
+    """pools_for_by_id enumerates every pool a partitioned disk belongs to."""
+    from nazman.utils.zfs_query import pools_for_by_id
+
+    by_id = "/dev/disk/by-id/ata-Multi"
+    members = {
+        f"{by_id}-part1": "tank",
+        f"{by_id}-part2": "archive",
+    }
+    assert pools_for_by_id(members, by_id) == ["tank", "archive"]
+
+    # Whole-disk membership wins preference and dedupes.
+    members_with_whole = dict(members)
+    members_with_whole[by_id] = "tank"
+    assert pools_for_by_id(members_with_whole, by_id) == ["tank", "archive"]
+
+    # Single partition / non-member / missing identity.
+    assert pools_for_by_id({f"{by_id}-part1": "tank"}, by_id) == ["tank"]
+    assert pools_for_by_id({}, by_id) == []
+    assert pools_for_by_id({f"{by_id}-part1": "tank"}, None) == []
+    assert pools_for_by_id({f"{by_id}-part1": "tank"}, "/dev/disk/by-id/ata-Other") == []
+
+
+@pytest.mark.asyncio
 async def test_get_disk_usage_free_percent():
     """get_disk_usage computes partition count + unpartitioned-space %."""
     disk = _mk_disk(size_bytes=1_000_000_000)
