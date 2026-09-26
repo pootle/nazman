@@ -82,6 +82,122 @@ async def test_get_pool_status_root_direct_disks():
 
 
 @pytest.mark.asyncio
+async def test_get_pool_status_raidz_type_normalized():
+    """zpool status -j reports vdev_type 'raidz' generically; the parity count
+    in the vdev name (raidz2-0) must surface as a concrete topology."""
+    status_json = (
+        '{"pools":{"tank":{"state":"ONLINE","vdevs":{"tank":{'
+        '"name":"tank","vdev_type":"root","class":"root","state":"ONLINE","vdevs":{'
+        '"raidz2-0":{"name":"raidz2-0","vdev_type":"raidz","class":"normal",'
+        '"guid":"2001","state":"ONLINE","vdevs":{"sdc":{"name":"sdc",'
+        '"vdev_type":"disk","class":"normal","guid":"2002","state":"ONLINE",'
+        '"path":"/dev/sdc","rep_dev_size":"10.0T"},"sdd":{"name":"sdd",'
+        '"vdev_type":"disk","class":"normal","guid":"2003","state":"ONLINE",'
+        '"path":"/dev/sdd","rep_dev_size":"10.0T"},"sde":{"name":"sde",'
+        '"vdev_type":"disk","class":"normal","guid":"2004","state":"ONLINE",'
+        '"path":"/dev/sde","rep_dev_size":"10.0T"}}}}}}}}}'
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        if args[0] == "status":
+            return (status_json, "", 0)
+        if args[3] == "name,property,value":
+            return ("", "", 0)
+        return ("12\n", "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        result = await zfs_manager.get_pool_status("tank")
+
+    assert result["topology"] == "raidz2"
+    assert result["data_vdevs"][0]["type"] == "raidz2"
+
+
+@pytest.mark.asyncio
+async def test_get_pool_status_mirror_type_stays_concrete():
+    """Mirrors are already concrete in zpool status -j; normalization must not
+    alter them."""
+    status_json = (
+        '{"pools":{"tank":{"state":"ONLINE","vdevs":{"tank":{'
+        '"name":"tank","vdev_type":"root","class":"root","state":"ONLINE","vdevs":{'
+        '"mirror-0":{"name":"mirror-0","vdev_type":"mirror","class":"normal",'
+        '"state":"ONLINE","vdevs":{"sda":{"name":"sda","vdev_type":"disk",'
+        '"state":"ONLINE","path":"/dev/sda"},"sdb":{"name":"sdb",'
+        '"vdev_type":"disk","state":"ONLINE","path":"/dev/sdb"}}}}}}}}}'
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        if args[0] == "status":
+            return (status_json, "", 0)
+        if args[3] == "name,property,value":
+            return ("", "", 0)
+        return ("12\n", "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        result = await zfs_manager.get_pool_status("tank")
+
+    assert result["topology"] == "mirror"
+    assert result["data_vdevs"][0]["type"] == "mirror"
+
+
+@pytest.mark.asyncio
+async def test_get_pool_status_attaches_physical_sector_size():
+    """Leaf children carry their disk's physical sector size (ZFS ashift is the
+    logical sector on 512e disks); groups carry the max of their members."""
+    status_json = (
+        '{"pools":{"tank":{"state":"ONLINE","vdevs":{"tank":{'
+        '"name":"tank","vdev_type":"root","class":"root","state":"ONLINE","vdevs":{'
+        '"raidz1-0":{"name":"raidz1-0","vdev_type":"raidz1","class":"normal",'
+        '"state":"ONLINE","vdevs":{"sdc":{"name":"sdc","vdev_type":"disk",'
+        '"state":"ONLINE","path":"/dev/sdc"},"sdd":{"name":"sdd",'
+        '"vdev_type":"disk","state":"ONLINE","path":"/dev/sdd"}}}}}}}}}'
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        if args[0] == "status":
+            return (status_json, "", 0)
+        if args[3] == "name,property,value":
+            return ("", "", 0)
+        return ("12\n", "", 0)
+
+    def fake_phys_bytes(path_or_name):
+        return 4096 if path_or_name in ("/dev/sdc", "/dev/sdd") else None
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
+         patch("nazman.managers.zfs_manager._physical_sector_bytes", side_effect=fake_phys_bytes):
+        result = await zfs_manager.get_pool_status("tank")
+
+    group = result["data_vdevs"][0]
+    assert group["physical_sector_size"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_get_pool_status_skips_physical_sector_when_absent():
+    """Missing/unreadable devices leave physical_sector_size unset (no crash)."""
+    status_json = (
+        '{"pools":{"tank":{"state":"ONLINE","vdevs":{"tank":{'
+        '"name":"tank","vdev_type":"root","class":"root","state":"ONLINE","vdevs":{'
+        '"stripe-0":{"name":"stripe-0","vdev_type":"stripe","class":"normal",'
+        '"state":"ONLINE","vdevs":{"sdc":{"name":"sdc","vdev_type":"disk",'
+        '"state":"ONLINE","path":"/dev/nonexistent"}}}}}}}}}'
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        if args[0] == "status":
+            return (status_json, "", 0)
+        if args[3] == "name,property,value":
+            return ("", "", 0)
+        return ("12\n", "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool), \
+         patch("nazman.managers.zfs_manager._physical_sector_bytes", return_value=None):
+        result = await zfs_manager.get_pool_status("tank")
+
+    group = result["data_vdevs"][0]
+    assert group.get("physical_sector_size") in (None, "")
+    assert group["children"][0].get("physical_sector_size") is None
+
+
+@pytest.mark.asyncio
 async def test_get_pool_status_data_pool_fallback():
     """Handle zpool status -j format where pool data lives under data.pool."""
     status_json = (
@@ -424,14 +540,86 @@ async def test_create_dataset_omits_special_small_blocks_when_unset(db_session):
 
 @pytest.mark.asyncio
 async def test_get_pool_status_delegates_to_run_zpool():
-    """ZfsManager.get_pool_status should call run_zpool with 'status -j'."""
+    """ZfsManager.get_pool_status should call run_zpool with 'status -j' and
+    the per-vdev ashift query."""
     status_json = '{"pools":{"tank":{"state":"ONLINE","status":"","scan":{},"config":{"name":"tank","vdevs":[{"name":"stripe-0","type":"stripe","children":[{"name":"/dev/sda","state":"ONLINE"}]}]}}}}'
     with patch("nazman.managers.zfs_manager.run_zpool", new_callable=AsyncMock,
                return_value=(status_json, "", 0)) as mock:
         result = await zfs_manager.get_pool_status("tank")
-    mock.assert_called_once_with("status", "-j", "tank", op="read")
+    mock.assert_any_call("status", "-j", "tank", op="read")
+    mock.assert_any_call("get", "-Hp", "-o", "name,property,value", "ashift,guid",
+                         "tank", "all-vdevs", check=False, op="read")
     assert result["name"] == "tank"
     assert result["status"] == "ONLINE"
+
+
+@pytest.mark.asyncio
+async def test_get_pool_status_attaches_vdev_ashift():
+    """Per-vdev ashift from 'zpool get ... all-vdevs' must land on groups and
+    leaves (matched via guid), with pool-level ashift/sector size attached."""
+    status_json = (
+        '{"pools":{"tank":{"state":"ONLINE","vdevs":{"tank":{'
+        '"name":"tank","vdev_type":"root","class":"root","state":"ONLINE","vdevs":{'
+        '"raidz1-0":{"name":"raidz1-0","vdev_type":"raidz1","class":"normal",'
+        '"guid":"2001","state":"ONLINE","vdevs":{"sdc":{"name":"sdc",'
+        '"vdev_type":"disk","class":"normal","guid":"2002","state":"ONLINE",'
+        '"path":"/dev/sdc"},"sdd":{"name":"sdd","vdev_type":"disk",'
+        '"class":"normal","guid":"2003","state":"ONLINE",'
+        '"path":"/dev/sdd"}}}}}}}}}'
+    )
+    all_vdevs_out = (
+        "root-0\tashift\t12\nroot-0\tguid\t1000\n"
+        "raidz1-0\tashift\t12\nraidz1-0\tguid\t2001\n"
+        "sdc\tashift\t9\nsdc\tguid\t2002\n"
+        "sdd\tashift\t9\nsdd\tguid\t2003\n"
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        if args[0] == "status":
+            return (status_json, "", 0)
+        if args[3] == "name,property,value":
+            return (all_vdevs_out, "", 0)
+        return ("12\n", "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        result = await zfs_manager.get_pool_status("tank")
+
+    group = result["data_vdevs"][0]
+    assert group["name"] == "raidz1-0"
+    assert group["ashift"] == 12
+    by_name = {c["name"]: c for c in group["children"]}
+    assert by_name["sdc"]["ashift"] == 9
+    assert by_name["sdd"]["ashift"] == 9
+    assert result["ashift"] == 12
+    assert result["sector_size_bytes"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_get_pool_status_handles_missing_all_vdevs():
+    """When 'zpool get ... all-vdevs' is unavailable (rc != 0, old ZFS), status
+    still loads and per-vdev ashift stays unset without crashing."""
+    status_json = (
+        '{"pools":{"tank":{"state":"ONLINE","vdevs":{"tank":{'
+        '"name":"tank","vdev_type":"root","class":"root","state":"ONLINE","vdevs":{'
+        '"stripe-0":{"name":"stripe-0","vdev_type":"stripe","class":"normal",'
+        '"state":"ONLINE","vdevs":{"sdc":{"name":"sdc","vdev_type":"disk",'
+        '"state":"ONLINE","path":"/dev/sdc"}}}}}}}}}'
+    )
+
+    async def fake_run_zpool(*args, **kwargs):
+        if args[0] == "status":
+            return (status_json, "", 0)
+        if args[3] == "name,property,value":
+            return ("", "bad request", 1)
+        return ("12\n", "", 0)
+
+    with patch("nazman.managers.zfs_manager.run_zpool", side_effect=fake_run_zpool):
+        result = await zfs_manager.get_pool_status("tank")
+
+    group = result["data_vdevs"][0]
+    assert group.get("ashift") is None
+    assert group["children"][0].get("ashift") is None
+    assert result["ashift"] == 12
 
 
 @pytest.mark.asyncio

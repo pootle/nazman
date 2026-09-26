@@ -109,7 +109,12 @@ On the **Pools** page, the **Pool Operations** card:
 - **Metric Logging** — record this pool's disk performance to disk for 30 days
   (see the **Performance** page).
 - **Details** on a pool card — vdev-by-vdev breakdown with the state of each
-  device (ONLINE / DEGRADED / FAULTED) and the **Last scrub** time.
+  device (ONLINE / DEGRADED / FAULTED), each vdev's physical sector size
+  (e.g. `4K sectors (physical)`) and the **Last scrub** time. Sector size per
+  vdev requires OpenZFS 2.2+ (the installer checks this); older ZFS shows the
+  pool without per-vdev sector sizes. The physical sector size is read from the
+  disk's sysfs geometry, not ZFS's `ashift` (which tracks the logical sector on
+  512e drives).
 - **Destroy Pool** — irreversible (see below).
 
 > **Danger:** **Destroy Pool** is destructive and cannot be undone. The

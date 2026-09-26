@@ -538,16 +538,34 @@ function showPoolDetailsModal(status) {
         return val * (mult[unit] || 1);
     }
 
+    function physicalLabel(bytes) {
+        if (!bytes) return '';
+        const label = (bytes >= 1024 && bytes % 1024 === 0) ? (bytes / 1024) + 'K' : bytes + 'B';
+        return label + ' sectors (physical)';
+    }
+
+    function sectorLabel(a) {
+        if (!a) return '';
+        const b = 1 << a;
+        const label = (b >= 1024 && b % 1024 === 0) ? (b / 1024) + 'K' : b + 'B';
+        return label + ' sectors (ashift ' + a + ')';
+    }
+
     function vdevSummary(vdevs, label) {
         if (!vdevs || vdevs.length === 0) return '';
         const items = vdevs.map(v => {
             const type = v.type || 'unknown';
+            const withAshift = (v.children || []).filter(c => c.ashift);
+            const groupSector = v.physical_sector_size
+                ? physicalLabel(v.physical_sector_size)
+                : sectorLabel(v.ashift || (withAshift.length ? withAshift[0].ashift : 0));
             const devs = (v.children || []).map(c => {
                 const state = c.state || '';
                 const size = c.size || '';
-                return `<div style="padding-left:8px">${c.name || '?'} <span style="opacity:0.6">${size}</span> <span class="status status-${state}">${state}</span></div>`;
+                const sector = c.physical_sector_size ? physicalLabel(c.physical_sector_size) : sectorLabel(c.ashift);
+                return `<div style="padding-left:8px">${c.name || '?'} ${sector} <span style="opacity:0.6">${size}</span> <span class="status status-${state}">${state}</span></div>`;
             }).join('');
-            return `<li><strong>${type}</strong>${devs ? '' : ': no devices'}${devs}</li>`;
+            return `<li><strong>${type}</strong>${groupSector ? ` <span style="opacity:0.7">${groupSector}</span>` : ''}${devs ? '' : ': no devices'}${devs}</li>`;
         }).join('');
         return `<div style="margin-bottom:8px"><strong>${label}</strong><ul style="margin:4px 0 0 16px;list-style:none">${items}</ul></div>`;
     }
@@ -609,7 +627,7 @@ function showPoolDetailsModal(status) {
     modal.style.display = 'flex';
     modal.style.zIndex = '2000';
     modal.innerHTML = `
-        <div class="modal-content" style="max-width:500px">
+        <div class="modal-content" style="max-width:760px">
             <div class="modal-header">
                 <h3>Pool "${status.name}"</h3>
                 <button class="close" onclick="this.closest('.modal').remove()">&times;</button>

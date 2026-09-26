@@ -45,11 +45,15 @@ async def test_get_pool_status(client):
             "topology": "stripe",
             "vdevs": [],
             "scan": {},
+            "ashift": 12,
+            "sector_size_bytes": 4096,
         })
         response = client.get("/api/pools/testpool")
         assert response.status_code == 200
         data = response.json()
         assert data["name"] == "testpool"
+        assert data["ashift"] == 12
+        assert data["sector_size_bytes"] == 4096
 
 
 @pytest.mark.asyncio

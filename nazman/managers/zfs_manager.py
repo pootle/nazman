@@ -8,7 +8,7 @@ from ..models.disk import Disk
 from ..utils.commands import run_zpool, run_zfs
 from ..utils.devices import (
     read_slot_uuids, resolve_slot_to_device, get_device_path, get_device_name,
-    partition_by_id, kernel_base_name,
+    partition_by_id, kernel_base_name, normalize_base_name,
 )
 from ..utils.exceptions import (
     PoolError, PoolNotFoundError, DatasetError, DatasetNotFoundError, ValidationError,
@@ -46,6 +46,35 @@ def _vdev_usable_bytes(vdev: Dict[str, Any]) -> float:
     if vtype == "raidz3":
         return sum(sizes) - sum(sorted(sizes)[:3])
     return sum(sizes)
+
+
+def _normalize_vdev_type(name: str, vtype: str) -> str:
+    """Concrete topology for group vdevs that ``zpool status -j`` reports
+    generically.  RAIDZ entries have ``vdev_type`` ``raidz`` and carry their
+    parity count in the vdev name (``raidz2-0``); the UI and recreate specs
+    need it spelled out as a valid topology."""
+    if vtype == "raidz":
+        prefix = (name or "").split("-")[0]
+        if prefix.startswith("raidz"):
+            return prefix
+    return vtype
+
+
+def _physical_sector_bytes(path_or_name: str) -> Optional[int]:
+    """Physical sector size in bytes of the block device behind a ZFS leaf.
+
+    Reads ``/sys/block/<base>/queue/physical_block_size`` for the kernel block
+    device resolved from a leaf's path or name (e.g. ``sda1``/by-id symlink).
+    Returns None when the device is not present or unreadable.  ZFS's per-leaf
+    ``ashift`` reflects the *logical* sector size on 512e disks, so the vdev
+    standard (physical sector size) is sourced here instead.
+    """
+    try:
+        base = normalize_base_name(path_or_name)
+        with open(f"/sys/block/{base}/queue/physical_block_size") as fh:
+            return int(fh.read().strip())
+    except Exception:
+        return None
 
 
 def _compute_usable_bytes(data_vdevs: Optional[List[Dict[str, Any]]]) -> float:
@@ -416,6 +445,7 @@ class ZfsManager:
                                 "state": disk.get("state", "UNKNOWN"),
                                 "path": disk.get("path", ""),
                                 "size": disk.get("rep_dev_size") or disk.get("phys_space") or disk.get("size") or "",
+                                "guid": disk.get("guid", ""),
                             })
                 return out
 
@@ -441,8 +471,9 @@ class ZfsManager:
 
                     entry = {
                         "name": name,
-                        "type": vtype,
+                        "type": _normalize_vdev_type(name, vtype),
                         "class": vclass,
+                        "guid": vdev.get("guid", ""),
                         "children": children,
                         **{k: v for k, v in vdev.items() if k in ("total_space", "state", "alloc_space")},
                     }
@@ -478,7 +509,7 @@ class ZfsManager:
                         vtype = vdev.get("vdev_type", "")
                         children_raw = vdev.get("vdevs", {})
                         children = _leaf_disks(children_raw)
-                        target.append({"name": name, "type": vtype, "class": class_key, "children": children, **{k: v for k, v in vdev.items() if k in ("total_space", "state", "alloc_space")}})
+                        target.append({"name": name, "type": _normalize_vdev_type(name, vtype), "class": class_key, "guid": vdev.get("guid", ""), "children": children, **{k: v for k, v in vdev.items() if k in ("total_space", "state", "alloc_space")}})
 
             # Determine topology from data vdevs
             if data_vdevs:
@@ -488,17 +519,51 @@ class ZfsManager:
 
             status_str = pool_info.get("state", "ONLINE").upper()
 
+            # Per-vdev sector size exponent (ashift).  Requires
+            # ``zpool get ... all-vdevs``, i.e. OpenZFS >= 2.2; the install
+            # path (prepare.sh) gates on that version, so this only fails to
+            # fill on systems that bypassed the check.
+            ashifts: Dict[str, int] = {}
+            try:
+                ashifts = await self._get_vdev_ashifts(pool_name)
+            except Exception:
+                pass
+
+            def _ashift_for(guid: str, name: str) -> Optional[int]:
+                for key in (guid, name):
+                    value = ashifts.get(key)
+                    if value is not None:
+                        return value
+                return None
+
+            all_groups = data_vdevs + special_vdevs + log_vdevs + cache_vdevs
+            for group in all_groups:
+                group["ashift"] = _ashift_for(str(group.get("guid") or ""), str(group.get("name") or ""))
+                child_phys = []
+                for child in group.get("children", []):
+                    child["ashift"] = _ashift_for(str(child.get("guid") or ""), str(child.get("name") or ""))
+                    phys = _physical_sector_bytes(str(child.get("path") or child.get("name") or ""))
+                    if phys:
+                        child["physical_sector_size"] = phys
+                        child_phys.append(phys)
+                if child_phys:
+                    group["physical_sector_size"] = max(child_phys)
+
+            pool_ashift = await self._get_pool_ashift(pool_name)
+
             return {
                 "name": pool_name,
                 "status": status_str,
                 "topology": topology,
-                "vdevs": data_vdevs + special_vdevs + log_vdevs + cache_vdevs,
+                "vdevs": all_groups,
                 "data_vdevs": data_vdevs,
                 "special_vdevs": special_vdevs,
                 "log_vdevs": log_vdevs,
                 "cache_vdevs": cache_vdevs,
                 "scan": pool_info.get("scan", {}),
-                "config": pool_info.get("config", {})
+                "config": pool_info.get("config", {}),
+                "ashift": pool_ashift or None,
+                "sector_size_bytes": (1 << pool_ashift) if pool_ashift else None,
             }
 
         except Exception as e:
@@ -517,6 +582,36 @@ class ZfsManager:
             return int(stdout.strip())
         except ValueError:
             return 0
+
+    async def _get_vdev_ashifts(self, pool_name: str) -> Dict[str, int]:
+        """Map every vdev's identity (guid, then name) to its ashift.
+
+        Uses ``zpool get -o name,property,value ashift,guid <pool> all-vdevs``
+        (OpenZFS >= 2.2), which reports each vdev's own ashift, including
+        leaves that differ from the pool's ``ashift`` property.  An empty dict
+        is returned when the per-vdev form is unavailable.
+        """
+        stdout, _, rc = await run_zpool(
+            "get", "-Hp", "-o", "name,property,value", "ashift,guid",
+            pool_name, "all-vdevs", check=False, op="read",
+        )
+        if rc != 0:
+            return {}
+        ashift_by_name: Dict[str, int] = {}
+        guid_by_name: Dict[str, str] = {}
+        for line in stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            name, prop, value = parts
+            if prop == "ashift" and value.isdigit():
+                ashift_by_name[name] = int(value)
+            elif prop == "guid" and value:
+                guid_by_name[name] = value
+        result: Dict[str, int] = {}
+        for name, ashift in ashift_by_name.items():
+            result[guid_by_name.get(name, name)] = ashift
+        return result
 
     async def _slot_uuid_map(self, db: Session) -> Dict[str, Dict[str, Any]]:
         """Map every present partition's by-id path to its slot identity.

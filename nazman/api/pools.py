@@ -56,6 +56,8 @@ class PoolStatusResponse(BaseModel):
     log_vdevs: List[dict] = []
     cache_vdevs: List[dict] = []
     scan: dict
+    ashift: Optional[int] = None
+    sector_size_bytes: Optional[int] = None
 
 
 @router.get("/", response_model=List[PoolResponse])
