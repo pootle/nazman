@@ -64,6 +64,7 @@ static/js/api.js
 static/js/app.js
 static/js/components.js
 static/js/charts.js
+static/js/details.js
 static/css/style.css
 static/css/guide.css
 

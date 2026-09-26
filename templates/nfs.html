@@ -228,7 +228,10 @@ function renderNfsShares() {
                         <td><code>${s.sharenfs || 'not set'}</code></td>
                         <td><span class="status status-${s.enabled ? 'online' : 'warning'}">${s.enabled ? 'Shared' : 'Paused'}</span></td>
                         <td>
-                            <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})" ${nfsInstalled ? '' : 'disabled'}>
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="Details.share('nfs', '${escapeHtml(s.dataset_name)}')" title="View share details">
+                                <i class="fas fa-info-circle"></i>
+                            </button>
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${escapeHtml(s.dataset_name)}', ${!s.enabled})" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
                             </button>
                             <button class="btn btn-sm btn-secondary action-btn" onclick="editShare('${s.dataset_name}')" ${nfsInstalled ? '' : 'disabled'}>

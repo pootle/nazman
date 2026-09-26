@@ -187,7 +187,7 @@ function renderPools() {
                 <table class="data-table pool-dataset-table">
                     <thead><tr><th>Dataset</th><th>Used</th><th>Referenced</th><th>Mountpoint</th></tr></thead>
                     <tbody>${pool.datasets.map(d => `<tr>
-                        <td><code>${escapeHtml(d.name)}</code></td>
+                        <td><a href="javascript:void(0)" onclick="Details.dataset('${escapeHtml(d.name)}'); return false;" title="View dataset details">${escapeHtml(d.name)}</a></td>
                         <td>${escapeHtml(d.used || '-')}</td>
                         <td>${escapeHtml(d.referenced || '-')}</td>
                         <td><small class="text-muted">${escapeHtml(d.mountpoint || '-')}</small></td>
@@ -518,130 +518,8 @@ async function importPool() {
     }
 }
 
-async function viewPoolStatus(poolName) {
-    try {
-        const status = await api.getPoolStatus(poolName);
-        showPoolDetailsModal(status);
-    } catch (error) {
-        showAlert('Failed: ' + error.message, 'error');
-    }
-}
-
-function showPoolDetailsModal(status) {
-    function parseSize(str) {
-        if (!str) return 0;
-        const m = str.match(/([\d.]+)\s*([KMGTP]i?B?)/i);
-        if (!m) return parseFloat(str) || 0;
-        const val = parseFloat(m[1]);
-        const unit = m[2][0].toUpperCase();
-        const mult = {K: 1024, M: 1024**2, G: 1024**3, T: 1024**4, P: 1024**5};
-        return val * (mult[unit] || 1);
-    }
-
-    function physicalLabel(bytes) {
-        if (!bytes) return '';
-        const label = (bytes >= 1024 && bytes % 1024 === 0) ? (bytes / 1024) + 'K' : bytes + 'B';
-        return label + ' sectors (physical)';
-    }
-
-    function sectorLabel(a) {
-        if (!a) return '';
-        const b = 1 << a;
-        const label = (b >= 1024 && b % 1024 === 0) ? (b / 1024) + 'K' : b + 'B';
-        return label + ' sectors (ashift ' + a + ')';
-    }
-
-    function vdevSummary(vdevs, label) {
-        if (!vdevs || vdevs.length === 0) return '';
-        const items = vdevs.map(v => {
-            const type = v.type || 'unknown';
-            const withAshift = (v.children || []).filter(c => c.ashift);
-            const groupSector = v.physical_sector_size
-                ? physicalLabel(v.physical_sector_size)
-                : sectorLabel(v.ashift || (withAshift.length ? withAshift[0].ashift : 0));
-            const devs = (v.children || []).map(c => {
-                const state = c.state || '';
-                const size = c.size || '';
-                const sector = c.physical_sector_size ? physicalLabel(c.physical_sector_size) : sectorLabel(c.ashift);
-                return `<div style="padding-left:8px">${c.name || '?'} ${sector} <span style="opacity:0.6">${size}</span> <span class="status status-${state}">${state}</span></div>`;
-            }).join('');
-            return `<li><strong>${type}</strong>${groupSector ? ` <span style="opacity:0.7">${groupSector}</span>` : ''}${devs ? '' : ': no devices'}${devs}</li>`;
-        }).join('');
-        return `<div style="margin-bottom:8px"><strong>${label}</strong><ul style="margin:4px 0 0 16px;list-style:none">${items}</ul></div>`;
-    }
-
-    function vdevSize(vdevs) {
-        if (!vdevs || vdevs.length === 0) return null;
-        let total = 0;
-        for (const v of vdevs) {
-            const kids = v.children || [];
-            const sizes = kids.map(c => parseSize(c.size)).filter(s => s > 0);
-            if (sizes.length === 0) continue;
-            const type = v.type || 'stripe';
-            if (type === 'mirror') {
-                total += Math.min(...sizes);
-            } else if (type === 'raidz1') {
-                total += sizes.reduce((a, b) => a + b, 0) - Math.min(...sizes);
-            } else if (type === 'raidz2') {
-                const sorted = [...sizes].sort((a, b) => a - b);
-                total += sizes.reduce((a, b) => a + b, 0) - sorted[0] - sorted[1];
-            } else if (type === 'raidz3') {
-                const sorted = [...sizes].sort((a, b) => a - b);
-                total += sizes.reduce((a, b) => a + b, 0) - sorted[0] - sorted[1] - sorted[2];
-            } else {
-                total += sizes.reduce((a, b) => a + b, 0);
-            }
-        }
-        return total || null;
-    }
-
-    const dataUsable = vdevSize(status.data_vdevs);
-    const rawSize = (status.data_vdevs || []).concat(status.special_vdevs || [], status.log_vdevs || [], status.cache_vdevs || [])
-        .flatMap(v => (v.children || []).map(c => parseSize(c.size)))
-        .reduce((a, b) => a + b, 0);
-
-    let html = `
-        <div style="margin-bottom:12px">
-            <span class="status status-${status.status}" style="font-size:1.1em">${status.status}</span>
-            <span class="topology" style="margin-left:8px">${status.topology}</span>
-        </div>`;
-
-    if (rawSize > 0) {
-        html += `<div style="margin-bottom:12px"><strong>Raw capacity:</strong> ${formatBytes(rawSize)}</div>`;
-    }
-    if (dataUsable && dataUsable !== rawSize) {
-        html += `<div style="margin-bottom:12px"><strong>Usable (data):</strong> ${formatBytes(dataUsable)}</div>`;
-    }
-
-    html += vdevSummary(status.data_vdevs, 'Data Vdevs');
-    html += vdevSummary(status.special_vdevs, 'Special Vdevs');
-    html += vdevSummary(status.log_vdevs, 'Log Vdevs');
-    html += vdevSummary(status.cache_vdevs, 'Cache Vdevs');
-
-    if (status.scan && status.scan.state) {
-        html += `<div style="margin-top:8px"><strong>Last scrub:</strong> ${status.scan.state} ${status.scan.end_time || ''}</div>`;
-    }
-
-    const modal = document.createElement('div');
-    modal.className = 'modal';
-    modal.style.display = 'flex';
-    modal.style.zIndex = '2000';
-    modal.innerHTML = `
-        <div class="modal-content" style="max-width:760px">
-            <div class="modal-header">
-                <h3>Pool "${status.name}"</h3>
-                <button class="close" onclick="this.closest('.modal').remove()">&times;</button>
-            </div>
-            <div class="modal-body" style="padding:20px">
-                ${html}
-                <div style="text-align:right;margin-top:16px">
-                    <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">Close</button>
-                </div>
-            </div>
-        </div>
-    `;
-    document.body.appendChild(modal);
-    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+function viewPoolStatus(poolName) {
+    Details.pool(poolName);
 }
 
 async function destroyPool(poolName) {

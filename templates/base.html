@@ -136,6 +136,20 @@
         </div>
     </div>
 
+    <!-- Shared object details modal (disks -> vdevs -> pools -> datasets -> shares) -->
+    <div id="details-modal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width:900px">
+            <div class="modal-header">
+                <h3 id="details-modal-title">Details</h3>
+                <button class="close" onclick="Details.close()">&times;</button>
+            </div>
+            <div class="modal-body" id="details-modal-body" style="padding:20px"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="Details.close()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Message history modal -->
     <div id="message-history-modal" class="modal" style="display: none;">
         <div class="modal-content" style="max-width: 560px">
@@ -155,6 +169,7 @@
     <script src="/static/js/api.js?v=6"></script>
     <script src="/static/js/components.js?v=4"></script>
     <script src="/static/js/app.js?v=5"></script>
+    <script src="/static/js/details.js?v=1"></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

@@ -306,10 +306,13 @@ function renderDatasets() {
                         <td>${dataset.readonly || '-'}</td>
                         <td>${dataset.special_small_blocks || '0'}</td>
                         <td>
-                            <button class="btn btn-sm btn-secondary" onclick="editDataset('${dataset.name}')">
+                            <button class="btn btn-sm btn-secondary" onclick="Details.dataset('${escapeHtml(dataset.name)}')" title="View dataset details">
+                                <i class="fas fa-info-circle"></i>
+                            </button>
+                            <button class="btn btn-sm btn-secondary" onclick="editDataset('${escapeHtml(dataset.name)}')">
                                 <i class="fas fa-edit"></i>
                             </button>
-                            <button class="btn btn-sm btn-danger" onclick="destroyDataset('${dataset.name}')">
+                            <button class="btn btn-sm btn-danger" onclick="destroyDataset('${escapeHtml(dataset.name)}')">
                                 <i class="fas fa-trash"></i>
                             </button>
                         </td>

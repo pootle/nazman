@@ -191,7 +191,10 @@ function renderSmbShares() {
                         <td>${s.read_only ? '<span class="status status-warning">Read-only</span>' : '<span class="status status-online">Read-write</span>'}</td>
                         <td><span class="status status-${s.enabled ? 'online' : 'faulted'}">${s.enabled ? 'Shared' : 'Disabled'}</span></td>
                         <td>
-                            <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})" ${smbInstalled ? '' : 'disabled'}>
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="Details.share('smb', '${escapeHtml(s.dataset_name)}')" title="View share details">
+                                <i class="fas fa-info-circle"></i>
+                            </button>
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${escapeHtml(s.dataset_name)}', ${!s.enabled})" ${smbInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
                             </button>
                             ${s.enabled ? `<button class="btn btn-sm btn-secondary action-btn" onclick="editShare('${s.dataset_name}')" ${smbInstalled ? '' : 'disabled'}>
