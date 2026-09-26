@@ -479,7 +479,7 @@ async function handleSaveDatasetChanges(e) {
 }
 
 async function destroyDataset(name) {
-    if (!confirm(`DESTROY dataset "${name}"?\n\nThis will destroy all data and cannot be undone!\n\nNote: the dataset must be unmounted with no active NFS clients before it can be destroyed.`)) {
+    if (!confirm(`DESTROY dataset "${name}"?\n\nThis will destroy all data and cannot be undone!\n\nThe dataset will be unmounted automatically (no active NFS clients or SMB share may hold it).`)) {
         return;
     }
     
@@ -497,8 +497,8 @@ async function destroyDataset(name) {
         await loadDatasets();
     } catch (error) {
         const msg = error.message || '';
-        if (msg.includes('mounted') || msg.includes('NFS client')) {
-            showAlert(`Cannot destroy "${name}": ${msg}\n\nUnmount the dataset and disconnect NFS clients first.`, 'error');
+        if (msg.includes('mounted') || msg.includes('unmount') || msg.includes('NFS client') || msg.includes('SMB') || msg.includes('network drive')) {
+            showAlert(`Cannot destroy "${name}": ${msg}\n\nClose any local process on the mountpoint, disconnect SMB network drives, and unmount NFS clients first.`, 'error');
         } else if (!recursive && (msg.includes('has children') || msg.includes('snapshot'))) {
             // Suggest recursive destroy
             if (confirm(`Dataset "${name}" has children/snapshots.\n\nDestroy recursively?`)) {

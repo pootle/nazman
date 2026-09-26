@@ -26,6 +26,91 @@ class DestructionService:
         self.nfs = nfs
         self.smb = smb
 
+    # ── Unmounting ──────────────────────────────────────────────────────
+
+    async def _mounted_names(self, names: List[str]) -> List[str]:
+        """Return the subset of ``names`` currently mounted by ZFS."""
+        mounted = []
+        for ds in names:
+            try:
+                stdout, _, rc = await run_zfs(
+                    "get", "-H", "-o", "value", "mounted", ds, check=False, op="read",
+                )
+            except Exception:
+                continue
+            if rc == 0 and stdout.strip().lower() == "yes":
+                mounted.append(ds)
+        return mounted
+
+    async def _unmount_names(self, names: List[str]) -> None:
+        """Unmount every mounted dataset in ``names``, raising on any that is busy.
+
+        When ``zfs unmount`` is refused the most specific cause is surfaced: an
+        open SMB network drive or connected NFS client pinning the dataset, else
+        a local process holding the mountpoint.
+        """
+        for ds in await self._mounted_names(names):
+            _, stderr, rc = await run_zfs(
+                "unmount", "-f", ds, check=False, op="write",
+            )
+            if rc != 0:
+                raise DatasetError(await self._busy_hint(ds, stderr))
+
+    async def _smb_clients_for(self, dataset_name: str) -> List[str]:
+        """Hosts with a live SMB session on ``dataset_name``'s share, if any.
+
+        Parses the ``Service`` table of ``smbstatus`` (share -> pid -> machine),
+        matching the trailing dataset name against the share. Returns an empty
+        list when smbstatus is unavailable or no session is open.
+        """
+        share = dataset_name.rsplit("/", 1)[-1]
+        try:
+            stdout, _, rc = await run_command(
+                ["smbstatus"], timeout=15, check=False, op="read", category="smb",
+            )
+        except Exception:
+            return []
+        if rc != 0:
+            return []
+        hosts: List[str] = []
+        in_services = False
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Service"):
+                in_services = True
+                continue
+            if not in_services or not line:
+                continue
+            cols = line.split()
+            if len(cols) >= 3 and cols[0] == share:
+                host = cols[2]
+                if host not in hosts:
+                    hosts.append(host)
+        return hosts
+
+    async def _busy_hint(self, dataset_name: str, stderr: str) -> str:
+        """Explain why a dataset could not be unmounted, as specifically as possible."""
+        reason = stderr.strip() or "dataset is busy"
+        smb_hosts = await self._smb_clients_for(dataset_name)
+        if smb_hosts:
+            hosts = ", ".join(smb_hosts)
+            return (
+                f'Could not unmount "{dataset_name}": an open SMB connection from '
+                f"{hosts} is keeping it in use ({reason}). "
+                f"Close the mapped network drive on {hosts} and retry."
+            )
+        nfs_clients = await zfs_query.showmount_clients([f"/{dataset_name}"])
+        if nfs_clients:
+            hosts = ", ".join(sorted({c["client"] for c in nfs_clients}))
+            return (
+                f'Could not unmount "{dataset_name}": NFS client(s) {hosts} are still '
+                f"connected to it ({reason}). Unmount the share on those clients and retry."
+            )
+        return (
+            f'Could not unmount "{dataset_name}": {reason}. '
+            "A local process may still be using its mountpoint."
+        )
+
     # ── Pools ────────────────────────────────────────────────────────────
 
     async def get_pool_destroy_info(self, db: Session, pool_name: str) -> Dict[str, Any]:
@@ -135,15 +220,13 @@ class DestructionService:
 
         pool = self.zfs.get_pool_by_name(db, pool_name)
 
-        # Pre-check: block if any child dataset is busy (mounted/held by an NFS
-        # client). `zpool destroy -f` otherwise fails with "cannot unmount".
+        # Pre-check: block if any child dataset is held by an NFS/SMB client.
+        # Otherwise mounted datasets are unmounted cleanly below; `zpool destroy
+        # -f` force-unmounts, but the explicit unmount surfaces a busy
+        # mountpoint (local process) as a dataset-specific error first.
         obstacles = await self._pool_destroy_obstacles(db, pool_name)
-        if obstacles["active_clients"] or obstacles["mounted"] or obstacles.get("smb_connected"):
+        if obstacles["active_clients"] or obstacles.get("smb_connected"):
             parts = []
-            if obstacles["mounted"]:
-                parts.append(
-                    "child dataset(s) still mounted: " + ", ".join(obstacles["mounted"])
-                )
             if obstacles["active_clients"]:
                 n = len(obstacles["active_clients"])
                 parts.append(f"{n} NFS client(s) still connected")
@@ -152,8 +235,7 @@ class DestructionService:
                 parts.append(f"{n} SMB connection(s) still active on {', '.join(obstacles['smb_connected'])}")
             raise PoolError(
                 f'Pool "{pool_name}" has {"; ".join(parts)}. '
-                "Unmount these datasets and disconnect NFS/SMB clients before destroying "
-                "the pool. (Unmount with e.g. `sudo zfs unmount <dataset>`.)"
+                "Disconnect NFS/SMB clients before destroying the pool."
             )
 
         # Unexport any NFS shares and unshare any SMB shares owned by this pool
@@ -166,6 +248,9 @@ class DestructionService:
                 await self.smb.unshare_pool(db, pool)
             except Exception:
                 pass
+
+        dataset_names = await zfs_query.list_filesystem_names(pool_name)
+        await self._unmount_names([pool_name] + dataset_names)
 
         stdout, stderr, returncode = await run_zpool(
             "destroy", "-f", pool_name,
@@ -207,32 +292,56 @@ class DestructionService:
 
         active_clients = await zfs_query.showmount_clients([f"/{dataset_name}"])
 
+        try:
+            smb_connected = await self._smb_clients_for(dataset_name)
+        except Exception:
+            smb_connected = []
+
         return {
             "mounted": mounted,
             "exports": exports,
             "active_clients": active_clients,
             "smb_share": self.smb.list_shares(db),
+            "smb_connected": smb_connected,
         }
 
     async def destroy_dataset(self, db: Session, dataset_name: str, recursive: bool = False) -> None:
-        """Destroy a dataset (DESTRUCTIVE)."""
+        """Destroy a dataset (DESTRUCTIVE).
+
+        Mounted datasets are unmounted cleanly first (recursively when
+        ``recursive``); an active NFS client, a live SMB share, or an open SMB
+        connection hard-blocks with a specific message.
+        """
         obstacles = await self._dataset_destroy_obstacles(db, dataset_name)
         smb_share = next((s for s in (obstacles.get("smb_share") or [])
                           if s["dataset_name"] == dataset_name), None)
-        if obstacles["mounted"] or obstacles["active_clients"] or smb_share:
+        smb_connected = obstacles.get("smb_connected") or []
+        if obstacles["active_clients"] or smb_share or smb_connected:
             parts = []
-            if obstacles["mounted"]:
-                parts.append("still mounted")
+            if smb_connected:
+                hosts = ", ".join(smb_connected)
+                parts.append(f"held open by an SMB connection from {hosts}")
+            elif smb_share:
+                parts.append("shared over SMB")
             if obstacles["active_clients"]:
                 n = len(obstacles["active_clients"])
-                parts.append(f"{n} NFS client(s) still connected")
-            if smb_share:
-                parts.append("has an active SMB share")
-            raise DatasetError(
-                f'Dataset "{dataset_name}" is {", ".join(parts)}. '
-                "Remove the SMB share, unmount the dataset, and disconnect NFS clients "
-                "before destroying."
-            )
+                parts.append(f"connected to by {n} NFS client(s)")
+            message = f'Dataset "{dataset_name}" is {" and ".join(parts)}.'
+            if smb_connected:
+                message += (
+                    f" Close the mapped network drive on {', '.join(smb_connected)} "
+                    "and retry."
+                )
+            elif smb_share:
+                message += " Remove the SMB share first."
+            else:
+                message += " Unmount those clients before destroying."
+            raise DatasetError(message)
+
+        names = [dataset_name]
+        if recursive:
+            names += await zfs_query.list_filesystem_names(dataset_name)
+        await self._unmount_names(names)
 
         cmd = ["destroy"]
         if recursive:

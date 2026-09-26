@@ -48,9 +48,12 @@ an existing quota. Click **Save Changes**.
 
 The trash icon on the row is irreversible:
 
-- NAZMan first checks the dataset **must be unmounted** and **has no active NFS
-  clients** (`Cannot destroy ... Unmount the dataset and disconnect NFS clients
-  first.`).
+- NAZMan automatically **unmounts** the dataset before the destroy (with all
+  children for recursive destroys), then checks there is **no active NFS
+  client**, **no live SMB share** and **no open SMB connection** — any of these
+  refuses the destroy with specific guidance (e.g. *"Close the mapped network
+  drive on ... and retry."*). If a local process is holding the mountpoint, the
+  unmount fails with a clear error.
 - You are asked whether to destroy **ALL child datasets and snapshots**
   (recursive) or only if no children exist.
 - The final confirmation warns this **cannot be undone**.
