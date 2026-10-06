@@ -1,8 +1,9 @@
 # Set Up Telegram Alerts
 
 NAZMan can message your phone when something goes wrong: an unhealthy pool, a
-scrub or resilver with errors, a pool filling up, or a scheduled task that
-failed. Alerts are delivered through a free Telegram bot.
+scrub or resilver with errors, a pool filling up, a scheduled task that failed,
+or a backup that needs a disk. Alerts are delivered through a free Telegram
+bot.
 
 > Note: Alerts need outbound internet access to `api.telegram.org`. There is no
 > cost involved.
@@ -50,16 +51,40 @@ failed. Alerts are delivered through a free Telegram bot.
 
 ## What triggers an alert
 
+**Pools**
+
 - A pool enters a state other than `ONLINE` (e.g. `DEGRADED`, `FAULTED`,
   `OFFLINE`).
 - A scrub or resilver finishes with read/write/checksum errors.
 - A pool crosses the configured usage threshold (default 90%). Each further
   5% step re-alerts.
-- Any scheduled task (scrub, snapshot, health check, backup) fails.
+
+**Scheduled tasks**
+
+- Any scheduled task (scrub, snapshot, health check) fails.
+
+**Backups** — a backup group reports its own outcomes, independently of the
+scheduler:
+
+- **Session finished** — sent after every session with how many datasets
+  completed and where the data was written. `success` reports as an info
+  message, `partial` (some datasets failed) as a warning.
+- **Session failed** — every dataset in the group errored on the current set.
+- **Needs a disk** — the active set is full, or its disk is offline. Backups
+  pause until you plug in a disk or move the group to another set.
+- **Incremental promoted to full** — a run had no base snapshot to build on,
+  so NAZMan sent a full instead. This is normal after a set is reset, but it
+  means the run transferred much more data than expected.
+
+These are shown on the **Backup Sessions** card as well; the alert is the
+heads-up that something needs your attention.
 
 The cooldown setting (default 60 minutes) stops the same event from
 re-notifying you on every poll - a persistently broken pool is reported once
-per window, not every minute.
+per window, not every minute. Backup session-finished and promotion notices
+bypass that cooldown, since each one is a distinct event worth seeing; the
+failure and needs-a-disk notices are subject to it, so a group that stays
+broken does not message you every few minutes.
 
 ## Where your token is stored
 

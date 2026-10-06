@@ -7,13 +7,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pathlib import Path
 
 from .config import get_settings, ensure_directories
-from .database import init_db
+from .database import get_db_context, init_db
 from .utils.exceptions import NAZManError, NotFoundError
 from .utils.guide import guide_page_context
 from .wiring import get_container
 from .api import (
     disks_router, pools_router, datasets_router,
-    nfs_router, smb_router, snapshots_router, backup_router, zfs_backup_router,
+    backup_groups_router, nfs_router, smb_router, snapshots_router,
+    backup_router, zfs_backup_router,
     system_restore_router,
     system_router, health_router, metrics_router, auth_router, alerts_router,
 )
@@ -33,6 +34,10 @@ async def lifespan(app: FastAPI):
 
     # Start the scheduler (loads persisted tasks) and the metrics recorder.
     await container.scheduler.start()
+    # Reconcile backup group crons into scheduler jobs, so a group configured
+    # in the UI survives a restart (and a job whose group is gone is removed).
+    with get_db_context() as db:
+        await container.backup_groups.sync_scheduled_tasks(db)
     await container.metrics.start()
 
     # Start the alert poller (no-op while alerting is disabled).
@@ -99,6 +104,7 @@ app.include_router(nfs_router)
 app.include_router(smb_router)
 app.include_router(snapshots_router)
 app.include_router(backup_router)
+app.include_router(backup_groups_router)
 app.include_router(zfs_backup_router)
 app.include_router(system_restore_router)
 app.include_router(metrics_router)

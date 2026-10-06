@@ -26,6 +26,7 @@ nazman/managers/metrics_store.py
 nazman/managers/smb_manager.py
 nazman/managers/alert_manager.py
 nazman/services/__init__.py
+nazman/services/backup_group_service.py
 nazman/services/destruction.py
 nazman/services/disk_view.py
 nazman/services/system_restore.py
@@ -52,6 +53,7 @@ nazman/api/datasets.py
 nazman/api/nfs.py
 nazman/api/snapshots.py
 nazman/api/backup.py
+nazman/api/backup_groups.py
 nazman/api/zfs_backup.py
 nazman/api/system_restore.py
 nazman/api/system.py

@@ -167,8 +167,12 @@ function renderPools() {
     container.innerHTML = pools.map(pool => {
         const usable = pool.usable_bytes || 0;
         const pct = pool.used_capacity_pct != null ? pool.used_capacity_pct : null;
-        const used = usable && pct != null ? usable * pct / 100 : null;
-        const free = usable && used != null ? usable - used : pool.free_bytes;
+        const used = pool.allocated_bytes != null
+            ? pool.allocated_bytes
+            : (usable && pct != null ? usable * pct / 100 : null);
+        const free = pool.free_bytes != null
+            ? pool.free_bytes
+            : (usable && used != null ? usable - used : null);
 
         const usageHtml = usable > 0 && pct != null ? `
             <div class="pool-usage-bar" style="background:#444;border-radius:4px;height:10px;overflow:hidden;margin:6px 0">

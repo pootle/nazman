@@ -25,7 +25,8 @@ options, in order of speed:
 
 ## Option A — Restore from a specific backup run
 
-The **Backup Runs** card lists recent runs for every dataset.
+The **Backup Sessions** card lists recent sessions. Each one records which of the
+group's datasets ran, as full or incremental, and the disk it wrote to.
 
 1. Find the run you want (check **Dataset**, **Type**, **Date** and
    **Snapshot**).

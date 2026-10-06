@@ -5,6 +5,7 @@ from .nfs import router as nfs_router
 from .smb import router as smb_router
 from .snapshots import router as snapshots_router
 from .backup import router as backup_router
+from .backup_groups import router as backup_groups_router
 from .zfs_backup import router as zfs_backup_router
 from .system_restore import router as system_restore_router
 from .system import router as system_router, health_router
@@ -20,6 +21,7 @@ __all__ = [
     "smb_router",
     "snapshots_router",
     "backup_router",
+    "backup_groups_router",
     "zfs_backup_router",
     "system_restore_router",
     "system_router",

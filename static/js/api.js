@@ -281,12 +281,13 @@ class NasManAPI {
         return this.request('GET', '/api/backup-zfs/disks/used');
     }
 
-    async declareBackupDisk(diskId, confirm, slotUuid, label, wipeRaid) {
+    async declareBackupDisk(diskId, confirm, slotUuid, label, wipeRaid, backupSetId = null) {
         return this.request('POST', `/api/backup-zfs/disks/${diskId}/declare`, {
             confirm,
             slot_uuid: slotUuid || null,
             label: label || null,
             wipe_raid: !!wipeRaid,
+            backup_set_id: backupSetId,
         });
     }
 
@@ -319,18 +320,12 @@ class NasManAPI {
         return this.request('DELETE', `/api/backup-zfs/disks/${id}`);
     }
 
-    async listBackupableDatasets() {
-        return this.request('GET', '/api/backup-zfs/datasets');
-    }
-
-    async listBackupRuns() {
-        return this.request('GET', '/api/backup-zfs/runs');
-    }
-
-    async runBackup(datasetName, backupDiskId, type) {
-        return this.request('POST', '/api/backup-zfs/runs', {
-            dataset_name: datasetName, backup_disk_id: backupDiskId, backup_type: type
-        });
+    async listBackupRuns(groupId = null, limit = null) {
+        const params = new URLSearchParams();
+        if (groupId) params.set('group_id', groupId);
+        if (limit) params.set('limit', limit);
+        const qs = params.toString();
+        return this.request('GET', `/api/backup-zfs/runs${qs ? `?${qs}` : ''}`);
     }
 
     async restoreBackupRun(runId, datasetName) {
@@ -345,15 +340,6 @@ class NasManAPI {
         return this.request('POST', `/api/backup-zfs/disks/${backupDiskId}/rebuild-manifest`);
     }
 
-    async upsertBackupSchedule(payload) {
-        return this.request('POST', '/api/backup-zfs/schedules', payload);
-    }
-
-    async deleteBackupSchedule(datasetName, backupDiskId) {
-        const params = backupDiskId ? `?backup_disk_id=${backupDiskId}` : '';
-        return this.request('DELETE', `/api/backup-zfs/schedules/${encodeURIComponent(datasetName)}${params}`);
-    }
-
     async listDiskStreams(backupDiskId) {
         return this.request('GET', `/api/backup-zfs/disks/${backupDiskId}/streams`);
     }
@@ -364,12 +350,91 @@ class NasManAPI {
         });
     }
 
+    // Backup groups (datasets, sets, disk chains, sessions)
+    async listBackupGroups() {
+        return this.request('GET', '/api/backup-groups');
+    }
+
+    async getBackupGroup(groupId) {
+        return this.request('GET', `/api/backup-groups/${groupId}`);
+    }
+
+    async createBackupGroup(payload) {
+        return this.request('POST', '/api/backup-groups', payload);
+    }
+
+    async updateBackupGroup(groupId, payload) {
+        return this.request('PATCH', `/api/backup-groups/${groupId}`, payload);
+    }
+
+    async deleteBackupGroup(groupId) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}`);
+    }
+
+    async addGroupDataset(groupId, datasetName) {
+        return this.request('POST', `/api/backup-groups/${groupId}/datasets`, { dataset_name: datasetName });
+    }
+
+    async removeGroupDataset(groupId, datasetName) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}/datasets/${datasetName}`);
+    }
+
+    async createGroupSet(groupId, payload) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets`, payload || {});
+    }
+
+    async listGroupSets(groupId) {
+        return this.request('GET', `/api/backup-groups/${groupId}/sets`);
+    }
+
+    async updateGroupSet(groupId, setId, payload) {
+        return this.request('PATCH', `/api/backup-groups/${groupId}/sets/${setId}`, payload);
+    }
+
+    async deleteGroupSet(groupId, setId) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}/sets/${setId}`);
+    }
+
+    async activateGroupSet(groupId, setId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/activate`);
+    }
+
+    async addSetDisk(groupId, setId, backupDiskId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/disks/${backupDiskId}`);
+    }
+
+    async removeSetDisk(groupId, setId, backupDiskId) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}/sets/${setId}/disks/${backupDiskId}`);
+    }
+
+    async activateBackupDisk(groupId, setId, backupDiskId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/disks/${backupDiskId}/activate`);
+    }
+
+    async advanceGroupSet(groupId, setId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/advance`);
+    }
+
+    async runBackupGroup(groupId, backupType = 'full') {
+        return this.request('POST', `/api/backup-groups/${groupId}/backup`, { backup_type: backupType });
+    }
+
+    async listGroupSessions(groupId) {
+        return this.request('GET', `/api/backup-groups/${groupId}/sessions`);
+    }
+
+    async listAllBackupSessions() {
+        return this.request('GET', '/api/backup-groups/sessions/all');
+    }
+
     // Disk partition layout (system rebuild)
     async recreatePartitions(diskId, partitions) {
         return this.request('POST', `/api/disks/${diskId}/recreate-partitions`, { partitions });
     }
 
     // System restore / rebuild
+    // A "set" here is a backup set discovered on attached media. Its chain may
+    // span several volumes, all of which must be attached to restore it.
     async listBackupSets() {
         return this.request('GET', '/api/system-restore/sets');
     }

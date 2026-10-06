@@ -28,8 +28,9 @@ dropdown (defaults to **All Datasets**) and **Refresh**.
 
 ## Recurring snapshots
 
-The UI's per-dataset **Full/Incr cron** fields on the [Backup](backup) page
-create snapshots automatically as part of each backup run. There is no
+The **Full cron** and **Incr cron** fields on a backup group's card on the
+[Backup](backup) page create snapshots automatically as part of each backup
+session for every dataset in that group. There is no
 separate "scheduled snapshots" screen — schedule recurring point-in-time
 snapshots there, or via `cron` at the shell.
 

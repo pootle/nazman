@@ -89,7 +89,7 @@ zpool status tank        # Resilvered: N% - shows ETA
    with normal use).
 2. The pool returns to **ONLINE**; the failing drive should now be **removed**
    on the Disks page — **Drop** it to clean up.
-3. Check **Backup** → **Backup Runs** for a recent success, and re-run a backup
-   if the last one was before the failure.
+3. Check **Backup** → **Backup Sessions** for a recent success, and re-run the
+   group if the last session was before the failure.
 
 Next: [Recover a Dataset](recover-dataset)

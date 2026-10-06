@@ -28,8 +28,9 @@ from the backup disks — the running database is not required.
 ### Step 1 — Find backup sets
 
 Connect your backup disks and click **Scan disks**. NAZMan mounts each
-candidate read-only, reads its manifest, and lists the backup info sets it
-finds (volume, device, pools, datasets, config bundles). Select one.
+candidate read-only, reads its manifest, and lists the backup sets it finds
+(pools, datasets, config bundles, and how many disks each set spans). Select
+one.
 
 ### Step 2 — Review the set
 
@@ -58,16 +59,28 @@ Each dataset from the set is listed with a checkbox (on by default) and a
 **Target pool** dropdown, pre-selected when a pool of the same name exists.
 Adjust the target pool if you renamed pools, then **Restore selected**.
 
-If datasets live on more than one backup disk, the **Required backup media**
-list shows which disks are connected. Insert each disk and use **Restore from
-this disk** to restore the datasets stored on it.
+A backup set is a **chain**: its disks hold successive parts of the same
+datasets, and each disk's manifest names the set it belongs to. NAZMan groups
+the disks it finds by that stamp, so a set spread over several disks is listed
+once with a **Disks** count instead of appearing several times.
+
+The **Required backup media** list shows every disk that holds part of the
+chain and whether it is connected. Insert all of them — a chain cannot be read
+without each disk that holds part of it. A dataset whose chain continues onto
+a disk that is missing is marked, and restoring it fails rather than silently
+producing a partial dataset.
+
+Media written before backup sets existed has no set stamp; each such volume is
+offered as its own single-disk set, exactly as before.
 
 ### Step 5 — Finish (optional)
 
-- **Adopt backup media** — re-register the backup volume as a declared backup
-  disk so future backups work.
-- **Rebuild schedules** — reconcile the restored backup schedules into running
-  scheduler jobs.
+- **Adopt backup media** — re-register the restored backup disks as declared
+  backup disks so future backups can use them. Every disk of the set is
+  adopted; any that cannot be (no filesystem UUID, or not matched to an
+  attached disk) is listed so you can deal with it.
+- **Rebuild schedules** — reconcile the restored backup groups' crons into
+  running scheduler jobs.
 
 > **Summary:** Scan → review → recreate pools → restore datasets (inserting each
 > disk as prompted) → adopt media and rebuild schedules. Configuration can be

@@ -198,52 +198,177 @@ class SystemRestoreService:
         finally:
             await self._unmount(mountpoint)
 
-    def _set_id(self, candidate: Dict[str, Any]) -> str:
+    def _volume_id(self, candidate: Dict[str, Any]) -> str:
+        """Identify one backup volume (what is physically attached)."""
         return candidate.get("fs_uuid") or f"dev:{candidate['device_name']}"
 
-    async def discover_backup_sets(self, db: Session) -> List[Dict[str, Any]]:
-        """Scan all disks and return a menu of available backup info sets."""
-        sets = []
+    @staticmethod
+    def _manifest_set_id(manifest: Dict[str, Any]) -> Optional[str]:
+        """The backup set a volume belongs to, as stamped by the writer.
+
+        Volumes written before backup sets existed carry no stamp, so they are
+        each their own set - which is exactly what they are.
+        """
+        for ds in manifest.get("datasets") or []:
+            for run in ds.get("backups") or []:
+                if run.get("set_id"):
+                    return str(run["set_id"])
+        return None
+
+    @staticmethod
+    def _merge_manifests(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Combine a set's volumes into one logical manifest.
+
+        A set is a chain spread over its volumes, so the set's contents are the
+        union of its volumes' - datasets matched by name, runs matched by
+        stream file, so re-reading a volume twice cannot duplicate entries.
+        """
+        merged: Dict[str, Any] = {
+            "datasets": [],
+            "pools": [],
+            "config_backups": [],
+            "media": {},
+        }
+        updated = ""
+        for manifest in manifests:
+            if not manifest:
+                continue
+            for key in ("manifest_version", "nazman_version", "created_at"):
+                if merged.get(key) is None and manifest.get(key) is not None:
+                    merged[key] = manifest[key]
+            updated = max(updated, manifest.get("updated_at") or "")
+            if manifest.get("media") and not merged["media"]:
+                merged["media"] = manifest["media"]
+            for pool in manifest.get("pools") or []:
+                if pool.get("name") and not any(
+                    p.get("name") == pool.get("name") for p in merged["pools"]
+                ):
+                    merged["pools"].append(pool)
+            for config in manifest.get("config_backups") or []:
+                if not any(c.get("id") == config.get("id") for c in merged["config_backups"]):
+                    merged["config_backups"].append(config)
+            for ds in manifest.get("datasets") or []:
+                target = next(
+                    (d for d in merged["datasets"] if d.get("name") == ds.get("name")), None,
+                )
+                if target is None:
+                    target = {
+                        "name": ds.get("name"), "pool": ds.get("pool"),
+                        "properties": dict(ds.get("properties") or {}),
+                        "mountpoint": ds.get("mountpoint"), "backups": [],
+                    }
+                    merged["datasets"].append(target)
+                for key in ("pool", "mountpoint"):
+                    if ds.get(key):
+                        target[key] = ds[key]
+                if ds.get("properties"):
+                    target["properties"] = dict(ds["properties"])
+                runs = target.setdefault("backups", [])
+                for run in ds.get("backups") or []:
+                    runs[:] = [r for r in runs if r.get("stream_file") != run.get("stream_file")]
+                    runs.append(run)
+        merged["updated_at"] = updated or None
+        for ds in merged["datasets"]:
+            ds["backups"].sort(key=lambda r: r.get("created_at") or "")
+        return merged
+
+    async def _scan_volumes(self, db: Session) -> List[Dict[str, Any]]:
+        """Every attached volume with a readable backup manifest."""
+        found = []
         for candidate in await self.list_candidates(db):
             manifest = await self._read_manifest(candidate)
             if manifest is None:
                 continue
-            summary = bm.manifest_summary(manifest)
-            summary.update({
-                "set_id": self._set_id(candidate),
-                "device": candidate["device"],
-                "by_id": candidate.get("by_id"),
-                "fstype": candidate.get("fstype"),
-                "label": candidate.get("label"),
-                "fs_uuid": candidate.get("fs_uuid"),
-                "volume_root": manifest.get("_volume_root"),
+            found.append({
+                "candidate": candidate,
+                "manifest": manifest,
+                "volume_id": self._volume_id(candidate),
+                "set_id": self._manifest_set_id(manifest) or self._volume_id(candidate),
             })
-            sets.append(summary)
+        return found
+
+    async def discover_backup_sets(self, db: Session) -> List[Dict[str, Any]]:
+        """Scan all disks and return a menu of available backup sets.
+
+        A set may span several volumes, so volumes are grouped by the set
+        stamp their writer left; the menu shows one entry per set with the
+        media it needs.
+        """
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for volume in await self._scan_volumes(db):
+            groups.setdefault(volume["set_id"], []).append(volume)
+
+        sets = []
+        for set_id, volumes in groups.items():
+            merged = self._merge_manifests([v["manifest"] for v in volumes])
+            summary = bm.manifest_summary(merged)
+            volume_views = []
+            for v in volumes:
+                candidate = v["candidate"]
+                volume_views.append({
+                    "volume_id": v["volume_id"],
+                    "device": candidate["device"],
+                    "by_id": candidate.get("by_id"),
+                    "fstype": candidate.get("fstype"),
+                    "label": candidate.get("label"),
+                    "fs_uuid": candidate.get("fs_uuid"),
+                })
+            sets.append({
+                **summary,
+                "set_id": set_id,
+                "volume_count": len(volume_views),
+                "volumes": volume_views,
+                # Kept for the single-volume case, where it is the set itself.
+                "fs_uuid": volume_views[0]["fs_uuid"] if len(volume_views) == 1 else None,
+                "label": volume_views[0].get("label"),
+                "media_fs_uuids": sorted({
+                    v["volume_id"] for v in volumes
+                }) or summary.get("media_fs_uuids") or [],
+            })
         return sets
+
+    async def _volumes_of(self, db: Session, set_id: str) -> List[Dict[str, Any]]:
+        """The attached volumes that make up a set."""
+        volumes = [v for v in await self._scan_volumes(db) if v["set_id"] == set_id]
+        if not volumes:
+            raise BackupError(f"Backup set {set_id} not found on any attached disk")
+        return volumes
 
     async def _find_candidate(self, db: Session, set_id: str) -> Dict[str, Any]:
         for candidate in await self.list_candidates(db):
-            if self._set_id(candidate) == set_id:
+            if self._volume_id(candidate) == set_id:
                 return candidate
+        for volume in await self._scan_volumes(db):
+            if volume["set_id"] == set_id:
+                return volume["candidate"]
         raise BackupError(f"Backup set {set_id} not found on any attached disk")
 
     async def _manifest_for(self, db: Session, set_id: str) -> Dict[str, Any]:
-        candidate = await self._find_candidate(db, set_id)
-        manifest = await self._read_manifest(candidate)
-        if manifest is None:
-            raise BackupError(f"Backup set {set_id} could not be read")
-        manifest["_candidate"] = candidate
+        """The set's merged manifest, across every volume that belongs to it."""
+        volumes = await self._volumes_of(db, set_id)
+        manifest = self._merge_manifests([v["manifest"] for v in volumes])
+        manifest["_volumes"] = volumes
         return manifest
 
     async def get_backup_set(self, db: Session, set_id: str) -> Dict[str, Any]:
         """Full detail of one backup set (pools, datasets, config, media)."""
         manifest = await self._manifest_for(db, set_id)
-        candidate = manifest.pop("_candidate", {})
-        manifest.pop("_volume_root", None)
+        volumes = manifest.pop("_volumes", [])
+        summary = bm.manifest_summary(manifest)
         return {
             "set_id": set_id,
-            "candidate": candidate,
-            "summary": bm.manifest_summary(manifest),
+            "volume_count": len(volumes),
+            "volumes": [
+                {
+                    "volume_id": v["volume_id"],
+                    "device": v["candidate"]["device"],
+                    "by_id": v["candidate"].get("by_id"),
+                    "label": v["candidate"].get("label"),
+                    "fs_uuid": v["candidate"].get("fs_uuid"),
+                }
+                for v in volumes
+            ],
+            "summary": summary,
             "manifest": manifest,
             "required_media": await self.required_media(db, set_id),
         }
@@ -353,6 +478,8 @@ class SystemRestoreService:
     async def restore_plan(self, db: Session, set_id: str) -> List[Dict[str, Any]]:
         """Datasets to restore, with a suggested target pool (default on)."""
         manifest = await self._manifest_for(db, set_id)
+        volumes = manifest.get("_volumes") or []
+        connected = {v["volume_id"] for v in volumes}
         pools = await self.zfs.list_pool_names(db) if self.zfs is not None else []
         plan = []
         for ds in manifest.get("datasets", []):
@@ -362,8 +489,11 @@ class SystemRestoreService:
             source = ds.get("name")
             leaf = source.split("/", 1)[1] if "/" in source else source
             suggested = ds.get("pool") if ds.get("pool") in pools else None
+            # A set's chain can span several volumes, so the plan says which
+            # ones this dataset needs and whether they are all attached.
+            chain = self._chain(backups)
             media = sorted({
-                b.get("media_fs_uuid") for b in backups if b.get("media_fs_uuid")
+                b.get("media_fs_uuid") for b in chain if b.get("media_fs_uuid")
             })
             plan.append({
                 "source_dataset": source,
@@ -372,22 +502,26 @@ class SystemRestoreService:
                 "pools": pools,
                 "enabled": True,
                 "media_fs_uuids": media,
-                "chain": self._chain(backups),
+                "media_missing": [m for m in media if m not in connected],
+                "spans_volumes": len(media) > 1,
+                "chain": chain,
             })
         return plan
 
     # ── Media grouping ──────────────────────────────────────────────────
     async def required_media(self, db: Session, set_id: str) -> List[Dict[str, Any]]:
+        """Which volumes of the set hold the streams, and are they attached?"""
         manifest = await self._manifest_for(db, set_id)
-        candidates = await self.list_candidates(db)
-        present = {self._set_id(c): c for c in candidates}
+        volumes = manifest.get("_volumes") or []
+        present = {v["volume_id"]: v for v in volumes}
+        labels = {v["volume_id"]: v["candidate"].get("label") for v in volumes}
         groups: Dict[str, Dict[str, Any]] = {}
         for ds in manifest.get("datasets", []):
             for b in self._chain(ds.get("backups") or []):
                 key = b.get("media_fs_uuid") or ""
                 group = groups.setdefault(key, {
                     "media_fs_uuid": key or None,
-                    "label": b.get("media_label"),
+                    "label": labels.get(key) or b.get("media_label"),
                     "datasets": [],
                     "connected": key in present if key else False,
                 })
@@ -395,11 +529,32 @@ class SystemRestoreService:
                     group["datasets"].append(ds.get("name"))
         return list(groups.values())
 
+    async def _mount_volumes(self, db: Session, set_id: str) -> tuple:
+        """Mount every volume of a set read-only, so a chain can cross them."""
+        volumes = await self._volumes_of(db, set_id)
+        mounted: List[tuple] = []
+        try:
+            for volume in volumes:
+                mountpoint = await self._mount_readonly(volume["candidate"])
+                if mountpoint is not None:
+                    mounted.append((volume["candidate"], mountpoint))
+        except Exception:
+            for _candidate, mountpoint in mounted:
+                await self._unmount(mountpoint)
+            raise
+        if not mounted:
+            raise BackupError(f"Could not mount any volume of backup set {set_id}")
+        return mounted
+
+    async def _unmount_all(self, mounted: List[tuple]) -> None:
+        for _candidate, mountpoint in mounted:
+            await self._unmount(mountpoint)
+
     async def _mount_for_set(self, db: Session, set_id: str) -> tuple:
-        candidate = await self._find_candidate(db, set_id)
-        mountpoint = await self._mount_readonly(candidate)
-        if mountpoint is None:
-            raise BackupError(f"Could not mount backup volume {set_id}")
+        """Mount the set's first volume (config bundles live on one volume)."""
+        mounted = await self._mount_volumes(db, set_id)
+        candidate, mountpoint = mounted[0]
+        await self._unmount_all(mounted[1:])
         return candidate, mountpoint
 
     async def restore_datasets(
@@ -409,14 +564,16 @@ class SystemRestoreService:
         """Replay each selected dataset's latest chain into its target pool.
 
         ``selections`` entries are ``{source_dataset, target_pool, enabled}``.
-        When ``media_fs_uuid`` is given only datasets whose chain lives entirely
-        on that medium are restored (used to prompt disk-by-disk).
+        Every volume of the set is mounted, because a set's chain is spread
+        across its disks in the order they filled up; each stream is read from
+        whichever volume the writer put it on.  When ``media_fs_uuid`` is given
+        only datasets whose chain lives entirely on that volume are restored
+        (used to prompt disk-by-disk).
         """
         if self.zfs_backup is None:
             raise BackupError("ZFS backup manager unavailable")
         manifest = await self._manifest_for(db, set_id)
-        manifest.pop("_candidate", None)
-        manifest.pop("_volume_root", None)
+        manifest.pop("_volumes", None)
 
         by_name = {d.get("name"): d for d in manifest.get("datasets", [])}
         chosen = []
@@ -434,64 +591,43 @@ class SystemRestoreService:
             leaf = source.split("/", 1)[1] if "/" in source else source
             target = f"{target_pool}/{leaf}"
             chain_media = {(b.get("media_fs_uuid") or None) for b in chain}
-            if len(chain_media) > 1:
-                chosen.append((source, target, chain, None,
-                               "chain spans multiple backup media"))
+            if media_fs_uuid is not None and chain_media != {media_fs_uuid}:
+                # Restricting to one volume: only what fits entirely on it.
                 continue
-            media = next(iter(chain_media))
-            if media_fs_uuid is not None and media != media_fs_uuid:
-                continue
-            chosen.append((source, target, chain, media, None))
+            chosen.append((source, target, chain))
 
+        # Parents before children, so a dataset's parent pool/dataset exists
+        # before the child is received into it.
         chosen.sort(key=lambda item: item[0].count("/"))
 
+        mounted = await self._mount_volumes(db, set_id)
         results = []
-        groups: Dict[Optional[str], List[tuple]] = {}
-        for source, target, chain, media, err in chosen:
-            if err:
-                results.append({"source": source, "target": target, "status": "failed", "error": err})
-            else:
-                groups.setdefault(media, []).append((source, target, chain))
-
-        # Each group's streams live on one medium; mount it for the replay.
-        for media, items in groups.items():
-            volume_root = await self._mount_media(db, set_id, media)
-            if volume_root is None:
-                for source, target, _chain in items:
-                    results.append({
-                        "source": source, "target": target, "status": "failed",
-                        "error": "Backup medium is not connected",
-                    })
-                continue
-            try:
-                for source, target, chain in items:
-                    results.append(await self._restore_one(source, target, chain, volume_root))
-            finally:
-                await self._unmount(volume_root)
+        try:
+            for source, target, chain in chosen:
+                results.append(
+                    await self._restore_one(source, target, chain, mounted)
+                )
+        finally:
+            await self._unmount_all(mounted)
         return {"set_id": set_id, "results": results}
 
-    async def _mount_media(self, db: Session, set_id: str, media_uuid: Optional[str]) -> Optional[Path]:
-        """Mount the volume holding a dataset chain's streams.
-
-        Falls back to the selected set's own volume when no media UUID was
-        recorded; otherwise the matching candidate is mounted read-only.
-        """
-        if not media_uuid or media_uuid == set_id:
-            _candidate, mountpoint = await self._mount_for_set(db, set_id)
-            return mountpoint
-        for candidate in await self.list_candidates(db):
-            if self._set_id(candidate) == media_uuid:
-                return await self._mount_readonly(candidate)
-        return None
-
     async def _restore_one(
-        self, source: str, target: str, chain: List[Dict[str, Any]], volume_root: Path,
+        self, source: str, target: str, chain: List[Dict[str, Any]],
+        mounted: List[tuple],
     ) -> Dict[str, Any]:
         exists = await self.zfs.dataset_exists(target) if self.zfs is not None else False
         entry: Dict[str, Any] = {"source": source, "target": target, "streams": []}
         try:
             for b in chain:
-                stream = volume_root / (b.get("stream_file") or "")
+                stream = self._locate_stream(b, mounted)
+                if stream is None:
+                    missing = b.get("media_fs_uuid") or "its backup volume"
+                    entry["status"] = "failed"
+                    entry["error"] = (
+                        f"Stream {b.get('stream_file')} is not connected "
+                        f"(expected on {missing})"
+                    )
+                    return entry
                 result = await self.zfs_backup.receive_stream(
                     str(stream), target, force=exists or b.get("type") == "incremental",
                 )
@@ -503,66 +639,132 @@ class SystemRestoreService:
             entry["error"] = str(e)
         return entry
 
+    @staticmethod
+    def _locate_stream(run: Dict[str, Any], mounted: List[tuple]) -> Optional[Path]:
+        """Find a stream on whichever mounted volume of the set holds it.
+
+        The recorded media UUID is the fast path; falling back to a scan of
+        every volume means a chain still restores when a volume's identity
+        changed (e.g. the media was re-imaged).
+        """
+        relative = run.get("stream_file") or ""
+        preferred = run.get("media_fs_uuid")
+        for candidate, mountpoint in mounted:
+            if preferred and candidate.get("fs_uuid") != preferred:
+                continue
+            stream = mountpoint / relative
+            if stream.exists():
+                return stream
+        for _candidate, mountpoint in mounted:
+            stream = mountpoint / relative
+            if stream.exists():
+                return stream
+        return None
+
     # ── Configuration restore ───────────────────────────────────────────
     async def restore_configuration(self, db: Session, set_id: str, config_id: str) -> Dict[str, Any]:
         manifest = await self._manifest_for(db, set_id)
-        manifest.pop("_candidate", None)
-        manifest.pop("_volume_root", None)
+        manifest.pop("_volumes", None)
         entry = next((e for e in manifest.get("config_backups", []) if e.get("id") == config_id), None)
         if entry is None:
             raise ValidationError(f"Config backup {config_id} not found in set")
         if self.backup is None:
             raise BackupError("Backup manager unavailable")
 
-        _candidate, volume_root = await self._mount_for_set(db, set_id)
+        # Each volume carries its own bundle, so the one being restored may be
+        # on any volume of the set.
+        mounted = await self._mount_volumes(db, set_id)
         try:
-            bundle = volume_root / (entry.get("path") or "")
+            relative = entry.get("path") or ""
+            bundle = None
+            for _candidate, mountpoint in mounted:
+                if (mountpoint / relative).exists():
+                    bundle = mountpoint / relative
+                    break
+            if bundle is None:
+                raise BackupError(
+                    f"Config backup {config_id} is not on any connected volume of this set"
+                )
             await self.backup.restore_configuration_bundle(db, bundle)
         finally:
-            await self._unmount(volume_root)
+            await self._unmount_all(mounted)
         return {"set_id": set_id, "config_id": config_id, "restored": True}
 
     # ── Post-restore adoption (independent options) ─────────────────────
     async def adopt_media(self, db: Session, set_id: str) -> Dict[str, Any]:
-        """Re-register the backup volume as a declared backup disk."""
-        candidate = await self._find_candidate(db, set_id)
-        if not candidate.get("fs_uuid"):
-            raise ValidationError("Backup volume has no filesystem UUID; cannot adopt")
-        existing = db.query(BackupDisk).filter(BackupDisk.fs_uuid == candidate["fs_uuid"]).first()
-        if existing:
-            return {"adopted": False, "backup_disk_id": existing.id, "message": "Already declared"}
+        """Re-register the set's backup volumes as declared backup disks.
 
-        base_by_id = candidate.get("base_by_id")
-        disk = db.query(Disk).filter(Disk.by_id == base_by_id).first() if base_by_id else None
-        if disk is None:
-            raise ValidationError("Could not match the backup volume to an attached disk")
+        A set's volumes form one chain, so adopting the set adopts all of its
+        attached volumes; the ones still missing are reported rather than
+        silently skipped, because the chain cannot be used without them.
+        """
+        volumes = await self._volumes_of(db, set_id)
+        adopted: List[int] = []
+        already: List[int] = []
+        missing: List[str] = []
+        for volume in volumes:
+            candidate = volume["candidate"]
+            if not candidate.get("fs_uuid"):
+                missing.append(f"{candidate.get('device')} (no filesystem UUID)")
+                continue
+            existing = db.query(BackupDisk).filter(
+                BackupDisk.fs_uuid == candidate["fs_uuid"],
+            ).first()
+            if existing:
+                already.append(existing.id)
+                continue
+            base_by_id = candidate.get("base_by_id")
+            disk = db.query(Disk).filter(Disk.by_id == base_by_id).first() if base_by_id else None
+            if disk is None:
+                missing.append(f"{candidate.get('label') or candidate.get('device')} "
+                               "(not matched to an attached disk)")
+                continue
 
-        from ..config import get_settings
-        mount_base = Path(get_settings().backup_mount_base)
-        mount_point = mount_base / candidate["fs_uuid"]
-        mount_point.mkdir(parents=True, exist_ok=True)
-        await run_command(
-            ["mount", candidate["device"], str(mount_point)],
-            timeout=60, check=False, op="write", category="disk",
-        )
-        rec = BackupDisk(
-            disk_id=disk.id,
-            slot_uuid=None,
-            partition_number=candidate.get("partition_number") or 1,
-            label=candidate.get("label"),
-            fs_type=candidate.get("fstype") or "ext4",
-            mount_point=str(mount_point),
-            fs_uuid=candidate["fs_uuid"],
-        )
-        db.add(rec)
-        db.commit()
-        db.refresh(rec)
-        return {"adopted": True, "backup_disk_id": rec.id, "mount_point": str(mount_point)}
+            from ..config import get_settings
+            mount_base = Path(get_settings().backup_mount_base)
+            mount_point = mount_base / candidate["fs_uuid"]
+            mount_point.mkdir(parents=True, exist_ok=True)
+            await run_command(
+                ["mount", candidate["device"], str(mount_point)],
+                timeout=60, check=False, op="write", category="disk",
+            )
+            rec = BackupDisk(
+                disk_id=disk.id,
+                slot_uuid=None,
+                partition_number=candidate.get("partition_number") or 1,
+                label=candidate.get("label"),
+                fs_type=candidate.get("fstype") or "ext4",
+                mount_point=str(mount_point),
+                fs_uuid=candidate["fs_uuid"],
+            )
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
+            adopted.append(rec.id)
+        return {
+            "adopted": bool(adopted),
+            "backup_disk_ids": adopted,
+            "already_declared": already,
+            "missing": missing,
+            "message": (
+                f"Declared {len(adopted)} volume(s); {len(already)} already declared"
+                + (f"; {len(missing)} could not be adopted" if missing else "")
+            ),
+        }
 
     async def rebuild_schedules(self, db: Session, set_id: str) -> Dict[str, Any]:
-        """Reconcile restored backup schedules into scheduler jobs."""
-        if self.zfs_backup is None:
-            raise BackupError("ZFS backup manager unavailable")
-        await self.zfs_backup.sync_scheduled_tasks(db)
-        count = len(db.query(BackupDisk).all())
-        return {"set_id": set_id, "backup_disks": count, "schedules_synced": True}
+        """Reconcile the restored backup groups into scheduler jobs.
+
+        A restored database's groups keep their crons, so the jobs are rebuilt
+        from them rather than from the media that was just read.
+        """
+        from ..models.backup_zfs import BackupGroup
+        from .backup_group_service import BackupGroupService
+
+        groups = db.query(BackupGroup).count()
+        service = BackupGroupService(
+            zfs_backup=self.zfs_backup, scheduler=self.scheduler,
+        )
+        await service.sync_scheduled_tasks(db)
+        return {"set_id": set_id, "backup_disks": len(db.query(BackupDisk).all()),
+                "backup_groups": groups, "schedules_synced": True}

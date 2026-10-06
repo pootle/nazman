@@ -13,7 +13,7 @@ disappear.
 | **Backup disk shows Not connected** | Device not visible. Try the **Wake / Replug** action (software re-enumerate). If the USB enclosure is powered but asleep, power-cycle it. The disk must reach **Mounted** before backups/restores. |
 | **Filesystem changed** | A device is present but has a different filesystem UUID than declared. You have the wrong disk plugged in, or the disk was re-formatted/re-partitioned underneath NAZMan. **Scan** to re-probe; if it is genuinely the old disk with new identity, re-declare it (the old streams on it are still readable via **Restore from Backup Disk**). |
 | **Full** | No free space. Thin out old stream files on the disk (or the pool hosting them) or move to a larger disk for the next full. |
-| **Backup fails** | Check the failing run's row on the **Backup Runs** card (the error is in the status tooltip) and the Command Log for the `zfs send`/`zfs receive` stderr. Common: disk filled mid-stream (→ **Full**), or the dataset gained a snapshot conflict (destroy the stray `backup-*` snapshot). |
+| **Backup fails** | Check the session on the **Backup Sessions** card (the error is in the status tooltip) and the Command Log for the `zfs send`/`zfs receive` stderr. Common: no disk with room in the active set (the group is marked **needs a disk**), a disk filled mid-stream (→ **Full**), or the dataset gained a snapshot conflict (destroy the stray `backup-*` snapshot). |
 
 ## Pool / disk issues
 

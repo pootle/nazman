@@ -5,9 +5,10 @@
 
 {% block content %}
 <div class="backup-page">
-    <p class="text-muted">Back up selected ZFS datasets to a declared external backup disk. Full and incremental
-        (snapshot-stream to gzip files). Each volume also receives the current configuration automatically, so any
-        single disk can rebuild the whole system — see its <strong>Manifest</strong>.</p>
+    <p class="text-muted">A <strong>backup group</strong> is a fixed list of ZFS datasets. It is written to
+        <strong>sets</strong> — a ring of backup disks that are used in turn, so each disk in a set is a spare for
+        the others. The first run on a set captures a full snapshot of every dataset plus the current configuration;
+        later runs send only what changed. Full and incremental runs are gzip snapshot-streams.</p>
 
     <!-- Backup Disks -->
     <div class="card">
@@ -25,26 +26,38 @@
         </div>
     </div>
 
-    <!-- Datasets / Scheduling / On-demand -->
+    <!-- Backup Groups -->
     <div class="card">
         <div class="card-header">
-            <h2><i class="fas fa-folder-open"></i> Datasets to Back Up</h2>
+            <h2><i class="fas fa-layer-group"></i> Backup Groups</h2>
+            <div>
+                <button class="btn btn-secondary" onclick="loadBackupGroups()">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+                <button class="btn btn-primary" onclick="openGroupModal()">
+                    <i class="fas fa-plus"></i> New Group
+                </button>
+            </div>
         </div>
         <div class="card-body">
-            <div id="dataset-backup" class="dataset-backup"><p class="loading">Loading datasets...</p></div>
+            <div id="backup-groups" class="backup-groups">
+                <p class="loading">Loading backup groups...</p>
+            </div>
         </div>
     </div>
 
-    <!-- Runs / History -->
+    <!-- Sessions / History -->
     <div class="card">
         <div class="card-header">
-            <h2><i class="fas fa-history"></i> Backup Runs</h2>
-            <button class="btn btn-secondary" onclick="loadBackupRuns()">
+            <h2><i class="fas fa-history"></i> Backup Sessions</h2>
+            <button class="btn btn-secondary" onclick="loadBackupSessions()">
                 <i class="fas fa-sync-alt"></i> Refresh
             </button>
         </div>
         <div class="card-body">
-            <div id="backup-runs" class="history-table"><p class="loading">Loading backup runs...</p></div>
+            <div id="backup-sessions" class="history-table">
+                <p class="loading">Loading backup sessions...</p>
+            </div>
         </div>
     </div>
 </div>
@@ -109,6 +122,60 @@
         </div>
     </div>
 </div>
+<div id="group-modal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:600px">
+        <div class="modal-header">
+            <h3 id="group-modal-title">New Backup Group</h3>
+            <button class="close" onclick="hideGroupModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <label for="group-name" class="form-label" style="display:block;margin-bottom:4px;">Name</label>
+            <input id="group-name" class="form-control" type="text" maxlength="100" placeholder="e.g. Media">
+
+            <label class="form-label" style="display:block;margin:12px 0 4px;">Datasets</label>
+            <div id="group-dataset-list" class="checkbox-list"
+                 style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;"></div>
+
+            <label for="group-full-cron" class="form-label" style="display:block;margin:12px 0 4px;">
+                Full backup cron</label>
+            <input id="group-full-cron" class="form-control" type="text" placeholder="e.g. 0 2 * * 0">
+
+            <label for="group-incr-cron" class="form-label" style="display:block;margin:12px 0 4px;">
+                Incremental cron</label>
+            <input id="group-incr-cron" class="form-control" type="text" placeholder="e.g. 0 3 * * *">
+
+            <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
+                <input type="checkbox" id="group-enabled" checked>
+                <span>Enabled</span>
+            </label>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-primary" id="group-modal-ok">Save</button>
+            <button class="btn btn-secondary" onclick="hideGroupModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<div id="set-modal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:520px">
+        <div class="modal-header">
+            <h3>Add Backup Set</h3>
+            <button class="close" onclick="hideSetModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p class="text-muted">A set is a ring of backup disks used in turn. Position decides the order the
+                sets are used; the next set is chosen when one is full.</p>
+            <label for="set-label" class="form-label" style="display:block;margin-bottom:4px;">Label</label>
+            <input id="set-label" class="form-control" type="text" maxlength="100" placeholder="e.g. 2026-01">
+            <label for="set-position" class="form-label" style="display:block;margin:12px 0 4px;">Position</label>
+            <input id="set-position" class="form-control" type="number" min="0" placeholder="auto">
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-primary" id="set-modal-ok">Add Set</button>
+            <button class="btn btn-secondary" onclick="hideSetModal()">Cancel</button>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -125,17 +192,20 @@ async function loadBackupPage() {
 // ── ZFS data backup ──────────────────────────────────────────────────
 let backupDisks = [];
 let backupDatasets = [];
-let backupRuns = [];
+let backupGroups = [];
+let backupSessions = [];
+let editingGroupId = null;
+let addingSetToGroupId = null;
 let allDisks = [];
 let diskPartitions = {};
 let usedDisks = [];
 
 async function loadZfsBackup() {
-    // The dataset panel renders backup-disk options, so disks must load first.
+    // The group panel offers backup disks when building a set, so disks load first.
     await loadBackupDisks();
     await Promise.all([
-        loadBackupDatasets(),
-        loadBackupRuns()
+        loadBackupGroups(),
+        loadBackupSessions()
     ]);
 }
 
@@ -166,12 +236,12 @@ async function loadBackupDisks() {
     try {
         backupDisks = await api.listBackupDisks();
         await refreshDiskInventory();
-        renderBackupDisks();
-        renderBackupDatasets();
-        scheduleDisksPoll();
     } catch (e) {
         showError('backup-disks', 'Failed to load backup disks');
+        return;
     }
+    renderBackupDisks();
+    scheduleDisksPoll();
 }
 
 const BACKUP_STATUS_LABELS = {
@@ -413,6 +483,8 @@ async function confirmDeclareDisk() {
     hideDeclareDisk();
 
     const raidLines = [];
+    const knownLines = [];
+    const foreignLines = [];
     try {
         const info = await api.backupDiskRaidInfo(id, slotUuid || null);
         for (const md of info.md || []) {
@@ -421,6 +493,22 @@ async function confirmDeclareDisk() {
                 + (md.version ? ` · version ${md.version}` : '')
                 + (md.os_backing ? ' — part of the OS, must be handled manually' : '')
             );
+        }
+        const mdNames = new Set((info.md || []).map(m => (m.device || '').split('/').pop()));
+        for (const p of info.partitions || []) {
+            if (p.kind === 'backup_disk') {
+                knownLines.push(`This disk is the ${p.detail}.`);
+            } else if (p.kind === 'zfs_pool') {
+                knownLines.push(`This disk is a ${p.detail}.`);
+            } else if (p.kind === 'md_raid') {
+                // The RAID block above already covers superblock members; only
+                // mention arrays mdadm did not identify.
+                if (!mdNames.has((p.device_path || '').split('/').pop())) {
+                    foreignLines.push(`Partition ${p.number} (${p.device_path}) is ${p.detail} — not managed by NAZMan; it will be destroyed.`);
+                }
+            } else if (p.kind !== 'unknown' || p.detail !== 'no filesystem') {
+                foreignLines.push(`Partition ${p.number} (${p.device_path}) is ${p.detail} — not managed by NAZMan; it will be destroyed.`);
+            }
         }
     } catch (e) {
         // The raid probe is best-effort; the backend re-checks at declare time.
@@ -434,8 +522,10 @@ async function confirmDeclareDisk() {
     } else {
         raidDiv.style.display = 'none';
     }
-    document.getElementById('declare-confirm-message').textContent =
-        `Wipe and format ${target} as the backup target?\n\n${warning}`;
+    const messageLines = [`Wipe and format ${target} as the backup target?`, warning];
+    if (knownLines.length) messageLines.push('', ...knownLines);
+    if (foreignLines.length) messageLines.push('', ...foreignLines);
+    document.getElementById('declare-confirm-message').textContent = messageLines.join('\n');
     document.getElementById('declare-confirm-ok').onclick = () => {
         const wipeRaid = document.getElementById('declare-confirm-wipe-raid').checked;
         hideDeclareConfirm();
@@ -455,186 +545,416 @@ async function declareDisk(id, slotUuid, label, wipeRaid) {
     }
 }
 
+// ── Backup groups ────────────────────────────────────────────────────
+async function loadBackupGroups() {
+    try {
+        backupGroups = await api.listBackupGroups();
+        renderBackupGroups();
+        if (backupSessions.some(s => s.status === 'running')) scheduleSessionsPoll();
+    } catch (e) {
+        showError('backup-groups', 'Failed to load backup groups');
+    }
+}
+
+function sessionStatusBadge(status) {
+    if (status === 'success') return '<span class="status-online">success</span>';
+    if (status === 'partial') return '<span class="status-unknown">partial</span>';
+    if (status === 'running') return '<span class="status-running">running…</span>';
+    return `<span class="status-faulted">${status}</span>`;
+}
+
+function setUsageView(set) {
+    const total = set.total_bytes || 0;
+    const free = set.free_bytes || 0;
+    const used = Math.max(total - free, 0);
+    const pct = total ? Math.round((used / total) * 100) : 0;
+    const danger = total && free / total < 0.1;
+    return `<div class="set-usage" title="${formatBytes(used)} used of ${formatBytes(total)}">
+        <div class="usage-bar"><div class="usage-fill${danger ? ' usage-danger' : ''}" style="width:${pct}%"></div></div>
+        <small class="text-muted">${formatBytes(free)} free of ${formatBytes(total)}</small>
+    </div>`;
+}
+
+function setDisksView(group, set) {
+    const assigned = new Set();
+    for (const s of group.sets) {
+        for (const d of s.disks) if (s.id !== set.id) assigned.add(d.id);
+    }
+    const rows = (set.disks || []).map((d, i) => {
+        const name = d.label || d.fs_uuid || `Disk ${d.id}`;
+        return `<tr>
+            <td>${i + 1}</td>
+            <td>${d.is_active ? '<span class="badge badge-active">writing</span> ' : ''}<strong>${name}</strong>
+                <br><small class="text-muted">${d.status || ''}${d.mounted ? ' · mounted' : ''}</small></td>
+            <td>${d.free_bytes != null ? formatBytes(d.free_bytes) : '—'}</td>
+            <td>
+                ${d.is_active ? '' : `<button class="btn btn-secondary btn-sm" title="Write to this disk from the next run on" onclick="setActiveDisk(${group.id}, ${set.id}, ${d.id})">Use</button>`}
+                <button class="btn btn-danger btn-sm" title="Remove this disk from the set (its backups stay on the disk)" onclick="removeSetDisk(${group.id}, ${set.id}, ${d.id})">Remove</button>
+            </td>
+        </tr>`;
+    }).join('');
+
+    const options = backupDisks
+        .filter(d => !assigned.has(d.id) && d.status !== 'pending' && d.status !== 'failed')
+        .map(d => `<option value="${d.id}" title="${d.device_path || ''}">${d.label || d.device_path || d.id}</option>`)
+        .join('');
+
+    return `<table class="data-table">
+        <thead><tr><th>#</th><th>Disk</th><th>Free</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="text-muted">No disks in this set yet.</td></tr>'}</tbody>
+    </table>
+    ${options ? `<div class="sched-add">
+        <select id="adddisk-${group.id}-${set.id}" class="form-control">${options}</select>
+        <button class="btn btn-secondary btn-sm" onclick="addSetDisk(${group.id}, ${set.id})">Add disk</button>
+    </div>` : '<div class="text-muted" style="margin-top:8px;">Declare a backup disk above to add one to this set.</div>'}`;
+}
+
+function setView(group, set) {
+    return `<div class="backup-set${set.is_active ? ' set-active' : ''}">
+        <div class="sched-head">
+            <strong>Set ${set.position + 1}${set.label ? ' — ' + set.label : ''}</strong>
+            ${set.is_active ? '<span class="badge badge-active">active</span>' : ''}
+            <span class="text-muted">${set.disk_count} disk${set.disk_count === 1 ? '' : 's'}</span>
+            ${set.last_used_at ? `<span class="text-muted">last used ${formatDate(set.last_used_at)}</span>` : ''}
+            <span style="flex:1"></span>
+            ${set.is_active ? '' : `<button class="btn btn-secondary btn-sm" title="Use this set from the next run on" onclick="activateSet(${group.id}, ${set.id})">Make active</button>`}
+            ${set.disk_count ? `<button class="btn btn-secondary btn-sm" title="Mark the current disk full and move to the next one in this set" onclick="advanceSet(${group.id}, ${set.id})">Disk full — next</button>` : ''}
+            <button class="btn btn-danger btn-sm" title="Delete this set (backups stay on the disks)" onclick="removeSet(${group.id}, ${set.id})">Delete</button>
+        </div>
+        ${setUsageView(set)}
+        ${setDisksView(group, set)}
+    </div>`;
+}
+
+function groupView(group) {
+    const last = group.last_session;
+    const blocked = group.blocking_reason;
+    const cron = group.enabled
+        ? (group.full_cron || 'no full cron') + ' / ' + (group.incremental_cron || 'no incremental cron')
+        : 'disabled';
+    const sets = (group.sets || []).map(s => setView(group, s)).join('');
+
+    return `<div class="backup-group">
+        <div class="sched-head">
+            <strong>${group.name}</strong>
+            ${group.needs_disk ? '<span class="status-faulted">needs a disk</span>' : ''}
+            ${group.enabled ? '' : '<span class="status-unknown">disabled</span>'}
+            <span class="text-muted">${group.dataset_count} dataset${group.dataset_count === 1 ? '' : 's'} · ${group.set_count} set${group.set_count === 1 ? '' : 's'}</span>
+            <span class="text-muted" title="Full / incremental cron">${cron}</span>
+            <span style="flex:1"></span>
+            <button class="btn btn-primary btn-sm" title="Back up every dataset in this group now"
+                    ${group.ready ? '' : 'disabled'} onclick="runGroup(${group.id}, 'full')">Full now</button>
+            <button class="btn btn-secondary btn-sm" title="Back up only what changed since the last run"
+                    ${group.ready ? '' : 'disabled'} onclick="runGroup(${group.id}, 'incremental')">Incr now</button>
+            <button class="btn btn-secondary btn-sm" onclick="openGroupModal(${group.id})">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="removeGroup(${group.id})">Delete</button>
+        </div>
+        <div class="text-muted" style="margin:4px 0 8px;">
+            <code>${(group.datasets || []).join('</code>, <code>')}</code>
+        </div>
+        ${blocked ? `<div class="text-muted" style="margin-bottom:8px;">Cannot back up yet: ${blocked}</div>` : ''}
+        ${last ? `<div class="text-muted" style="margin-bottom:8px;">Last session: ${sessionStatusBadge(last.status)} ${formatDate(last.completed_at || last.started_at)}
+            ${last.notes ? ' — ' + last.notes : ''}</div>` : ''}
+        ${sets || '<div class="text-muted">No backup sets yet.</div>'}
+        <div class="sched-add">
+            <button class="btn btn-secondary btn-sm" onclick="openSetModal(${group.id})">Add set</button>
+        </div>
+    </div>`;
+}
+
+function renderBackupGroups() {
+    const c = document.getElementById('backup-groups');
+    if (!backupGroups.length) {
+        c.innerHTML = createEmptyState('No backup groups yet. Create one to choose the datasets to back up.');
+        return;
+    }
+    c.innerHTML = backupGroups.map(groupView).join('');
+}
+
+async function runGroup(groupId, type) {
+    try {
+        await api.runBackupGroup(groupId, type);
+        showAlert('Backup started in the background', 'success');
+        await loadBackupSessions();
+        scheduleSessionsPoll();
+    } catch (e) {
+        showAlert('Backup could not start: ' + e.message, 'error');
+    }
+}
+
+async function activateSet(groupId, setId) {
+    try {
+        await api.activateGroupSet(groupId, setId);
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not change the active set: ' + e.message, 'error');
+    }
+}
+
+async function advanceSet(groupId, setId) {
+    if (!confirm('Move the next run to the following disk in this set?')) return;
+    try {
+        await api.advanceGroupSet(groupId, setId);
+        showAlert('Moved to the next disk in the set', 'success');
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not advance: ' + e.message, 'error');
+    }
+}
+
+async function setActiveDisk(groupId, setId, diskId) {
+    if (!confirm('Write to this disk from the next run on?')) return;
+    try {
+        await api.activateBackupDisk(groupId, setId, diskId);
+        showAlert('This disk is now the write target', 'success');
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not select this disk: ' + e.message, 'error');
+    }
+}
+
+async function addSetDisk(groupId, setId) {
+    const diskId = parseInt(document.getElementById(`adddisk-${groupId}-${setId}`).value, 10);
+    try {
+        await api.addSetDisk(groupId, setId, diskId);
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not add the disk: ' + e.message, 'error');
+    }
+}
+
+async function removeSetDisk(groupId, setId, diskId) {
+    if (!confirm('Remove this disk from the set? Backups already on it are not deleted.')) return;
+    try {
+        await api.removeSetDisk(groupId, setId, diskId);
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not remove the disk: ' + e.message, 'error');
+    }
+}
+
+async function removeSet(groupId, setId) {
+    if (!confirm('Delete this backup set? Backups already on its disks are not deleted.')) return;
+    try {
+        await api.deleteGroupSet(groupId, setId);
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not delete the set: ' + e.message, 'error');
+    }
+}
+
+async function removeGroup(groupId) {
+    const group = backupGroups.find(g => g.id === groupId);
+    if (!confirm(`Delete the backup group "${group ? group.name : groupId}"? Its sets and disk assignments are removed; backups already on the disks are not deleted.`)) return;
+    try {
+        await api.deleteBackupGroup(groupId);
+        showAlert('Backup group deleted', 'success');
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not delete the group: ' + e.message, 'error');
+    }
+}
+
+// ── Group modal ──────────────────────────────────────────────────────
+// Loaded on demand: the dataset picker is the only thing that needs it.
 async function loadBackupDatasets() {
     try {
-        backupDatasets = await api.listBackupableDatasets();
-        renderBackupDatasets();
+        backupDatasets = await api.getDatasets();
     } catch (e) {
-        showError('dataset-backup', 'Failed to load datasets');
+        backupDatasets = [];
+        showAlert('Could not list datasets: ' + e.message, 'error');
     }
+    return backupDatasets;
 }
 
-let activeRuns = new Set();
-
-function scheduleRunBadge(status) {
-    if (status === 'running') return '<span class="status-running">running…</span>';
-    if (status === 'success') return '<span class="status-online">last OK</span>';
-    if (status === 'failed') return '<span class="status-faulted">last failed</span>';
-    return '<span class="status-unknown">no runs yet</span>';
-}
-
-function renderBackupDatasets() {
-    const c = document.getElementById('dataset-backup');
-    if (backupDatasets.length === 0) {
-        c.innerHTML = createEmptyState('No datasets found.');
+function renderGroupDatasets(selected, message) {
+    const c = document.getElementById('group-dataset-list');
+    if (message) {
+        c.innerHTML = `<span class="text-muted">${message}</span>`;
         return;
     }
-    const diskName = (d) => d.label || d.device_path.split('/').pop();
-    const noDisks = backupDisks.length === 0;
-
-    c.innerHTML = `
-        <table class="data-table">
-            <thead><tr>
-                <th>Dataset</th><th>Backup disks &amp; schedules</th>
-                <th>Changed since full</th><th>Last backup</th>
-            </tr></thead>
-            <tbody>
-                ${backupDatasets.map(ds => {
-                    const scheds = ds.schedules || [];
-                    const busy = (diskId) => activeRuns.has(ds.name + '/' + diskId);
-                    const assigned = new Set(scheds.map(s => s.backup_disk_id));
-                    const addOpts = backupDisks.filter(d => d.status !== 'pending' && d.status !== 'failed' && !assigned.has(d.id))
-                        .map(d => `<option value="${d.id}" title="${d.device_path}">${diskName(d)}</option>`).join('');
-                    const blocks = scheds.length ? scheds.map(s => {
-                        const diskId = s.backup_disk_id;
-                        const running = busy(diskId);
-                        const btn = (t, title) => `<button class="btn btn-${t === 'full' ? 'primary' : 'secondary'} btn-sm" ${running ? 'disabled' : ''} title="${title}" onclick="runDataset('${ds.name}', ${diskId}, '${t}')">${t === 'full' ? 'Full' : 'Incr'}</button>`;
-                        return `<div class="sched-block">
-                            <div class="sched-head">
-                                <strong>${s.label}</strong>
-                                ${running ? '<span class="status-running">running…</span>' : scheduleRunBadge(s.last_status)}
-                            </div>
-                            <div class="sched-crons">
-                                <input id="fc-${ds.name}-${diskId}" class="form-control" placeholder="Full cron e.g. 0 2 * * 0" value="${s.full_cron || ''}" title="Full backup cron schedule">
-                                <input id="ic-${ds.name}-${diskId}" class="form-control" placeholder="Incr cron e.g. 0 3 * * *" value="${s.incremental_cron || ''}" title="Incremental backup cron schedule">
-                            </div>
-                            <div class="sched-actions">
-                                ${btn('full', 'Run a full backup of this dataset to this disk now (full snapshot-stream, resets the incremental chain)')}
-                                ${btn('incremental', 'Run an incremental backup of this dataset to this disk now (only changes since the last anchor)')}
-                                <button class="btn btn-secondary btn-sm" title="Save or update this disk's full/incremental cron schedule" onclick="saveSchedule('${ds.name}', ${diskId})">Save</button>
-                                <button class="btn btn-danger btn-sm" title="Delete this dataset's backup schedule on this disk (existing backup runs are kept)" onclick="removeSchedule('${ds.name}', ${diskId})">Remove</button>
-                            </div>
-                        </div>`;
-                    }).join('') : '<div class="text-muted">No backup disk assigned yet.</div>';
-
-                    const addControl = noDisks || !addOpts ? '' :
-                        `<div class="sched-add">
-                            <select id="newdisk-${ds.name}" class="form-control" title="Add another backup disk for grandfather-father-son retention">${addOpts}</select>
-                            <button class="btn btn-secondary btn-sm" title="Back up this dataset to an additional disk" onclick="addDiskSchedule('${ds.name}')">Add disk</button>
-                        </div>`;
-
-                    return `<tr>
-                        <td><code>${ds.name}</code></td>
-                        <td>${blocks}${addControl}</td>
-                        <td title="Size of changed data since the last full backup">${formatBytes(ds.changed_since_full)} <small class="text-muted">(${ds.full_runs || 0} backups)</small></td>
-                        <td>${scheduleRunBadge(ds.last_status)} <small class="text-muted">${ds.last_type || '-'} ${formatDate(ds.last_completed_at)}</small></td>
-                    </tr>`;
-                }).join('')}
-            </tbody>
-        </table>`;
-}
-
-async function runDataset(name, diskId, type) {
-    if (!diskId) { showAlert('Select a backup disk first', 'error'); return; }
-    const key = name + '/' + diskId;
-    activeRuns.add(key);
-    renderBackupDatasets();
-    try {
-        await api.runBackup(name, diskId, type);
-        // The backup runs in the background; scheduleRunsPoll picks up the
-        // running→success/failed transition and refreshes the dataset panel.
-        await loadBackupRuns();
-        scheduleRunsPoll();
-    } catch (e) {
-        showAlert(`Backup failed: ${e.message}`, 'error');
-        activeRuns.delete(key);
-        await loadBackupDatasets();
-    }
-}
-
-async function addDiskSchedule(name) {
-    const select = document.getElementById('newdisk-' + name);
-    const diskId = parseInt(select.value, 10);
-    if (!diskId) { showAlert('No backup disk selected', 'error'); return; }
-    if ((backupDatasets.find(d => d.name === name).schedules || []).some(s => s.backup_disk_id === diskId)) {
-        showAlert('This dataset is already scheduled on that disk', 'error');
+    if (!backupDatasets.length) {
+        c.innerHTML = '<span class="text-muted">No datasets available.</span>';
         return;
     }
-    try {
-        await api.upsertBackupSchedule({
-            dataset_name: name, backup_disk_id: diskId,
-            full_cron: null, incremental_cron: null, enabled: true
-        });
-        showAlert('Backup disk added for dataset', 'success');
-        await loadBackupDatasets();
-    } catch (e) {
-        showAlert('Could not add backup disk: ' + e.message, 'error');
-    }
+    c.innerHTML = backupDatasets.map(ds => `<label style="display:flex;gap:8px;align-items:center;">
+        <input type="checkbox" value="${ds.name}" ${selected.includes(ds.name) ? 'checked' : ''}>
+        <code>${ds.name}</code></label>`).join('');
 }
 
-async function saveSchedule(name, diskId) {
-    const fc = document.getElementById('fc-' + name + '-' + diskId).value;
-    const ic = document.getElementById('ic-' + name + '-' + diskId).value;
-    try {
-        await api.upsertBackupSchedule({
-            dataset_name: name, backup_disk_id: diskId,
-            full_cron: fc || null, incremental_cron: ic || null, enabled: true
-        });
-        showAlert('Schedule saved', 'success');
-        await loadBackupDatasets();
-    } catch (e) {
-        showAlert('Schedule save failed: ' + e.message, 'error');
-    }
+async function openGroupModal(groupId) {
+    editingGroupId = groupId || null;
+    const group = groupId ? backupGroups.find(g => g.id === groupId) : null;
+    const selected = group ? group.datasets : [];
+    document.getElementById('group-modal-title').textContent = group ? 'Edit Backup Group' : 'New Backup Group';
+    document.getElementById('group-name').value = group ? group.name : '';
+    document.getElementById('group-full-cron').value = group ? (group.full_cron || '') : '';
+    document.getElementById('group-incr-cron').value = group ? (group.incremental_cron || '') : '';
+    document.getElementById('group-enabled').checked = group ? group.enabled : true;
+    renderGroupDatasets(selected, backupDatasets.length ? null : 'Loading datasets...');
+    document.getElementById('group-modal').style.display = 'flex';
+
+    if (!backupDatasets.length) await loadBackupDatasets();
+    // The modal can be closed while the list loads; never repaint over it.
+    if (document.getElementById('group-modal').style.display === 'none') return;
+    renderGroupDatasets(selected);
 }
 
-async function removeSchedule(name, diskId) {
-    if (!confirm('Remove the backup schedule for this dataset on this disk? (Existing backup runs are kept)')) return;
-    try {
-        await api.deleteBackupSchedule(name, diskId);
-        showAlert('Schedule removed', 'success');
-        await loadBackupDatasets();
-    } catch (e) {
-        showAlert('Schedule remove failed: ' + e.message, 'error');
-    }
+function hideGroupModal() {
+    document.getElementById('group-modal').style.display = 'none';
+    editingGroupId = null;
 }
 
-async function loadBackupRuns() {
+document.getElementById('group-modal-ok').addEventListener('click', async function() {
+    const name = document.getElementById('group-name').value.trim();
+    if (!name) { showAlert('Name is required', 'error'); return; }
+    const datasets = Array.from(
+        document.querySelectorAll('#group-dataset-list input:checked')
+    ).map(i => i.value);
+    if (!datasets.length) { showAlert('Choose at least one dataset', 'error'); return; }
+
+    const payload = {
+        name,
+        datasets,
+        full_cron: document.getElementById('group-full-cron').value.trim() || null,
+        incremental_cron: document.getElementById('group-incr-cron').value.trim() || null,
+        enabled: document.getElementById('group-enabled').checked,
+    };
     try {
-        backupRuns = await api.listBackupRuns();
-        renderBackupRuns(backupRuns);
-        if (backupRuns.some(r => r.status === 'running')) {
-            scheduleRunsPoll();
+        if (editingGroupId) {
+            // The dataset list is the group's definition, so it is replaced wholesale.
+            await api.updateBackupGroup(editingGroupId, {
+                name: payload.name, full_cron: payload.full_cron,
+                incremental_cron: payload.incremental_cron, enabled: payload.enabled,
+            });
+            const current = backupGroups.find(g => g.id === editingGroupId);
+            for (const name of current.datasets.filter(d => !datasets.includes(d))) {
+                await api.removeGroupDataset(editingGroupId, name);
+            }
+            for (const name of datasets.filter(d => !current.datasets.includes(d))) {
+                await api.addGroupDataset(editingGroupId, name);
+            }
+        } else {
+            await api.createBackupGroup(payload);
         }
+        hideGroupModal();
+        showAlert(editingGroupId ? 'Group updated' : 'Group created', 'success');
+        await loadBackupGroups();
     } catch (e) {
-        showError('backup-runs', 'Failed to load backup runs');
+        showAlert('Save failed: ' + e.message, 'error');
+    }
+});
+
+function openSetModal(groupId) {
+    addingSetToGroupId = groupId;
+    document.getElementById('set-label').value = '';
+    document.getElementById('set-position').value = '';
+    document.getElementById('set-modal').style.display = 'flex';
+}
+
+function hideSetModal() {
+    document.getElementById('set-modal').style.display = 'none';
+    addingSetToGroupId = null;
+}
+
+document.getElementById('set-modal-ok').addEventListener('click', async function() {
+    const position = document.getElementById('set-position').value.trim();
+    try {
+        await api.createGroupSet(addingSetToGroupId, {
+            label: document.getElementById('set-label').value.trim() || null,
+            position: position === '' ? null : parseInt(position, 10),
+        });
+        hideSetModal();
+        showAlert('Backup set added', 'success');
+        await loadBackupGroups();
+    } catch (e) {
+        showAlert('Could not add the set: ' + e.message, 'error');
+    }
+});
+
+// ── Sessions / history ───────────────────────────────────────────────
+async function loadBackupSessions() {
+    try {
+        backupSessions = await api.listAllBackupSessions();
+        renderBackupSessions();
+        if (backupSessions.some(s => s.status === 'running')) scheduleSessionsPoll();
+    } catch (e) {
+        showError('backup-sessions', 'Failed to load backup sessions');
     }
 }
 
-let runsPollTimer = null;
-function scheduleRunsPoll() {
-    if (runsPollTimer) return;
-    const prev = new Map(backupRuns.map(r => [r.id, r.status]));
-    runsPollTimer = setTimeout(async () => {
-        runsPollTimer = null;
-        const runs = await api.listBackupRuns().catch(() => []);
-        backupRuns = runs;
-        renderBackupRuns(runs);
-        for (const r of runs) {
-            const was = prev.get(r.id);
-            if (was !== 'running') continue;
-            activeRuns.delete(r.dataset_name + '/' + r.backup_disk_id);
-            if (r.status === 'success') {
-                showAlert(r.backup_type + ' backup of ' + r.dataset_name + ' complete', 'success');
-            } else if (r.status === 'failed') {
-                showAlert('Backup failed: ' + (r.error || 'unknown error'), 'error');
+let sessionsPollTimer = null;
+function scheduleSessionsPoll() {
+    if (sessionsPollTimer) return;
+    const prev = new Map(backupSessions.map(s => [s.id, s.status]));
+    sessionsPollTimer = setTimeout(async () => {
+        sessionsPollTimer = null;
+        const sessions = await api.listAllBackupSessions().catch(() => null);
+        if (sessions === null) { scheduleSessionsPoll(); return; }
+        for (const s of sessions) {
+            if (prev.get(s.id) !== 'running') continue;
+            if (s.status === 'success') {
+                showAlert(`${s.group_name} backup complete`, 'success');
+            } else if (s.status === 'partial') {
+                showAlert(`${s.group_name} backup finished with errors`, 'warning');
+            } else if (s.status === 'failed') {
+                showAlert(`${s.group_name} backup failed: ${s.error || 'unknown error'}`, 'error');
             }
         }
-        if (runs.some(r => r.status === 'running')) {
-            scheduleRunsPoll();
+        backupSessions = sessions;
+        renderBackupSessions();
+        if (sessions.some(s => s.status === 'running')) {
+            scheduleSessionsPoll();
         } else {
-            await loadBackupDatasets();
+            await loadBackupGroups();
         }
     }, 5000);
+}
+
+function sessionProgressCell(s) {
+    if (s.status !== 'running') return '<td class="text-muted">—</td>';
+    const pct = Math.min(100, Math.max(0, s.progress_pct || 0));
+    let detail = `<small>${pct}% · ${s.datasets_done}/${s.datasets_total} datasets</small>`;
+    if (s.current_run) {
+        const r = s.current_run;
+        if (r.pct != null && r.expected_bytes) {
+            detail += `<br><small class="text-muted">${r.dataset_name}: ${r.pct}% (${formatBytes(r.size_bytes)} / ${formatBytes(r.expected_bytes)})</small>`;
+        } else if (r.size_bytes) {
+            detail += `<br><small class="text-muted">${r.dataset_name}: ${formatBytes(r.size_bytes)} written, estimating…</small>`;
+        } else {
+            detail += `<br><small class="text-muted">${r.dataset_name}: preparing…</small>`;
+        }
+    }
+    return `<td><div class="usage-bar" style="width:140px"><div class="usage-fill" style="width:${pct}%"></div></div>
+        ${detail}</td>`;
+}
+
+function renderBackupSessions() {
+    const c = document.getElementById('backup-sessions');
+    if (!backupSessions.length) {
+        c.innerHTML = createEmptyState('No backup sessions yet.');
+        return;
+    }
+    c.innerHTML = `<table class="data-table">
+        <thead><tr>
+            <th>Group</th><th>Status</th><th>Progress</th><th>Datasets</th><th>Written</th>
+            <th>Set</th><th>Started</th>
+        </tr></thead>
+        <tbody>
+            ${backupSessions.map(s => `<tr title="${(s.notes || '') + ' ' + (s.error || '')}">
+                <td>${s.group_name || '—'}</td>
+                <td>${sessionStatusBadge(s.status)}</td>
+                ${sessionProgressCell(s)}
+                <td>${s.datasets_done}/${s.datasets_total}
+                    ${s.datasets_failed ? `<span class="status-faulted">${s.datasets_failed} failed</span>` : ''}
+                    ${s.datasets_skipped ? `<span class="text-muted">${s.datasets_skipped} skipped</span>` : ''}</td>
+                <td>${formatBytes(s.bytes_written)}</td>
+                <td>${s.set_position != null ? 'Set ' + (s.set_position + 1) : '—'}
+                    ${s.disk_label ? '<br><small class="text-muted">' + s.disk_label + '</small>' : ''}</td>
+                <td>${formatDate(s.started_at)}</td>
+            </tr>`).join('')}
+        </tbody>
+    </table>`;
 }
 
 let disksPollTimer = null;
@@ -671,41 +991,5 @@ function scheduleDisksPoll() {
     }, 5000);
 }
 
-function runStatusBadge(status, phase) {
-    if (status === 'success') return '<span class="status-online">success</span>';
-    if (status === 'skipped') return '<span class="status-unknown">skipped — no changes</span>';
-    if (status === 'running' && phase === 'sending') return '<span class="status-running">sending…</span>';
-    if (status === 'running') return `<span class="status-running">${phase || 'running'}…</span>`;
-    return `<span class="status-faulted">${status}</span>`;
-}
-
-function renderBackupRuns(runs) {
-    const c = document.getElementById('backup-runs');
-    if (!runs || runs.length === 0) {
-        c.innerHTML = createEmptyState('No backup runs yet.');
-        return;
-    }
-    c.innerHTML = `
-        <table class="data-table">
-            <thead><tr>
-                <th>Dataset</th><th>Type</th><th>Status</th><th>Stream Size</th>
-                <th>Changed</th><th>Snapshot</th><th>Date</th>
-            </tr></thead>
-            <tbody>
-                ${runs.map(r => {
-                    const sending = r.status === 'running' && r.phase === 'sending' && r.size_bytes > 0;
-                    return `<tr>
-                        <td><code>${r.dataset_name}</code></td>
-                        <td><span class="badge">${r.backup_type}</span></td>
-                        <td title="${r.error || ''}">${runStatusBadge(r.status, r.phase)}${sending ? ' <span class="text-muted">(' + formatBytes(r.size_bytes) + ')</span>' : ''}</td>
-                        <td>${formatBytes(r.size_bytes)}</td>
-                        <td>${formatBytes(r.changed_bytes)}</td>
-                        <td><code title="${r.stream_file || ''}">${r.snapshot || '—'}</code></td>
-                        <td>${formatDate(r.completed_at || r.started_at)}</td>
-                    </tr>`;
-                }).join('')}
-            </tbody>
-        </table>`;
-}
 </script>
 {% endblock %}

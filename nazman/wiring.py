@@ -24,6 +24,7 @@ from .managers.metrics_manager import MetricsManager, register_default_collector
 from .managers.metrics_store import MetricsStore
 from .managers.alert_manager import AlertManager
 from .models.scheduler import TaskType
+from .services.backup_group_service import BackupGroupService
 from .services.destruction import DestructionService
 from .services.disk_view import DiskViewService
 from .services.system_restore import SystemRestoreService
@@ -48,6 +49,7 @@ class Container:
     destruction: DestructionService
     disk_view: DiskViewService
     system_restore: SystemRestoreService
+    backup_groups: BackupGroupService
 
 
 def build_container() -> Container:
@@ -61,7 +63,7 @@ def build_container() -> Container:
     backup = BackupManager(zfs=zfs)
     alerts = AlertManager()
     scheduler = SchedulerManager(alerter=alerts)
-    zfs_backup = ZfsBackupManager(zfs=zfs, scheduler=scheduler, backup=backup)
+    zfs_backup = ZfsBackupManager(zfs=zfs, backup=backup)
     metrics_store = MetricsStore()
     metrics = MetricsManager(zfs=zfs, store=metrics_store)
     register_default_collectors(metrics)
@@ -71,8 +73,11 @@ def build_container() -> Container:
     system_restore = SystemRestoreService(
         disk=disk, zfs=zfs, zfs_backup=zfs_backup, backup=backup, scheduler=scheduler,
     )
+    backup_groups = BackupGroupService(
+        zfs_backup=zfs_backup, backup=backup, scheduler=scheduler, alerter=alerts,
+    )
 
-    _register_backup_jobs(scheduler, zfs_backup)
+    _register_backup_jobs(scheduler, backup_groups)
 
     return Container(
         disk=disk,
@@ -89,34 +94,22 @@ def build_container() -> Container:
         destruction=destruction,
         disk_view=disk_view,
         system_restore=system_restore,
+        backup_groups=backup_groups,
     )
 
 
 def _register_backup_jobs(
     scheduler: SchedulerManager,
-    zfs_backup: ZfsBackupManager,
+    backup_groups: BackupGroupService,
 ) -> None:
     """Bind backup task types to scheduler executors (no manager imports below)."""
-    dataset_locks: dict = {}
-
     async def run_zfs_backup(task, db):
         config = task.config or {}
-        dataset_name = config.get("dataset_name")
-        backup_disk_id = config.get("backup_disk_id")
+        group_id = config.get("group_id")
         backup_type = config.get("type", "full") or "full"
-        if not dataset_name or not backup_disk_id:
-            raise NAZManError("ZFS backup task requires dataset_name and backup_disk_id")
-        # Per-dataset lock to prevent concurrent backups of the same dataset.
-        lock = dataset_locks.get(dataset_name)
-        if lock is None:
-            lock = dataset_locks[dataset_name] = asyncio.Lock()
-        async with lock:
-            await zfs_backup.run_backup(
-                db,
-                dataset_name=dataset_name,
-                backup_disk_id=backup_disk_id,
-                backup_type=backup_type,
-            )
+        if not group_id:
+            raise NAZManError("Backup job requires group_id")
+        await backup_groups.start_session(db, group_id, backup_type)
 
     scheduler.register_executor(TaskType.ZFS_BACKUP.value, run_zfs_backup)
 
@@ -194,3 +187,7 @@ def get_disk_view_service() -> DiskViewService:
 
 def get_system_restore_service() -> SystemRestoreService:
     return get_container().system_restore
+
+
+def get_backup_group_service() -> BackupGroupService:
+    return get_container().backup_groups

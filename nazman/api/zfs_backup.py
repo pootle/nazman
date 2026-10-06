@@ -43,13 +43,18 @@ class DeclareRequest(BaseModel):
     slot_uuid: Optional[str] = None
     label: Optional[str] = None
     wipe_raid: bool = False
+    backup_set_id: Optional[int] = None
 
 
 class BackupRunResponse(BaseModel):
     id: int
+    session_id: Optional[int] = None
+    group_id: Optional[int] = None
+    backup_set_id: Optional[int] = None
     dataset_name: str
     backup_disk_id: Optional[int]
     backup_type: str
+    promoted_from: Optional[str] = None
     stream_file: Optional[str] = None
     snapshot: Optional[str] = None
     base_snapshot: Optional[str]
@@ -63,12 +68,6 @@ class BackupRunResponse(BaseModel):
     completed_at: Optional[datetime]
 
     model_config = {"from_attributes": True}
-
-
-class RunRequest(BaseModel):
-    dataset_name: str
-    backup_disk_id: int
-    backup_type: str = "full"
 
 
 class RestoreFileRequest(BaseModel):
@@ -119,12 +118,14 @@ async def declare_backup_disk(
 
     The wipe+format runs in the background; this returns immediately with a
     ``pending`` entry that flips to the real disk (success) or ``failed``.
+    ``backup_set_id`` files the new volume into a set straight away, so the
+    setup flow does not need a second step.
     """
     try:
         return await zfs_backup_manager.start_declare_backup_disk(
             db, disk_id, confirm=req.confirm,
             slot_uuid=req.slot_uuid, label=req.label,
-            wipe_raid=req.wipe_raid,
+            wipe_raid=req.wipe_raid, backup_set_id=req.backup_set_id,
         )
     except Exception as e:
         logger.error("declare_backup_disk failed for disk %s: %s", disk_id, e, exc_info=True)
@@ -220,78 +221,22 @@ async def deregister_backup_disk(
     zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
 
 ):
+    """Undeclare a volume.  The media is left alone, so the manifest can still
+    be read for a new-server restore; runs and set membership are cleared so no
+    chain points at a disk NAZMan no longer knows about."""
     await zfs_backup_manager.deregister_backup_disk(db, backup_disk_id)
-    # Orphaned schedule-driven ScheduledTask jobs are removed by reconciliation.
-    await zfs_backup_manager.sync_scheduled_tasks(db)
     return {"message": "Backup disk deregistered"}
-
-
-@router.get("/datasets", response_model=List[dict])
-async def list_backupable_datasets(
-    db: Session = Depends(get_db),
-    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
-
-):
-    """All datasets with per-disk schedules, backup status, and run info."""
-    return await zfs_backup_manager.list_backupable_datasets(db)
 
 
 @router.get("/runs", response_model=List[BackupRunResponse])
 async def list_backup_runs(
     db: Session = Depends(get_db),
     zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
-
+    group_id: Optional[int] = None,
+    limit: int = 200,
 ):
-    return await zfs_backup_manager.list_runs(db)
-
-
-@router.post("/runs", response_model=BackupRunResponse, status_code=202)
-async def run_backup(
-    req: RunRequest,
-    db: Session = Depends(get_db),
-    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
-
-):
-    return await zfs_backup_manager.start_run_backup(
-        db,
-        dataset_name=req.dataset_name,
-        backup_disk_id=req.backup_disk_id,
-        backup_type=req.backup_type,
-    )
-
-
-@router.get("/schedules", response_model=List[dict])
-async def list_backup_schedules(
-    db: Session = Depends(get_db),
-    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
-
-):
-    return await zfs_backup_manager.list_schedules(db)
-
-
-@router.post("/schedules")
-async def upsert_backup_schedule(
-    body: dict,
-    db: Session = Depends(get_db),
-    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
-
-):
-    """Create or update the backup schedule for a (dataset, disk) pair."""
-    sched = await zfs_backup_manager.upsert_schedule(db, body)
-    return {"id": sched.id, "dataset_name": sched.dataset_name, "backup_disk_id": sched.backup_disk_id}
-
-
-@router.delete("/schedules/{dataset_name:path}")
-async def delete_backup_schedule(
-    dataset_name: str,
-    backup_disk_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
-
-):
-    """Remove the dataset's schedule on one disk (or all disks when no disk given)."""
-    removed = await zfs_backup_manager.delete_schedules(db, dataset_name, backup_disk_id)
-    return {"message": "Schedule removed", "backup_disk_ids": removed}
+    """Recent per-dataset runs across every group (sessions are the write path)."""
+    return await zfs_backup_manager.list_runs(db, group_id=group_id, limit=limit)
 
 
 @router.get("/disks/{backup_disk_id}/streams", response_model=List[dict])

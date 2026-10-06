@@ -10,7 +10,8 @@ from nazman.wiring import get_system_restore_service
 from tests.conftest import override_manager
 
 
-def _write_volume(root: Path, media_uuid: str = "AAA") -> dict:
+def _write_volume(root: Path, media_uuid: str = "AAA", set_id=None,
+                  stream: str = "data/tank/media/full-1.zfs.gz") -> dict:
     manifest = bm.new_manifest(media={"fs_uuid": media_uuid, "label": "vol1"})
     bm.merge_pools(manifest, [{
         "name": "tank", "ashift": 12,
@@ -22,20 +23,23 @@ def _write_volume(root: Path, media_uuid: str = "AAA") -> dict:
             ],
         }],
     }])
+    run = {
+        "type": "full", "stream_file": stream,
+        "snapshot": "tank/media@backup-1", "base_snapshot": None, "full_anchor": None,
+        "size_bytes": 10, "sha256": "x", "created_at": "2026-01-01T00:00:00",
+        "media_fs_uuid": media_uuid, "media_label": "vol1",
+    }
+    if set_id is not None:
+        run["set_id"] = set_id
     bm.upsert_dataset_backup(
         manifest,
         {"name": "tank/media", "pool": "tank", "properties": {}, "mountpoint": "/tank/media"},
-        {
-            "type": "full", "stream_file": "data/tank/media/full-1.zfs.gz",
-            "snapshot": "tank/media@backup-1", "base_snapshot": None, "full_anchor": None,
-            "size_bytes": 10, "sha256": "x", "created_at": "2026-01-01T00:00:00",
-            "media_fs_uuid": media_uuid, "media_label": "vol1",
-        },
+        run,
     )
     bm.save_manifest(root, manifest)
-    stream = root / "data/tank/media/full-1.zfs.gz"
-    stream.parent.mkdir(parents=True, exist_ok=True)
-    stream.write_bytes(b"x")
+    stream_path = root / stream
+    stream_path.parent.mkdir(parents=True, exist_ok=True)
+    stream_path.write_bytes(b"x")
     return manifest
 
 
@@ -131,13 +135,37 @@ async def test_required_media_marks_connected(db_session):
                 "media_fs_uuid": "AAA", "media_label": "vol1",
             }],
         }],
+        "_volumes": [
+            {"volume_id": "AAA", "candidate": _candidate("AAA")},
+        ],
     })
-    service.list_candidates = AsyncMock(return_value=[_candidate("AAA")])
 
     media = await service.required_media(db_session, "AAA")
     assert media[0]["media_fs_uuid"] == "AAA"
     assert media[0]["connected"] is True
     assert media[0]["datasets"] == ["tank/media"]
+
+
+@pytest.mark.asyncio
+async def test_required_media_marks_a_missing_volume_disconnected(db_session):
+    """A set that spans two disks reports the one that is not attached."""
+    service = SystemRestoreService()
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{
+            "name": "tank/media",
+            "backups": [
+                {"type": "full", "stream_file": "a", "created_at": "2026-01-01T00:00:00",
+                 "media_fs_uuid": "AAA", "media_label": "vol1"},
+                {"type": "incremental", "stream_file": "b", "created_at": "2026-01-02T00:00:00",
+                 "media_fs_uuid": "BBB", "media_label": "vol2"},
+            ],
+        }],
+        "_volumes": [{"volume_id": "AAA", "candidate": _candidate("AAA")}],
+    })
+
+    media = {m["media_fs_uuid"]: m for m in await service.required_media(db_session, "1")}
+    assert media["AAA"]["connected"] is True
+    assert media["BBB"]["connected"] is False
 
 
 @pytest.mark.asyncio
@@ -159,12 +187,10 @@ async def test_restore_datasets_replays_full_then_incrementals(db_session, tmp_p
     service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
     service._manifest_for = AsyncMock(return_value={
         "datasets": [{"name": "tank/media", "pool": "tank", "backups": chain}],
-        "_volume_root": str(volume),
-        "_candidate": _candidate(),
     })
     service.zfs.dataset_exists = AsyncMock(return_value=False)
     service.zfs_backup.receive_stream = AsyncMock(return_value={"ok": True})
-    service._mount_for_set = AsyncMock(return_value=(_candidate(), volume))
+    service._mount_volumes = AsyncMock(return_value=[(_candidate("AAA"), volume)])
     service._unmount = AsyncMock()
 
     result = await service.restore_datasets(
@@ -191,12 +217,10 @@ async def test_restore_datasets_media_filter_skips_other_media(db_session, tmp_p
                 "created_at": "2026-01-01T00:00:00", "media_fs_uuid": "AAA",
             }],
         }],
-        "_volume_root": str(tmp_path),
-        "_candidate": _candidate(),
     })
     service.zfs.dataset_exists = AsyncMock(return_value=False)
     service.zfs_backup.receive_stream = AsyncMock()
-    service._mount_for_set = AsyncMock(return_value=(_candidate(), tmp_path))
+    service._mount_volumes = AsyncMock(return_value=[(_candidate("AAA"), tmp_path)])
     service._unmount = AsyncMock()
 
     result = await service.restore_datasets(
@@ -233,11 +257,17 @@ async def test_create_pool_from_backup_calls_zfs(db_session):
 
 
 @pytest.mark.asyncio
-async def test_adopt_media_requires_fs_uuid(db_session):
+async def test_adopt_media_reports_volumes_it_cannot_adopt(db_session):
+    """A volume with no filesystem UUID cannot be declared, and the rest of the
+    set is still adopted rather than blocked by it."""
     service = SystemRestoreService()
-    service._find_candidate = AsyncMock(return_value={"device": "/dev/sdb1", "fs_uuid": None})
-    with pytest.raises(ValidationError):
-        await service.adopt_media(db_session, "dev:sdb1")
+    service._volumes_of = AsyncMock(return_value=[
+        {"volume_id": "dev:sdb1", "candidate": {"device": "/dev/sdb1", "fs_uuid": None}},
+    ])
+
+    out = await service.adopt_media(db_session, "dev:sdb1")
+    assert out["adopted"] is False
+    assert len(out["missing"]) == 1
 
 
 @pytest.mark.asyncio
@@ -272,3 +302,182 @@ async def test_api_dataset_restore_plan(client):
         response = client.get("/api/system-restore/sets/AAA/datasets/plan")
     assert response.status_code == 200
     assert response.json()[0]["source_dataset"] == "tank/media"
+
+
+@pytest.mark.asyncio
+async def test_discover_backup_sets_groups_volumes_by_set_stamp(db_session, tmp_path):
+    """Two volumes stamped as one set are offered as a single backup set."""
+    vol1 = tmp_path / "vol1"
+    vol2 = tmp_path / "vol2"
+    vol1.mkdir()
+    vol2.mkdir()
+    _write_volume(vol1, media_uuid="AAA", set_id=7)
+    _write_volume(vol2, media_uuid="BBB", set_id=7, stream="data/tank/media/incr-1.zfs.gz")
+
+    service = SystemRestoreService()
+    service.list_candidates = AsyncMock(return_value=[
+        _candidate("AAA"), {**_candidate("BBB"), "device": "/dev/sdc1",
+                            "device_name": "sdc1", "label": "vol2"},
+    ])
+    service._mount_readonly = AsyncMock(side_effect=[vol1, vol2, vol1, vol2])
+    service._unmount = AsyncMock()
+
+    sets = await service.discover_backup_sets(db_session)
+    assert len(sets) == 1
+    assert sets[0]["set_id"] == "7"
+    assert sets[0]["volume_count"] == 2
+    assert {v["fs_uuid"] for v in sets[0]["volumes"]} == {"AAA", "BBB"}
+
+
+@pytest.mark.asyncio
+async def test_discover_backup_sets_keeps_unstamped_volumes_separate(db_session, tmp_path):
+    """Media written before backup sets existed is still one set per volume."""
+    vol1 = tmp_path / "vol1"
+    vol2 = tmp_path / "vol2"
+    vol1.mkdir()
+    vol2.mkdir()
+    _write_volume(vol1, media_uuid="AAA")
+    _write_volume(vol2, media_uuid="BBB", stream="data/tank/media/incr-1.zfs.gz")
+
+    service = SystemRestoreService()
+    service.list_candidates = AsyncMock(return_value=[
+        _candidate("AAA"), {**_candidate("BBB"), "device": "/dev/sdc1",
+                            "device_name": "sdc1", "label": "vol2"},
+    ])
+    service._mount_readonly = AsyncMock(side_effect=[vol1, vol2, vol1, vol2])
+    service._unmount = AsyncMock()
+
+    sets = await service.discover_backup_sets(db_session)
+    assert {s["set_id"] for s in sets} == {"AAA", "BBB"}
+    assert all(s["volume_count"] == 1 for s in sets)
+
+
+@pytest.mark.asyncio
+async def test_restore_datasets_replays_a_chain_that_spans_volumes(db_session, tmp_path):
+    """A set's chain continues onto the next disk, so the replay reads each
+    stream from whichever volume of the set holds it."""
+    vol1 = tmp_path / "vol1"
+    vol2 = tmp_path / "vol2"
+    (vol1 / "data/tank/media").mkdir(parents=True)
+    (vol2 / "data/tank/media").mkdir(parents=True)
+    (vol1 / "data/tank/media/full-1.zfs.gz").write_bytes(b"x")
+    (vol2 / "data/tank/media/incr-2.zfs.gz").write_bytes(b"x")
+
+    chain = [
+        {"type": "full", "stream_file": "data/tank/media/full-1.zfs.gz",
+         "created_at": "2026-01-01T00:00:00", "media_fs_uuid": "AAA", "set_id": 7},
+        {"type": "incremental", "stream_file": "data/tank/media/incr-2.zfs.gz",
+         "created_at": "2026-01-02T00:00:00", "media_fs_uuid": "BBB", "set_id": 7},
+    ]
+    service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{"name": "tank/media", "pool": "tank", "backups": chain}],
+    })
+    service.zfs.dataset_exists = AsyncMock(return_value=False)
+    service.zfs_backup.receive_stream = AsyncMock(return_value={"ok": True})
+    service._mount_volumes = AsyncMock(return_value=[
+        (_candidate("AAA"), vol1), (_candidate("BBB"), vol2),
+    ])
+    service._unmount = AsyncMock()
+
+    result = await service.restore_datasets(
+        db_session, "7",
+        [{"source_dataset": "tank/media", "target_pool": "newtank", "enabled": True}],
+    )
+
+    calls = service.zfs_backup.receive_stream.await_args_list
+    # The full comes off the first volume, the incremental off the second.
+    assert [str(c.args[0]) for c in calls] == [
+        str(vol1 / "data/tank/media/full-1.zfs.gz"),
+        str(vol2 / "data/tank/media/incr-2.zfs.gz"),
+    ]
+    assert result["results"][0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_restore_datasets_reports_a_stream_whose_volume_is_absent(db_session, tmp_path):
+    """A missing disk fails that dataset with a clear reason, not a traceback."""
+    vol1 = tmp_path / "vol1"
+    (vol1 / "data/tank/media").mkdir(parents=True)
+    (vol1 / "data/tank/media/full-1.zfs.gz").write_bytes(b"x")
+
+    chain = [
+        {"type": "full", "stream_file": "data/tank/media/full-1.zfs.gz",
+         "created_at": "2026-01-01T00:00:00", "media_fs_uuid": "AAA", "set_id": 7},
+        {"type": "incremental", "stream_file": "data/tank/media/incr-2.zfs.gz",
+         "created_at": "2026-01-02T00:00:00", "media_fs_uuid": "BBB", "set_id": 7},
+    ]
+    service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{"name": "tank/media", "pool": "tank", "backups": chain}],
+    })
+    service.zfs.dataset_exists = AsyncMock(return_value=False)
+    service.zfs_backup.receive_stream = AsyncMock()
+    service._mount_volumes = AsyncMock(return_value=[(_candidate("AAA"), vol1)])
+    service._unmount = AsyncMock()
+
+    result = await service.restore_datasets(
+        db_session, "7",
+        [{"source_dataset": "tank/media", "target_pool": "newtank", "enabled": True}],
+    )
+
+    entry = result["results"][0]
+    assert entry["status"] == "failed"
+    assert "incr-2.zfs.gz" in entry["error"]
+    assert "BBB" in entry["error"]
+
+
+@pytest.mark.asyncio
+async def test_restore_plan_flags_a_chain_that_spans_volumes(db_session):
+    service = SystemRestoreService(zfs=MagicMock())
+    service.zfs.list_pool_names = AsyncMock(return_value=["tank"])
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{
+            "name": "tank/media", "pool": "tank",
+            "backups": [
+                {"type": "full", "stream_file": "a", "created_at": "2026-01-01T00:00:00",
+                 "media_fs_uuid": "AAA"},
+                {"type": "incremental", "stream_file": "b", "created_at": "2026-01-02T00:00:00",
+                 "media_fs_uuid": "BBB"},
+            ],
+        }],
+        "_volumes": [{"volume_id": "AAA", "candidate": _candidate("AAA")}],
+    })
+
+    plan = await service.restore_plan(db_session, "7")
+    assert plan[0]["spans_volumes"] is True
+    assert plan[0]["media_missing"] == ["BBB"]
+
+
+@pytest.mark.asyncio
+async def test_merge_manifests_unions_datasets_runs_pools_and_configs():
+    merged = SystemRestoreService._merge_manifests([
+        {
+            "datasets": [{"name": "tank/a", "pool": "tank", "backups": [
+                {"type": "full", "stream_file": "s1", "created_at": "2026-01-01T00:00:00",
+                 "media_fs_uuid": "AAA"},
+            ]}],
+            "pools": [{"name": "tank"}],
+            "config_backups": [{"id": "c1"}],
+        },
+        {
+            "datasets": [
+                {"name": "tank/a", "pool": "tank", "backups": [
+                    {"type": "full", "stream_file": "s1", "created_at": "2026-01-01T00:00:00",
+                     "media_fs_uuid": "AAA"},
+                    {"type": "incremental", "stream_file": "s2",
+                     "created_at": "2026-01-02T00:00:00", "media_fs_uuid": "BBB"},
+                ]},
+                {"name": "tank/b", "pool": "tank", "backups": []},
+            ],
+            "pools": [{"name": "tank"}],
+            "config_backups": [{"id": "c2"}],
+        },
+    ])
+
+    names = [d["name"] for d in merged["datasets"]]
+    assert names == ["tank/a", "tank/b"]
+    # The duplicated run is keyed by stream file, so it is not doubled up.
+    assert [r["stream_file"] for r in merged["datasets"][0]["backups"]] == ["s1", "s2"]
+    assert [p["name"] for p in merged["pools"]] == ["tank"]
+    assert [c["id"] for c in merged["config_backups"]] == ["c1", "c2"]

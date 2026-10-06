@@ -157,6 +157,10 @@ echo "5/7 Writing default configuration (/etc/nazman/nazman.conf)..."
 if [[ -f /etc/nazman/nazman.conf ]]; then
     echo "  existing /etc/nazman/nazman.conf found; leaving it unchanged."
 else
+# Created 0600 before it is written: the conf holds the admin password hash
+# and Telegram tokens, and a freshly created file would otherwise be 0644
+# until the chmod below ran.
+install -m 600 /dev/null /etc/nazman/nazman.conf
 cat > /etc/nazman/nazman.conf << 'EOF'
 # NAZMan configuration (pydantic-settings, flat key = value format)
 

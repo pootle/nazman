@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     
     # Backup
     backup_mount_base: str = "/mnt/backup"  # parent dir under which backup disks are mounted
-    backup_gzip_level: int = 6
+    backup_gzip_level: int = 1
     backup_full_margin: float = 1.2  # capacity safety margin multiplier for full backups
     backup_config_retention: int = 5  # config bundles kept per backup volume
     
@@ -132,6 +132,17 @@ def set_setting(key: str, value: Any) -> bool:
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Create the conf 0600 before writing: it holds the admin password
+        # hash and Telegram tokens, and Path.write_text would otherwise create
+        # it 0644. An existing file keeps the mode it already has, so a live
+        # install's permissions are never changed out from under it.
+        if not path.exists():
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                pass  # created concurrently; it owns its own mode
+            else:
+                os.close(fd)
         path.write_text("\n".join(out) + "\n", encoding="utf-8")
         updated = True
     except OSError:

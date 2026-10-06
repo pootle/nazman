@@ -126,8 +126,8 @@
             <h2><span class="step-badge">5</span> Finish</h2>
         </div>
         <div class="card-body">
-            <p class="text-muted">Optional: re-register the restored backup volume so future backups work, and
-                reconcile the restored schedules into running jobs.</p>
+            <p class="text-muted">Optional: re-register the restored backup disks so future backups can use them, and
+                rebuild the restored backup groups' schedules into running jobs.</p>
             <button class="btn btn-secondary" onclick="adoptMedia()">
                 <i class="fas fa-hdd"></i> Adopt backup media
             </button>
@@ -328,15 +328,15 @@ function renderBackupSets() {
     c.innerHTML = `
         <table class="data-table">
             <thead><tr>
-                <th>Volume</th><th>Device</th><th>Pools</th><th>Datasets</th>
+                <th>Backup set</th><th>Disks</th><th>Pools</th><th>Datasets</th>
                 <th>Configs</th><th>Updated</th><th></th>
             </tr></thead>
             <tbody>
                 ${backupSets.map(s => `
                     <tr>
-                        <td>${escapeHtml((s.media && s.media.label) || s.label || '—')}<br>
-                            <small class="text-muted">${escapeHtml(s.fs_uuid || '')}</small></td>
-                        <td><code>${escapeHtml(s.device || '')}</code></td>
+                        <td><strong>${escapeHtml(s.label || 'Set ' + s.set_id)}</strong><br>
+                            <small class="text-muted">${escapeHtml(s.set_id)}</small></td>
+                        <td>${s.volume_count || 1}${s.volume_count > 1 ? '<br><small class="text-muted">all needed</small>' : ''}</td>
                         <td>${(s.pool_names || []).map(escapeHtml).join(', ') || '—'}</td>
                         <td>${s.dataset_count || 0}</td>
                         <td>${s.config_backup_count || 0}</td>
@@ -370,20 +370,29 @@ function renderSetDetail(set) {
     const datasets = m.datasets || [];
     const configs = m.config_backups || [];
     const media = set.required_media || [];
+    const volumes = set.volumes || [];
+    const missing = media.filter(md => !md.connected);
     document.getElementById('set-detail').innerHTML = `
         <div class="status-grid">
             <div class="status-item"><label>Set:</label><span>${escapeHtml(set.set_id)}</span></div>
+            <div class="status-item"><label>Disks in set:</label><span>${volumes.length || 1}</span></div>
             <div class="status-item"><label>Pools:</label><span>${pools.length}</span></div>
             <div class="status-item"><label>Datasets:</label><span>${datasets.length}</span></div>
             <div class="status-item"><label>Config bundles:</label><span>${configs.length}</span></div>
         </div>
+        ${volumes.length > 1 ? `<h4 style="margin:14px 0 6px">Disks holding this set</h4>${volumes.map(v => `
+            <div class="manifest-line"><code>${escapeHtml(v.fs_uuid || '')}</code>
+                <small class="text-muted">${escapeHtml(v.label || '')} · ${escapeHtml(v.device || '')}</small></div>`).join('')}` : ''}
         ${pools.length ? `<h4 style="margin:14px 0 6px">Pools</h4>${pools.map(p => `
             <div class="manifest-line"><strong>${escapeHtml(p.name)}</strong>
                 <small class="text-muted">ashift ${p.ashift || '—'} · ${(p.vdevs || []).map(v => `${v.role}/${v.topology}`).join(', ')}</small></div>`).join('')}` : ''}
         ${configs.length ? `<h4 style="margin:14px 0 6px">Configuration</h4>${configs.map(c => `
             <div class="manifest-line"><code>${escapeHtml(c.id)}</code>
                 <button class="btn btn-danger btn-sm" style="margin-left:8px" onclick="restoreSetConfig('${escapeHtml(c.id)}')">Restore</button></div>`).join('')}` : ''}
-        ${media.length ? `<h4 style="margin:14px 0 6px">Required media</h4>${media.map(md => `
+        ${media.length ? `<h4 style="margin:14px 0 6px">Required media</h4>
+            ${missing.length ? `<div class="status-faulted" style="display:inline-block;padding:2px 6px;border-radius:3px;margin-bottom:6px;">
+                ${missing.length} disk${missing.length === 1 ? '' : 's'} of this set ${missing.length === 1 ? 'is' : 'are'} not connected — the backup chain cannot be read without ${missing.length === 1 ? 'it' : 'them'}.</div>` : ''}
+            ${media.map(md => `
             <div class="media-row">
                 <span>${escapeHtml(md.label || md.media_fs_uuid || 'unknown')}</span>
                 <span class="${md.connected ? 'status-online' : 'status-faulted'}">${md.connected ? 'connected' : 'not connected'}</span>
@@ -577,13 +586,17 @@ async function loadDatasetPlan() {
 function renderRequiredMedia() {
     const c = document.getElementById('required-media');
     if (mediaList.length === 0) { c.innerHTML = ''; return; }
-    c.innerHTML = `<h4 style="margin:0 0 6px">Required backup media</h4>` + mediaList.map(m => `
+    const allConnected = mediaList.every(m => m.connected);
+    c.innerHTML = `<h4 style="margin:0 0 6px">Required backup media</h4>
+        ${mediaList.length > 1 ? `<p class="text-muted">This set is spread over ${mediaList.length} disks; the
+            backup chain can only be read when all of them are inserted.</p>` : ''}
+        ` + mediaList.map(m => `
         <div class="media-row">
             <span>${escapeHtml(m.label || m.media_fs_uuid || 'unknown')}</span>
             <span class="${m.connected ? 'status-online' : 'status-faulted'}">${m.connected ? 'connected' : 'insert disk'}</span>
             <small class="text-muted">${m.datasets.length} dataset(s)</small>
-            ${m.connected ? `<button class="btn btn-secondary btn-sm" onclick="restoreFromMedia('${escapeHtml(m.media_fs_uuid || '')}')">Restore from this disk</button>` : ''}
-        </div>`).join('');
+        </div>`).join('') + `
+        ${allConnected ? `<button class="btn btn-secondary btn-sm" style="margin-top:6px;" onclick="restoreFromMedia('')">Restore whole set</button>` : ''}`;
 }
 
 function renderDatasetPlan() {
@@ -609,7 +622,10 @@ function renderDatasetPlan() {
                             </select>
                         </td>
                         <td>${(d.chain || []).length}</td>
-                        <td><small class="text-muted">${(d.media_fs_uuids || []).map(escapeHtml).join(', ') || '—'}</small></td>
+                        <td><small class="text-muted">${(d.media_fs_uuids || []).map(escapeHtml).join(', ') || '—'}</small>
+                            ${d.spans_volumes ? '<br><small class="text-muted">continues on another disk</small>' : ''}
+                            ${(d.media_missing || []).length ? `<br><span class="status-faulted" style="font-size:11px;padding:2px 6px;border-radius:3px;">missing ${d.media_missing.map(escapeHtml).join(', ')}</span>` : ''}
+                        </td>
                     </tr>`).join('')}
             </tbody>
         </table>`;
@@ -634,7 +650,7 @@ async function restoreSelected() {
 async function restoreFromMedia(mediaUuid) {
     const selections = collectSelections();
     if (selections.some(s => !s.target_pool)) { showAlert('Every selected dataset needs a target pool', 'error'); return; }
-    if (!confirm('Restore datasets stored on this disk?')) return;
+    if (!confirm('Restore the selected datasets from this set?')) return;
     await runRestore(selections, mediaUuid);
 }
 
@@ -662,8 +678,13 @@ async function runRestore(selections, mediaUuid) {
 async function adoptMedia() {
     try {
         const res = await api.adoptSetMedia(selectedSetId);
-        document.getElementById('finish-note').innerHTML =
-            '<p class="text-success">' + escapeHtml(res.message || (res.adopted ? 'Backup volume adopted' : 'Already declared')) + '</p>';
+        let html = '<p class="text-success">' + escapeHtml(res.message) + '</p>';
+        // A set spans disks, so some may be adoptable while others are not;
+        // the chain is only usable once every volume of it is declared.
+        if ((res.missing || []).length) {
+            html += '<p class="text-danger">Not adopted: ' + (res.missing || []).map(escapeHtml).join('; ') + '</p>';
+        }
+        document.getElementById('finish-note').innerHTML = html;
     } catch (e) {
         document.getElementById('finish-note').innerHTML = '<p class="text-danger">' + escapeHtml(e.message) + '</p>';
     }
@@ -672,7 +693,7 @@ async function adoptMedia() {
 async function rebuildSchedules() {
     try {
         await api.rebuildSetSchedules(selectedSetId);
-        document.getElementById('finish-note').innerHTML = '<p class="text-success">Schedules reconciled.</p>';
+        document.getElementById('finish-note').innerHTML = '<p class="text-success">Backup schedules reconciled.</p>';
     } catch (e) {
         document.getElementById('finish-note').innerHTML = '<p class="text-danger">' + escapeHtml(e.message) + '</p>';
     }

@@ -499,6 +499,35 @@ body {
 }
 .sched-add .form-control { max-width: 220px; font-size: 12px; padding: 4px 6px; }
 
+/* Backup groups: a group holds sets, and each set holds a chain of disks */
+.backup-group {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    background: #fafafa;
+}
+.backup-set {
+    border: 1px solid #ddd;
+    border-left: 3px solid #bbb;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-top: 8px;
+    background: #fff;
+}
+.backup-set.set-active { border-left-color: #27ae60; }
+.backup-set .sched-head { flex-wrap: wrap; }
+.badge-active { background-color: #27ae60; color: white; }
+.set-usage { margin: 4px 0 8px; }
+.usage-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: #e4e6e8;
+    overflow: hidden;
+}
+.usage-fill { height: 100%; background: #3498db; }
+.usage-fill.usage-danger { background: #e74c3c; }
+
 /* Forms */
 .form-group {
     margin-bottom: 14px;

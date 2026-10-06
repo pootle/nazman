@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from nazman.database import Base, get_db, get_db_context
 from nazman.main import app
-from nazman.config import Settings
+from nazman.config import Settings, get_settings
 from nazman.auth import get_current_user
 from nazman import wiring
 
@@ -54,17 +54,34 @@ def fresh_container():
 
 @pytest.fixture(autouse=True)
 def override_settings():
-    """Override settings to use temp dirs and disable auth."""
+    """Override settings to use temp dirs and disable auth.
+
+    The conf file is redirected into the temp dir too. Modules that do
+    ``from ..config import get_settings`` bypass the patches below, so without
+    this a host ``/etc/nazman/nazman.conf`` written by a live install would
+    decide what the tests see - and ``set_setting`` would persist test writes
+    to the host.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        settings = Settings(
-            database_path=os.path.join(tmpdir, "test.db"),
-            logging_file=os.path.join(tmpdir, "test.log"),
-            auth_enabled=False,
-            command_log_path=os.path.join(tmpdir, "command_log.db"),
-        )
-        with patch("nazman.config.get_settings", return_value=settings):
-            with patch("nazman.database.get_settings", return_value=settings):
-                yield settings
+        with patch.object(
+            Settings, "model_config",
+            {**Settings.model_config, "env_file": os.path.join(tmpdir, "nazman.conf")},
+        ):
+            settings = Settings(
+                database_path=os.path.join(tmpdir, "test.db"),
+                logging_file=os.path.join(tmpdir, "test.log"),
+                auth_enabled=False,
+                command_log_path=os.path.join(tmpdir, "command_log.db"),
+            )
+            with patch("nazman.config.get_settings", return_value=settings):
+                with patch("nazman.database.get_settings", return_value=settings):
+                    # Rebuild the cached instance the direct importers hold,
+                    # now that Settings reads the temp conf instead of /etc.
+                    get_settings.cache_clear()
+                    try:
+                        yield settings
+                    finally:
+                        get_settings.cache_clear()
 
 
 @pytest.fixture()

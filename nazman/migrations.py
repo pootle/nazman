@@ -26,7 +26,50 @@ def run_migrations(engine, conn) -> None:
     _drop_obsolete_tables(conn)
     _rebuild_disks_table(engine, conn)
     _enforce_disk_serial_uniqueness(conn)
+    _reset_legacy_backup_tables(engine, conn)
     migrate_backup_tables(engine, conn)
+
+
+# Dropped newest-first so no table is removed while another still references
+# it.  ``backup_schedules`` is the one-shot marker: it only exists on
+# pre-upgrade databases, so its presence is what identifies a legacy install.
+_LEGACY_BACKUP_TABLES = (
+    "backup_runs",
+    "backup_schedules",
+    "backup_disks",
+)
+
+
+def _reset_legacy_backup_tables(engine, conn) -> None:
+    """Discard the pre-rotation backup state the first time it is seen.
+
+    Backup state was reworked from per-(dataset, disk) schedules onto backup
+    groups, sets and disks.  The old rows describe a scheme that no longer
+    exists and cannot be mapped onto the new one, so they are dropped rather
+    than half-migrated.  Nothing on the physical media is touched: streams,
+    manifests and configuration bundles stay on their volumes and remain
+    readable by the Restore page, but the disks have to be re-declared.
+
+    ``backup_schedules`` is the marker table for a pre-upgrade database and is
+    never recreated (the model is gone), so this runs exactly once.  Declared
+    backup disks and scheduled jobs go with it.
+    """
+    try:
+        if not inspect(engine).has_table("backup_schedules"):
+            return
+        logger.warning(
+            "resetting legacy backup state: declared backup disks, schedules and "
+            "run history are being discarded (media contents are untouched)"
+        )
+        for tbl in _LEGACY_BACKUP_TABLES:
+            conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
+        conn.execute(
+            text("DELETE FROM scheduled_tasks WHERE task_type = 'zfs_backup'")
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.error("failed to reset legacy backup tables", exc_info=True)
 
 
 def _drop_obsolete_tables(conn) -> None:
@@ -111,24 +154,33 @@ def _enforce_disk_serial_uniqueness(conn) -> None:
 
 
 def migrate_backup_tables(engine, conn) -> None:
-    """Migrate backup tables in place so declared disks survive restarts.
+    """Add columns and unique keys to backup tables that already exist.
 
-    These tables were previously dropped on every startup, which silently
-    discarded declared backup disks, schedules and run history.  SQLite can't
-    drop columns, but ADD COLUMN covers columns added by schema evolution;
-    unique keys are re-created idempotently so dedup guarantees hold even on
-    pre-existing tables.
+    Backup tables are normally created by ``Base.metadata.create_all``, so this
+    only does work for an install that predates a schema change: SQLite can't
+    drop columns, but ADD COLUMN covers columns added by evolution, and unique
+    keys are re-created idempotently so dedup guarantees hold even on
+    pre-existing tables.  The pre-rotation tables are wiped by
+    ``_reset_legacy_backup_tables`` first, so they never reach this loop.
     """
     try:
         from .models import backup_zfs
         backup_specs = [
+            ("backup_groups", backup_zfs.BackupGroup, [
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_backup_groups_name ON backup_groups(name)",
+            ]),
+            ("backup_group_datasets", backup_zfs.BackupGroupDataset, [
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_backup_group_dataset "
+                "ON backup_group_datasets(group_id, dataset_name)",
+            ]),
+            ("backup_sets", backup_zfs.BackupSet, [
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_backup_set_position "
+                "ON backup_sets(group_id, position)",
+            ]),
+            ("backup_sessions", backup_zfs.BackupSession, []),
             ("backup_disks", backup_zfs.BackupDisk, [
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_backup_disk_disk ON backup_disks(disk_id)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_backup_disks_fs_uuid ON backup_disks(fs_uuid)",
-            ]),
-            ("backup_schedules", backup_zfs.BackupSchedule, [
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_backup_schedule_dataset_disk "
-                "ON backup_schedules(dataset_name, backup_disk_id)",
             ]),
             ("backup_runs", backup_zfs.BackupRun, []),
         ]

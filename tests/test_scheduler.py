@@ -121,14 +121,13 @@ async def test_execute_snapshot_creates_snapshot_with_retention():
         first_call = mock_zfs.call_args_list[0]
         assert first_call.args[0] == "snapshot"
         assert "tank/data@auto-" in first_call.args[1]
-
-
 @pytest.mark.asyncio
-async def test_zfs_backup_executor_runs_backup():
-    """The wiring-registered ZFS_BACKUP executor calls run_backup per task.
+async def test_zfs_backup_executor_starts_group_session():
+    """The wiring-registered ZFS_BACKUP executor starts a group session.
 
     The scheduler itself no longer imports backup managers; wiring binds an
-    executor closure that acquires a per-dataset lock and runs the backup.
+    executor closure that hands the group id to the group service, which owns
+    the per-group lock and walks the group's datasets.
     """
     from nazman import wiring
 
@@ -136,25 +135,27 @@ async def test_zfs_backup_executor_runs_backup():
     executor = container.scheduler._executors[TaskType.ZFS_BACKUP.value]
 
     task = ScheduledTask(
-        name="zfs-full-tank-data",
+        name="backup-group-7-full",
         task_type=TaskType.ZFS_BACKUP.value,
-        target="tank/data",
+        target="Weekly",
         schedule="0 3 * * *",
-        config={"dataset_name": "tank/data", "backup_disk_id": 1, "type": "full"},
+        config={"group_id": 7, "type": "full"},
     )
 
-    with patch.object(type(container.zfs_backup), "run_backup",
-                      new_callable=AsyncMock) as mock_run:
-        await executor(task, MagicMock())
-        mock_run.assert_called_once()
-        kwargs = mock_run.call_args.kwargs
-        assert kwargs["dataset_name"] == "tank/data"
-        assert kwargs["backup_disk_id"] == 1
+    with patch.object(type(container.backup_groups), "start_session",
+                      new_callable=AsyncMock) as mock_start:
+        db = MagicMock()
+        await executor(task, db)
+        mock_start.assert_called_once()
+        args = mock_start.call_args.args
+        assert args[0] is db
+        assert args[1] == 7
+        assert args[2] == "full"
 
 
 @pytest.mark.asyncio
-async def test_zfs_backup_executor_requires_dataset_and_disk():
-    """Missing config keys raise instead of silently no-op'ing."""
+async def test_zfs_backup_executor_requires_group_id():
+    """A job without a group_id raises instead of silently no-op'ing."""
     from nazman import wiring
     from nazman.utils.exceptions import NAZManError
 
@@ -167,6 +168,7 @@ async def test_zfs_backup_executor_requires_dataset_and_disk():
     )
     with pytest.raises(NAZManError, match="requires"):
         await executor(task, MagicMock())
+
 
 
 @pytest.mark.asyncio
