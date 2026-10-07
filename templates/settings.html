@@ -201,7 +201,7 @@ async function loadAlertHistory() {
                 : '<table class="data-table"><thead><tr><th>Time</th><th>Event</th><th>Message</th><th>Status</th></tr></thead><tbody>' +
                   entries.map(e => `
                     <tr>
-                        <td>${e.created_at ? escapeHtml(new Date(e.created_at).toLocaleString()) : '&mdash;'}</td>
+                        <td>${e.created_at ? escapeHtml(formatDate(e.created_at)) : '&mdash;'}</td>
                         <td>${escapeHtml(e.event_key)}</td>
                         <td>${escapeHtml(e.message)}</td>
                         <td class="${e.delivered ? 'status-ok' : 'status-fail'}">

@@ -90,8 +90,8 @@ function parseSize(str) {
 
 function formatEventTime(t) {
     if (!t) return '—';
-    const date = new Date(t);
-    return isNaN(date.getTime()) ? t : date.toLocaleString();
+    const date = toLocalDate(t);
+    return date ? date.toLocaleString() : String(t);
 }
 
 function shortEventClass(cls) {

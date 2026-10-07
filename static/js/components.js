@@ -91,12 +91,25 @@ function formatBytes(bytes, decimals = 2) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
+// Parse a server timestamp into a local Date
+function toLocalDate(dateString) {
+    if (!dateString) return null;
+    let s = String(dateString).trim();
+    // Server timestamps are UTC but serialized without a zone marker (the
+    // SQLite round-trip drops it), so the browser would otherwise treat
+    // them as local and show wall-clock UTC. Add the marker when missing;
+    // strings that already carry a zone (e.g. client-stamped toISOString)
+    // are left alone.
+    if (s.includes('T') && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)) s += 'Z';
+    const date = new Date(s);
+    return isNaN(date.getTime()) ? null : date;
+}
+
 // Format date
 function formatDate(dateString) {
     if (!dateString) return 'Never';
-    
-    const date = new Date(dateString);
-    return date.toLocaleString();
+    const date = toLocalDate(dateString);
+    return date ? date.toLocaleString() : String(dateString);
 }
 
 // Create loading element
