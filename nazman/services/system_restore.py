@@ -22,7 +22,8 @@ from ..models.disk import Disk
 from ..utils import backup_manifest as bm
 from ..utils.commands import run_command
 from ..utils.devices import (
-    get_device_path, partition_by_id, resolve_by_id, os_disk_names,
+    get_device_path, partition_by_id, read_slot_uuids, resolve_by_id,
+    os_disk_names,
 )
 from ..utils.exceptions import BackupError, ValidationError
 from ..utils.sizes import parse_size_to_bytes
@@ -392,36 +393,81 @@ class SystemRestoreService:
         }
 
     # ── Pool recreation ─────────────────────────────────────────────────
-    async def _attached_disks(self, db: Session) -> List[Dict[str, Any]]:
+    async def _attached_disks(self, db: Session, excluded: set = ()) -> List[Dict[str, Any]]:
+        """Attached, assignable whole disks with their labeled partitions.
+
+        ``excluded`` holds device identities (by-id paths or base names) that
+        must never be offered, e.g. the backup media of the set being restored.
+        Disks already claimed by an imported pool are dropped too, mirroring
+        :meth:`list_candidates`.
+        """
         if self.disk is not None:
             await self.disk.sync_disks_to_database(db)
-        return [
-            {
+        media = {ident: "media" for ident in excluded if ident}
+        pool_members = {}
+        if self.zfs is not None:
+            try:
+                pool_members = await self.zfs.get_pool_members()
+            except Exception:
+                pool_members = {}
+        attached = []
+        for d in db.query(Disk).all():
+            if d.is_os_disk:
+                continue
+            live_path = get_device_path(d)
+            if self._in_pool(media, live_path, d.by_id) or self._in_pool(pool_members, live_path, d.by_id):
+                continue
+            partitions = []
+            if live_path:
+                base_name = live_path.removeprefix("/dev/")
+                for p in (await read_slot_uuids([live_path])).get(live_path, {}).get("partitions", []):
+                    if not p.get("slot_uuid"):
+                        continue
+                    partitions.append({
+                        "number": self._partition_number(p["name"], base_name),
+                        "slot_uuid": p["slot_uuid"],
+                        "device_path": partition_by_id(d.by_id, self._partition_number(p["name"], base_name)) if d.by_id else None,
+                        "size_bytes": p.get("size_bytes", 0),
+                    })
+            attached.append({
                 "disk_id": d.id,
                 "by_id": d.by_id,
                 "serial": d.serial,
                 "size_bytes": d.size_bytes,
                 "model": d.model,
-                "device_path": get_device_path(d),
-                "present": bool(get_device_path(d)),
+                "device_path": live_path,
+                "present": bool(live_path),
                 "is_os_disk": d.is_os_disk,
-            }
-            for d in db.query(Disk).all()
-            if not d.is_os_disk
-        ]
+                "partitions": partitions,
+            })
+        return attached
 
     async def plan_pool_mapping(self, db: Session, set_id: str, pool_name: str) -> Dict[str, Any]:
         """Suggest which attached disk fills each recorded vdev slot.
 
         Matching is by-id first, then serial (a disk moved to a new controller
         keeps its serial).  Unmatched slots are returned for manual assignment.
+        The set's own backup media is never offered, and a recorded partition
+        slot that already exists on its matched disk is reported so the wizard
+        can use it directly instead of wiping and repartitioning.
         """
         manifest = await self._manifest_for(db, set_id)
         pool = next((p for p in manifest.get("pools", []) if p.get("name") == pool_name), None)
         if pool is None:
             raise ValidationError(f"Pool '{pool_name}' not found in backup set")
 
-        attached = await self._attached_disks(db)
+        excluded = {
+            ident
+            for volume in manifest.get("_volumes") or []
+            for ident in (
+                (volume.get("candidate") or {}).get("base_by_id"),
+                (volume.get("candidate") or {}).get("by_id"),
+                (volume.get("candidate") or {}).get("base_name"),
+                (volume.get("candidate") or {}).get("device_name"),
+            )
+            if ident
+        }
+        attached = await self._attached_disks(db, excluded)
         used: set = set()
         vdevs = []
         for vdev in pool.get("vdevs", []):
@@ -430,13 +476,23 @@ class SystemRestoreService:
                 match = self._match_disk(spec, attached, used)
                 if match:
                     used.add(match["disk_id"])
+                matched_partition = None
+                if match and spec.get("slot_uuid"):
+                    matched_partition = next(
+                        (p for p in match.get("partitions", []) if p["slot_uuid"] == spec["slot_uuid"]),
+                        None,
+                    )
+                size_ok = bool(match and (not spec.get("size_bytes")
+                            or match["size_bytes"] >= spec["size_bytes"]))
+                if matched_partition and spec.get("partition_size_bytes"):
+                    size_ok = matched_partition["size_bytes"] >= spec["partition_size_bytes"]
                 devices.append({
                     "spec": spec,
                     "matched_disk_id": match["disk_id"] if match else None,
                     "match": "by_id" if match and match["by_id"] == spec.get("by_id")
                     else ("serial" if match else None),
-                    "size_ok": bool(match and (not spec.get("size_bytes")
-                                or match["size_bytes"] >= spec["size_bytes"])),
+                    "size_ok": size_ok,
+                    "matched_partition": matched_partition,
                 })
             vdevs.append({
                 "role": vdev.get("role"), "topology": vdev.get("topology"),
