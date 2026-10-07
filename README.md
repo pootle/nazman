@@ -42,8 +42,8 @@ the right configuration.
 
 | Branch | Purpose |
 |--------|---------|
-| `main` | **Production** artifact. App code, deployment scripts, and `install.sh` for a `curl \| bash` bootstrap. No `tests/` or dev tooling. |
-| `dev`  | **Development** variant. Everything on `main` plus the test suite, `dev-env.sh`, a `Makefile`, an `.opencode/` config for opencode development, and CI. |
+| `dev`  | Working branch. All code is written and tested here — app, tests, and install/build tooling. |
+| `main` | Release label merged forward from `dev`; its tree always equals `dev`'s. The deployed server stays lean because `build.sh`/`deploy.sh` copy only the files listed in `deploy.txt`. |
 
 ## Quick Start (Production)
 
