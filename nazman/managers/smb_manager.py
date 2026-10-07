@@ -14,12 +14,14 @@ permissions stay consistent across SMB and NFS clients.
 
 import os
 import re
+import shutil
 from typing import List, Dict, Any, Optional
 
 from sqlalchemy.orm import Session
 
-from ..utils.commands import run_command, run_zfs
+from ..utils.commands import run_command
 from ..utils.exceptions import SmbError, ValidationError
+from ..utils import provisioning, zfs_query
 
 SMB_CONF_PATH = "/etc/samba/smb.conf"
 
@@ -30,9 +32,9 @@ _MARKER_END = "# ===== end NAZMan managed shares ====="
 
 # Shared identity used by NFS; reuse it for SMB so NFS and SMB clients write as
 # the same user/group, keeping permission semantics consistent.
-ANON_USER = "nfsanon"
-ANON_UID = 65533
-ANON_GID = 65533
+ANON_USER = provisioning.ANON_USER
+ANON_UID = provisioning.ANON_UID
+ANON_GID = provisioning.ANON_GID
 
 
 def _normalize_dataset_name(name: str) -> str:
@@ -52,14 +54,57 @@ class SmbManager:
             for p in ("/usr/sbin/smbd", "/usr/bin/smbd")
         )
 
+    async def install_server(self) -> Dict[str, Any]:
+        """Install Samba on this host via apt (Debian/Ubuntu only).
+
+        Idempotent: returns immediately when ``smbd`` is already present.
+        Installs the ``samba`` package, then enables and starts the ``smbd``
+        and ``nmbd`` services, and ensures the shared anonymous identity used
+        by NAZMan's shares exists.
+        """
+        if self.is_server_present():
+            return {"installed": True, "message": "Samba is already installed."}
+
+        if shutil.which("apt-get") is None:
+            raise SmbError(
+                "Samba is not installed and apt-get is not available on this "
+                "server. Install the `samba` package manually."
+            )
+
+        env = {"DEBIAN_FRONTEND": "noninteractive"}
+
+        _, stderr, rc = await run_command(
+            ["apt-get", "update"], timeout=600, check=False,
+            env=env, op="system", category="smb",
+        )
+        if rc != 0:
+            raise SmbError(f"apt-get update failed: {stderr.strip()}")
+
+        _, stderr, rc = await run_command(
+            ["apt-get", "install", "-y", "samba"], timeout=600, check=False,
+            env=env, op="system", category="smb",
+        )
+        if rc != 0:
+            raise SmbError(f"Failed to install samba: {stderr.strip()}")
+
+        await run_command(["systemctl", "enable", "smbd"], timeout=60, op="system", category="smb")
+        await run_command(["systemctl", "enable", "nmbd"], timeout=60, op="system", category="smb")
+        await run_command(["systemctl", "start", "smbd"], timeout=60, op="system", category="smb")
+        await run_command(["systemctl", "start", "nmbd"], timeout=60, op="system", category="smb")
+
+        await self._ensure_anon_user()
+
+        return {
+            "installed": self.is_server_present(),
+            "message": "Samba installed successfully." if self.is_server_present()
+            else "Samba install completed but smbd was not found.",
+        }
+
     # -- dataset helpers ---------------------------------------------------
 
     @staticmethod
     async def _dataset_exists(dataset_name: str) -> bool:
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", dataset_name, check=False, op="read",
-        )
-        return rc == 0 and dataset_name in stdout.split()
+        return await zfs_query.dataset_exists(dataset_name)
 
     @staticmethod
     def share_name_for(dataset_name: str) -> str:
@@ -71,7 +116,7 @@ class SmbManager:
     # -- config path (test override) ---------------------------------------
 
     def conf_path(self) -> str:
-        return os.environ.get("NASMAN_SMB_CONF", SMB_CONF_PATH)
+        return os.environ.get("NAZMAN_SMB_CONF", SMB_CONF_PATH)
 
     # -- smb.conf parsing ---------------------------------------------------
 
@@ -238,8 +283,7 @@ class SmbManager:
 
         if enabled:
             try:
-                await run_command(["chown", f":{ANON_USER}", f"/{dataset_name}"], timeout=30, op="write", category="smb")
-                await run_command(["chmod", "2775", f"/{dataset_name}"], timeout=30, op="write", category="smb")
+                await provisioning.prepare_dataset_dir(dataset_name, category="smb")
             except Exception as e:
                 raise SmbError(f"Failed to prepare dataset directory: {e}")
 
@@ -259,7 +303,7 @@ class SmbManager:
 
     async def delete_share(self, db: Session, dataset_name: str) -> None:
         """Remove the NAZMan-managed SMB share for a dataset."""
-        if not self._dataset_exists(dataset_name):
+        if not await self._dataset_exists(dataset_name):
             raise ValidationError(f"Dataset '{dataset_name}' not found")
         self._rewrite_region(self.conf_path(), remove_dataset=_normalize_dataset_name(dataset_name))
         await self._reload()
@@ -303,16 +347,7 @@ class SmbManager:
     async def unshare_pool(self, db: Session, pool) -> None:
         """Remove NAZMan-managed SMB shares for every dataset in a pool."""
         pool_name = pool.name if isinstance(pool.name, str) else str(pool.name)
-        dataset_names = []
-        stdout, _, rc = await run_zfs(
-            "list", "-H", "-o", "name", "-t", "filesystem", "-r", pool_name,
-            check=False, op="read",
-        )
-        if rc == 0:
-            for line in stdout.splitlines():
-                name = line.strip()
-                if name and name != pool_name:
-                    dataset_names.append(name)
+        dataset_names = await zfs_query.list_filesystem_names(pool_name)
         for name in dataset_names:
             self._rewrite_region(self.conf_path(), remove_dataset=name)
         if dataset_names:
@@ -322,25 +357,4 @@ class SmbManager:
 
     @staticmethod
     async def _ensure_anon_user() -> None:
-        stdout, _, rc = await run_command(
-            ["getent", "group", ANON_USER], timeout=10, check=False
-        )
-        if rc != 0:
-            await run_command(["groupadd", "-g", str(ANON_GID), ANON_USER], timeout=30)
-        stdout, _, rc = await run_command(
-            ["getent", "passwd", ANON_USER], timeout=10, check=False
-        )
-        if rc != 0:
-            await run_command(
-                [
-                    "useradd", "-r", "-g", str(ANON_GID),
-                    "-u", str(ANON_UID), "-M",
-                    "-s", "/usr/sbin/nologin",
-                    "-d", "/var/lib/nfs", ANON_USER,
-                ],
-                timeout=30,
-            )
-
-
-# Singleton instance
-smb_manager = SmbManager()
+        await provisioning.ensure_anon_user()

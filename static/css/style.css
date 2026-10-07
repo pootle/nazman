@@ -361,9 +361,30 @@ body {
 .badge-system { background-color: #8e44ad; color: white; }
 .badge-removed { background-color: #7f8c8d; color: white; }
 
+/* Disk role badges (disks page) */
+.badge-role-system { background-color: #8e44ad; color: white; }
+.badge-role-pool { background-color: #2980b9; color: white; }
+.badge-role-more { background-color: #34495e; color: white; }
+.badge-role-backup { background-color: #16a085; color: white; }
+.badge-role-unused { background-color: #95a5a6; color: white; }
+.badge-role-dead { background-color: #c0392b; color: white; }
+.badge-role-removed { background-color: #7f8c8d; color: white; }
+
+/* Backup disk probe state (free column on the disks page) */
+.badge-state-mounted { background-color: #27ae60; color: white; }
+.badge-state-full { background-color: #e67e22; color: white; }
+.badge-state-unmounted { background-color: #95a5a6; color: white; }
+.badge-state-offline { background-color: #7f8c8d; color: white; }
+.badge-state-mismatch { background-color: #e74c3c; color: white; }
+.badge-state-unknown { background-color: #95a5a6; color: white; }
+
 /* Removed/not-currently-present disk rows */
 .removed-row td { opacity: 0.55; }
 .removed-row:hover td { opacity: 0.9; }
+
+/* Dead disk rows */
+.dead-row td { opacity: 0.55; }
+.dead-row:hover td { opacity: 0.9; }
 
 /* Status */
 .status {
@@ -382,6 +403,130 @@ body {
 .status-ok { background-color: #27ae60; color: white; }
 .status-failing { background-color: #e74c3c; color: white; }
 .status-unknown { background-color: #95a5a6; color: white; }
+.status-dead { background-color: #7f8c8d; color: white; }
+.status-attention { background-color: #e67e22; color: white; }
+
+/* Disk needing attention (SMART failing or ZFS errors on the disks page) */
+.badge-health-attention {
+    background-color: #e67e22;
+    color: white;
+    animation: status-amber-pulse 1.5s infinite;
+    cursor: help;
+}
+
+/* Disk details modal */
+.disk-detail-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1fr;
+    gap: 16px;
+}
+.disk-detail-grid .detail-col { min-width: 0; }
+.disk-detail-section {
+    background: #fafafa;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 12px;
+}
+.disk-detail-section h4 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #555;
+}
+.detail-key {
+    color: #888;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    width: 150px;
+    display: inline-block;
+    vertical-align: top;
+}
+.detail-val { font-size: 13px; word-break: break-all; }
+.smart-attr-table, .event-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.smart-attr-table td, .event-table td {
+    padding: 3px 6px;
+    border-top: 1px solid #eee;
+    text-align: left;
+}
+.smart-attr-table .num { font-variant-numeric: tabular-nums; }
+.problem-item { font-size: 13px; margin: 0 0 4px; }
+.problem-warn { color: #e67e22; }
+.problem-fatal { color: #e74c3c; font-weight: 600; }
+.empty-hint { color: #888; font-size: 13px; font-style: italic; }
+
+@media (max-width: 768px) {
+    .disk-detail-grid { grid-template-columns: 1fr; }
+}
+
+@keyframes status-amber-pulse {
+    0%, 100% { background-color: #f39c12; }
+    50% { background-color: #f1c40f; }
+}
+.status-running { background-color: #f39c12; color: white; animation: status-amber-pulse 1.5s infinite; }
+
+/* Per-(dataset, disk) backup schedule blocks */
+.sched-block {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: #fafafa;
+}
+.sched-block:last-child { margin-bottom: 8px; }
+.sched-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.sched-head span { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+.sched-crons {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.sched-crons .form-control { flex: 1; font-size: 12px; padding: 4px 6px; }
+.sched-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.sched-add {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 2px;
+}
+.sched-add .form-control { max-width: 220px; font-size: 12px; padding: 4px 6px; }
+
+/* Backup groups: a group holds sets, and each set holds a chain of disks */
+.backup-group {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    background: #fafafa;
+}
+.backup-set {
+    border: 1px solid #ddd;
+    border-left: 3px solid #bbb;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-top: 8px;
+    background: #fff;
+}
+.backup-set.set-active { border-left-color: #27ae60; }
+.backup-set .sched-head { flex-wrap: wrap; }
+.badge-active { background-color: #27ae60; color: white; }
+.set-usage { margin: 4px 0 8px; }
+.usage-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: #e4e6e8;
+    overflow: hidden;
+}
+.usage-fill { height: 100%; background: #3498db; }
+.usage-fill.usage-danger { background: #e74c3c; }
 
 /* Forms */
 .form-group {
@@ -767,6 +912,22 @@ code.event-cmd {
 .alert-error { background-color: var(--danger-color); }
 .alert-warning { background-color: var(--warning-color); }
 
+/* Message history modal */
+.message-entry {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    gap: 10px;
+    font-size: 0.9em;
+}
+.message-entry:last-child { border-bottom: none; }
+.message-ts { color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+.message-text { word-break: break-word; }
+.message-error .message-text { color: var(--danger-color); }
+.message-warning .message-text { color: var(--warning-color); }
+.message-success .message-text { color: var(--success-color); }
+.message-info .message-text { color: var(--primary-color); }
+
 @keyframes slideIn {
     from {
         transform: translateX(100%);
@@ -1112,3 +1273,58 @@ code.event-cmd {
     width: 15px;
     height: 15px;
 }
+
+/* ── System restore wizard ─────────────────────────────────────────── */
+.wizard-step { position: relative; }
+.step-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    margin-right: 8px;
+    border-radius: 50%;
+    background: var(--primary-color, #3498db);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+}
+.wizard-block {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    background: #fafafa;
+}
+.wizard-done { border-color: #27ae60; box-shadow: inset 0 0 0 1px #27ae60; }
+.wizard-skipped { opacity: 0.6; }
+.pool-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.vdev-block { border-top: 1px solid #eee; padding: 8px 0; }
+.vdev-block:first-of-type { border-top: none; }
+.vdev-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #555;
+    margin-bottom: 6px;
+}
+.vdev-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.vdev-spec { flex: 1; min-width: 0; font-size: 13px; word-break: break-all; }
+.vdev-row .form-control { max-width: 320px; }
+.pool-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.media-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid #eee;
+    font-size: 13px;
+}
+.media-row > span:first-child { flex: 1; min-width: 0; }
+.manifest-line { padding: 4px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }

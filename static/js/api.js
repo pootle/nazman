@@ -28,10 +28,16 @@ class NasManAPI {
         const response = await fetch(`${this.baseUrl}${path}`, options);
 
         if (response.status === 401) {
-            // A stored token is present but no longer valid; drop it so we prompt.
-            if (this.token) {
-                this.logout();
+            const stored = localStorage.getItem('nazman_token');
+            if (stored && stored !== this.token) {
+                // A login in another tab superseded our stale in-memory token;
+                // adopt the shared one and replay instead of clobbering it.
+                this.token = stored;
+                return this.request(method, path, data);
             }
+            // Our token (or the absence of one) is genuinely invalid; drop it
+            // so we prompt. Only removes the stored copy when it is ours.
+            this.logout();
             await this._requireAuth();
             // Retry once with the (now-present) token.
             return this.request(method, path, data);
@@ -214,9 +220,17 @@ class NasManAPI {
         return this.request('GET', '/api/nfs/presence');
     }
 
+    async installNfs() {
+        return this.request('POST', '/api/nfs/install');
+    }
+
     // SMB
     async getSmbPresence() {
         return this.request('GET', '/api/smb/presence');
+    }
+
+    async installSmb() {
+        return this.request('POST', '/api/smb/install');
     }
 
     async getSmbShares() {
@@ -250,17 +264,8 @@ class NasManAPI {
     }
 
     // Backup
-    async getBackupStatus() {
-        return this.request('GET', '/api/backup/status');
-    }
-
-    async getBackupHistory(limit = 50) {
-        return this.request('GET', `/api/backup/history?limit=${limit}`);
-    }
-
-    async createBackup(message = null) {
-        const params = message ? `?message=${encodeURIComponent(message)}` : '';
-        return this.request('POST', `/api/backup/backup${params}`);
+    async listConfigBundles() {
+        return this.request('GET', '/api/backup/bundles');
     }
 
     async restoreBackup(commitHash) {
@@ -272,12 +277,23 @@ class NasManAPI {
         return this.request('GET', '/api/backup-zfs/disks');
     }
 
-    async backupDiskCandidates() {
-        return this.request('GET', '/api/backup-zfs/disks/candidates');
+    async backupDiskUsed() {
+        return this.request('GET', '/api/backup-zfs/disks/used');
     }
 
-    async declareBackupDisk(diskId, confirm) {
-        return this.request('POST', `/api/backup-zfs/disks/${diskId}/declare`, { confirm });
+    async declareBackupDisk(diskId, confirm, slotUuid, label, wipeRaid, backupSetId = null) {
+        return this.request('POST', `/api/backup-zfs/disks/${diskId}/declare`, {
+            confirm,
+            slot_uuid: slotUuid || null,
+            label: label || null,
+            wipe_raid: !!wipeRaid,
+            backup_set_id: backupSetId,
+        });
+    }
+
+    async backupDiskRaidInfo(diskId, slotUuid) {
+        const params = slotUuid ? `?slot_uuid=${encodeURIComponent(slotUuid)}` : '';
+        return this.request('GET', `/api/backup-zfs/disks/${diskId}/raid-info${params}`);
     }
 
     async mountBackupDisk(id) {
@@ -292,44 +308,190 @@ class NasManAPI {
         return this.request('POST', `/api/backup-zfs/disks/${id}/scan`);
     }
 
+    async wakeBackupDisk(id) {
+        return this.request('POST', `/api/backup-zfs/disks/${id}/wake`);
+    }
+
+    async updateBackupDisk(id, payload) {
+        return this.request('PATCH', `/api/backup-zfs/disks/${id}`, payload);
+    }
+
     async deleteBackupDisk(id) {
         return this.request('DELETE', `/api/backup-zfs/disks/${id}`);
     }
 
-    async listBackupableDatasets() {
-        return this.request('GET', '/api/backup-zfs/datasets');
-    }
-
-    async listBackupRuns() {
-        return this.request('GET', '/api/backup-zfs/runs');
-    }
-
-    async runBackup(datasetName, backupDiskId, type) {
-        return this.request('POST', '/api/backup-zfs/runs', {
-            dataset_name: datasetName, backup_disk_id: backupDiskId, backup_type: type
-        });
+    async listBackupRuns(groupId = null, limit = null) {
+        const params = new URLSearchParams();
+        if (groupId) params.set('group_id', groupId);
+        if (limit) params.set('limit', limit);
+        const qs = params.toString();
+        return this.request('GET', `/api/backup-zfs/runs${qs ? `?${qs}` : ''}`);
     }
 
     async restoreBackupRun(runId, datasetName) {
-        return this.request('POST', `/api/backup-zfs/runs/${runId}/restore`, { dataset_name: datasetName });
+        return this.request('POST', `/api/backup-zfs/runs/${runId}/restore`, { target_dataset: datasetName });
     }
 
-    async upsertBackupSchedule(payload) {
-        return this.request('POST', '/api/backup-zfs/schedules', payload);
+    async getDiskManifest(backupDiskId) {
+        return this.request('GET', `/api/backup-zfs/disks/${backupDiskId}/manifest`);
     }
 
-    async deleteBackupSchedule(datasetName) {
-        return this.request('DELETE', `/api/backup-zfs/schedules/${encodeURIComponent(datasetName)}`);
+    async rebuildDiskManifest(backupDiskId) {
+        return this.request('POST', `/api/backup-zfs/disks/${backupDiskId}/rebuild-manifest`);
     }
 
     async listDiskStreams(backupDiskId) {
         return this.request('GET', `/api/backup-zfs/disks/${backupDiskId}/streams`);
     }
 
-    async restoreFromFile(backupDiskId, streamFile, datasetName) {
+    async restoreFromFile(backupDiskId, streamFile, datasetName, force = false) {
         return this.request('POST', '/api/backup-zfs/restore-file', {
-            stream_file: streamFile, dataset_name: datasetName
+            stream_file: streamFile, target_dataset: datasetName, force
         });
+    }
+
+    // Backup groups (datasets, sets, disk chains, sessions)
+    async listBackupGroups() {
+        return this.request('GET', '/api/backup-groups');
+    }
+
+    async getBackupGroup(groupId) {
+        return this.request('GET', `/api/backup-groups/${groupId}`);
+    }
+
+    async createBackupGroup(payload) {
+        return this.request('POST', '/api/backup-groups', payload);
+    }
+
+    async updateBackupGroup(groupId, payload) {
+        return this.request('PATCH', `/api/backup-groups/${groupId}`, payload);
+    }
+
+    async deleteBackupGroup(groupId) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}`);
+    }
+
+    async addGroupDataset(groupId, datasetName) {
+        return this.request('POST', `/api/backup-groups/${groupId}/datasets`, { dataset_name: datasetName });
+    }
+
+    async removeGroupDataset(groupId, datasetName) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}/datasets/${datasetName}`);
+    }
+
+    async createGroupSet(groupId, payload) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets`, payload || {});
+    }
+
+    async listGroupSets(groupId) {
+        return this.request('GET', `/api/backup-groups/${groupId}/sets`);
+    }
+
+    async updateGroupSet(groupId, setId, payload) {
+        return this.request('PATCH', `/api/backup-groups/${groupId}/sets/${setId}`, payload);
+    }
+
+    async deleteGroupSet(groupId, setId) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}/sets/${setId}`);
+    }
+
+    async activateGroupSet(groupId, setId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/activate`);
+    }
+
+    async addSetDisk(groupId, setId, backupDiskId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/disks/${backupDiskId}`);
+    }
+
+    async removeSetDisk(groupId, setId, backupDiskId) {
+        return this.request('DELETE', `/api/backup-groups/${groupId}/sets/${setId}/disks/${backupDiskId}`);
+    }
+
+    async activateBackupDisk(groupId, setId, backupDiskId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/disks/${backupDiskId}/activate`);
+    }
+
+    async advanceGroupSet(groupId, setId) {
+        return this.request('POST', `/api/backup-groups/${groupId}/sets/${setId}/advance`);
+    }
+
+    async runBackupGroup(groupId, backupType = 'full') {
+        return this.request('POST', `/api/backup-groups/${groupId}/backup`, { backup_type: backupType });
+    }
+
+    async listGroupSessions(groupId) {
+        return this.request('GET', `/api/backup-groups/${groupId}/sessions`);
+    }
+
+    async listAllBackupSessions() {
+        return this.request('GET', '/api/backup-groups/sessions/all');
+    }
+
+    // Disk partition layout (system rebuild)
+    async recreatePartitions(diskId, partitions) {
+        return this.request('POST', `/api/disks/${diskId}/recreate-partitions`, { partitions });
+    }
+
+    // System restore / rebuild
+    // A "set" here is a backup set discovered on attached media. Its chain may
+    // span several volumes, all of which must be attached to restore it.
+    async listBackupSets() {
+        return this.request('GET', '/api/system-restore/sets');
+    }
+
+    async getBackupSet(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}`);
+    }
+
+    async planPoolMapping(setId, poolName) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/pools/${encodeURIComponent(poolName)}/plan`);
+    }
+
+    async createPoolFromBackup(setId, poolName, vdevs) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/pools/${encodeURIComponent(poolName)}/create`, { vdevs });
+    }
+
+    async getDatasetRestorePlan(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/datasets/plan`);
+    }
+
+    async getRequiredMedia(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/media`);
+    }
+
+    async restoreDatasets(setId, selections, mediaFsUuid = null) {
+        const payload = { selections };
+        if (mediaFsUuid) payload.media_fs_uuid = mediaFsUuid;
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/datasets/restore`, payload);
+    }
+
+    async restoreSetConfig(setId, configId) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/config/restore`, { config_id: configId });
+    }
+
+    async adoptSetMedia(setId) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/adopt`);
+    }
+
+    async rebuildSetSchedules(setId) {
+        return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/rebuild-schedules`);
+    }
+
+    // Alerts
+    async getAlertsConfig() {
+        return this.request('GET', '/api/alerts/config');
+    }
+
+    async updateAlertsConfig(data) {
+        return this.request('PUT', '/api/alerts/config', data);
+    }
+
+    async sendTestAlert(message = null) {
+        return this.request('POST', '/api/alerts/test', { message });
+    }
+
+    async getAlertHistory(limit = 20) {
+        return this.request('GET', `/api/alerts/history?limit=${limit}`);
     }
 
     // Authentication
@@ -425,3 +587,17 @@ class NasManAPI {
 }
 
 const api = new NasManAPI();
+
+// Propagate sign-in / sign-out across tabs: a login in one tab immediately
+// replaces the stale in-memory token in every other open tab, so background
+// pollers stop acting on expired credentials.
+window.addEventListener('storage', (e) => {
+    if (e.key !== 'nazman_token') {
+        return;
+    }
+    api.token = e.newValue;
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) {
+        logoutBtn.style.display = api.token ? '' : 'none';
+    }
+});

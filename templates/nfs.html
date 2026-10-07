@@ -9,6 +9,11 @@
     <div class="card" id="nfs-presence-card" style="display:none;">
         <div class="card-body">
             <p class="callout callout-warning" id="nfs-presence-msg"></p>
+            <div class="modal-actions" id="nfs-install-actions" style="display:none;">
+                <button class="btn btn-primary" id="nfs-install-btn" onclick="installNfsServer()">
+                    <i class="fas fa-download"></i> Install NFS server
+                </button>
+            </div>
         </div>
     </div>
 
@@ -17,10 +22,10 @@
         <div class="card-header">
             <h2><i class="fas fa-share-alt"></i> NFS Shares</h2>
             <div>
-                <button class="btn btn-secondary" onclick="loadNfsShares()">
+                <button class="btn btn-secondary" id="nfs-refresh-btn" onclick="loadNfsShares()">
                     <i class="fas fa-sync-alt"></i> Refresh
                 </button>
-                <button class="btn btn-primary" onclick="showCreateExportModal()">
+                <button class="btn btn-primary" id="nfs-create-btn" onclick="showCreateExportModal()">
                     <i class="fas fa-plus"></i> Create Share
                 </button>
             </div>
@@ -36,7 +41,7 @@
     <div class="card">
         <div class="card-header">
             <h2><i class="fas fa-network-wired"></i> Active Exports</h2>
-            <button class="btn btn-secondary" onclick="loadActiveExports()">
+            <button class="btn btn-secondary" id="nfs-active-refresh-btn" onclick="loadActiveExports()">
                 <i class="fas fa-sync-alt"></i> Refresh
             </button>
         </div>
@@ -83,7 +88,8 @@
                     </label>
                 </div>
                 <p class="text-muted" style="margin-top:8px">
-                    All shares squash every client to the shared anonymous user
+                    Shares are restricted to the client specification, and every
+                    client is squashed to the shared anonymous user
                     (<code>nfsanon</code>, UID/GID 65533) for consistent read/write access.
                 </p>
             </div>
@@ -100,11 +106,25 @@
 <script>
 let shares = [];
 let datasets = [];
+let nfsInstalled = true;
 
 document.addEventListener('DOMContentLoaded', function() {
     loadNfsPage();
     document.getElementById('create-export-form').addEventListener('submit', handleCreateExport);
 });
+
+async function setNfsActiveState(installed) {
+    nfsInstalled = installed;
+    const tooltip = installed ? '' : 'The NFS kernel server is not installed on this server.';
+    document.getElementById('nfs-create-btn').disabled = !installed;
+    document.getElementById('nfs-create-btn').title = tooltip;
+    document.getElementById('nfs-refresh-btn').disabled = !installed;
+    document.getElementById('nfs-refresh-btn').title = tooltip;
+    document.getElementById('nfs-active-refresh-btn').disabled = !installed;
+    document.getElementById('nfs-active-refresh-btn').title = tooltip;
+    document.querySelectorAll('#nfs-shares .action-btn, #active-exports .action-btn')
+        .forEach(b => { b.disabled = !installed; b.title = tooltip; });
+}
 
 async function loadNfsPage() {
     await Promise.all([
@@ -121,15 +141,36 @@ async function checkNfsPresence() {
         const p = await api.getNfsPresence();
         if (p.installed) {
             card.style.display = 'none';
+            document.getElementById('nfs-install-actions').style.display = 'none';
         } else {
             document.getElementById('nfs-presence-msg').textContent =
                 'The NFS kernel server is not installed on this server. NFS sharing will not work ' +
-                'until you install it: run the NAZMan installer (build.sh, choosing to install NFS) ' +
-                'or run `sudo apt-get install -y nfs-kernel-server` on the server.';
+                'until you install it.';
+            document.getElementById('nfs-install-actions').style.display = '';
             card.style.display = '';
         }
+        await setNfsActiveState(p.installed);
     } catch (e) {
         console.error('Failed to check NFS presence:', e);
+    }
+}
+
+async function installNfsServer() {
+    const btn = document.getElementById('nfs-install-btn');
+    if (!confirm('Install the NFS kernel server (nfs-kernel-server package) now? This may take a few minutes.')) {
+        return;
+    }
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Installing...';
+    try {
+        await api.installNfs();
+        showAlert('NFS kernel server installed successfully', 'success');
+        await loadNfsPage();
+    } catch (error) {
+        showAlert('Failed to install NFS server: ' + error.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-download"></i> Install NFS server';
     }
 }
 
@@ -185,15 +226,18 @@ function renderNfsShares() {
                     <tr>
                         <td><code>${s.export_path}</code></td>
                         <td><code>${s.sharenfs || 'not set'}</code></td>
-                        <td><span class="status status-${s.enabled ? 'online' : 'faulted'}">${s.enabled ? 'Shared' : 'Not shared'}</span></td>
+                        <td><span class="status status-${s.enabled ? 'online' : 'warning'}">${s.enabled ? 'Shared' : 'Paused'}</span></td>
                         <td>
-                            <button class="btn btn-sm btn-secondary" onclick="toggleShare('${s.dataset_name}', ${!s.enabled})">
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="Details.share('nfs', '${escapeHtml(s.dataset_name)}')" title="View share details">
+                                <i class="fas fa-info-circle"></i>
+                            </button>
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="toggleShare('${escapeHtml(s.dataset_name)}', ${!s.enabled})" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-${s.enabled ? 'pause' : 'play'}"></i>
                             </button>
-                            ${s.enabled ? `<button class="btn btn-sm btn-secondary" onclick="editShare('${s.dataset_name}')">
+                            <button class="btn btn-sm btn-secondary action-btn" onclick="editShare('${s.dataset_name}')" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-edit"></i>
-                            </button>` : ''}
-                            <button class="btn btn-sm btn-danger" onclick="deleteExport('${s.dataset_name}')">
+                            </button>
+                            <button class="btn btn-sm btn-danger action-btn" onclick="deleteExport('${s.dataset_name}')" ${nfsInstalled ? '' : 'disabled'}>
                                 <i class="fas fa-trash"></i>
                             </button>
                         </td>
@@ -225,7 +269,7 @@ function renderActiveExports(activeExports) {
                 ${activeExports.map(exp => `
                     <tr>
                         <td><code>${exp.path}</code></td>
-                        <td>${exp.client}</td>
+                        <td>${exp.client === '*' || exp.client === '<world>' ? '* (all other hosts)' : exp.client}</td>
                         <td><code>${exp.options}</code></td>
                     </tr>
                 `).join('')}
@@ -244,6 +288,7 @@ function updateDatasetSelect() {
 }
 
 function showCreateExportModal() {
+    if (!nfsInstalled) return;
     document.getElementById('export-modal-title').textContent = 'Create NFS Share';
     document.getElementById('export-dataset').value = '';
     document.getElementById('export-client').value = '';
@@ -253,6 +298,7 @@ function showCreateExportModal() {
 }
 
 function editShare(datasetName) {
+    if (!nfsInstalled) return;
     const s = shares.find(x => x.dataset_name === datasetName);
     if (!s) return;
     document.getElementById('export-modal-title').textContent = 'Edit NFS Share';
@@ -311,31 +357,33 @@ async function handleCreateExport(e) {
 }
 
 async function toggleShare(datasetName, enable) {
+    if (!nfsInstalled) return;
     try {
         if (enable) {
-            // Re-enable with the existing sharenfs value (already set).
+            // Resume: options were kept by pause, so just re-share.
             await api.updateNfsExport(datasetName, { enabled: true });
         } else {
             await api.updateNfsExport(datasetName, { enabled: false });
         }
         await loadNfsShares();
-        showAlert(enable ? 'Share enabled' : 'Share disabled', 'success');
+        showAlert(enable ? 'Share resumed' : 'Share paused', 'success');
     } catch (error) {
         showAlert('Failed to update share: ' + error.message, 'error');
     }
 }
 
 async function deleteExport(datasetName) {
-    if (!confirm('Disable this NFS share?')) {
+    if (!nfsInstalled) return;
+    if (!confirm('Remove this NFS share permanently? Its settings will be discarded.')) {
         return;
     }
 
     try {
         await api.deleteNfsExport(datasetName);
         await loadNfsShares();
-        showAlert('Share disabled', 'success');
+        showAlert('Share removed', 'success');
     } catch (error) {
-        showAlert('Failed to disable share: ' + error.message, 'error');
+        showAlert('Failed to remove share: ' + error.message, 'error');
     }
 }
 </script>

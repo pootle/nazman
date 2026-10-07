@@ -5,9 +5,10 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers.smb_manager import smb_manager
+from ..managers.smb_manager import SmbManager
+from ..wiring import get_smb_manager
 
-router = APIRouter(prefix="/api/smb", tags=["smb"])
+router = APIRouter(prefix="/api/smb", tags=["smb"], dependencies=[Depends(get_current_user)])
 
 
 class SmbShareCreate(BaseModel):
@@ -34,18 +35,34 @@ class PresenceResponse(BaseModel):
     installed: bool
 
 
+class InstallResponse(BaseModel):
+    installed: bool
+    message: str
+
+
 @router.get("/presence", response_model=PresenceResponse)
 async def get_presence(
-    current_user: dict = Depends(get_current_user),
+    smb_manager: SmbManager = Depends(get_smb_manager),
 ):
     """Return whether Samba (smbd) is installed on this server."""
     return {"installed": smb_manager.is_server_present()}
 
 
+@router.post("/install", response_model=InstallResponse)
+async def install_server(
+    smb_manager: SmbManager = Depends(get_smb_manager),
+):
+    """Install Samba (smbd) on this server via apt."""
+    try:
+        return await smb_manager.install_server()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/", response_model=List[SmbShareResponse])
 async def list_shares(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    smb_manager: SmbManager = Depends(get_smb_manager),
 ):
     """List every dataset with a NAZMan-managed SMB share."""
     return smb_manager.list_shares(db)
@@ -55,7 +72,7 @@ async def list_shares(
 async def create_share(
     share: SmbShareCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    smb_manager: SmbManager = Depends(get_smb_manager),
 ):
     """Create/update a dataset's SMB share."""
     try:
@@ -74,7 +91,7 @@ async def update_share(
     dataset_name: str,
     update: SmbShareUpdate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    smb_manager: SmbManager = Depends(get_smb_manager),
 ):
     """Update a dataset's SMB share (read-only toggle, enable/disable)."""
     existing = None
@@ -100,7 +117,7 @@ async def update_share(
 async def delete_share(
     dataset_name: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    smb_manager: SmbManager = Depends(get_smb_manager),
 ):
     """Remove a dataset's SMB share."""
     try:

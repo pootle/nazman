@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} - NAZMan{% endblock %}
+{% block page_title %}User Guide{% endblock %}
+{% block head_extra %}<link rel="stylesheet" href="/static/css/guide.css?v=1">{% endblock %}
+
+{% block content %}
+<div class="guide-page">
+    <nav class="guide-nav">
+        <span class="guide-nav-title">User Guide</span>
+        {% for p in guide_pages %}
+        <a href="/guide/{{ p.slug }}" class="guide-nav-link {% if p.slug == active %}active{% endif %}">{{ p.title }}</a>
+        {% endfor %}
+    </nav>
+    <article class="guide-content">
+        {{ content|safe }}
+    </article>
+    <footer class="guide-footer">
+        {% if prev %}<a class="btn btn-secondary" href="/guide/{{ prev.slug }}">&larr; {{ prev.title }}</a>{% endif %}
+        {% if next %}<a class="btn btn-secondary" href="/guide/{{ next.slug }}">{{ next.title }} &rarr;</a>{% endif %}
+    </footer>
+</div>
+{% endblock %}

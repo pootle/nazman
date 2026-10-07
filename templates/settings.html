@@ -17,109 +17,33 @@
         </div>
     </div>
 
-    <!-- Scheduled Tasks -->
+    <!-- Alerts / Telegram -->
     <div class="card">
         <div class="card-header">
-            <h2><i class="fas fa-clock"></i> Scheduled Tasks</h2>
-            <button class="btn btn-primary" onclick="showCreateTaskModal()">
-                <i class="fas fa-plus"></i> Create Task
-            </button>
+            <h2><i class="fas fa-bell"></i> Telegram Alerts</h2>
         </div>
         <div class="card-body">
-            <div id="scheduled-tasks" class="tasks-table">
-                <p class="loading">Loading scheduled tasks...</p>
+            <p class="help-text">
+                Send failure alerts (unhealthy pools, scrub/resilver errors, high
+                usage, failed scheduled tasks, and backup sessions that need a disk
+                or failed) to your phone via a Telegram bot.
+                See the <a href="/guide/alerts">guide</a> to create a bot.
+            </p>
+            <div id="alerts-config" class="form-section">
+                <p class="loading">Loading alert configuration...</p>
             </div>
+            <div id="alert-history" class="alert-history"></div>
         </div>
-    </div>
-
-    <!-- Application Settings -->
-    <div class="card">
-        <div class="card-header">
-            <h2><i class="fas fa-cog"></i> Application Settings</h2>
-        </div>
-        <div class="card-body">
-            <form id="settings-form">
-                <div class="form-group">
-                    <label for="setting-auth">Authentication:</label>
-                    <select id="setting-auth">
-                        <option value="enabled">Enabled</option>
-                        <option value="disabled">Disabled</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="setting-backup">Auto Backup:</label>
-                    <select id="setting-backup">
-                        <option value="enabled">Enabled</option>
-                        <option value="disabled">Disabled</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="setting-refresh">Refresh Interval (seconds):</label>
-                    <input type="number" id="setting-refresh" value="5" min="1" max="60">
-                </div>
-                <button type="submit" class="btn btn-primary">
-                    <i class="fas fa-save"></i> Save Settings
-                </button>
-            </form>
-        </div>
-    </div>
-</div>
-
-<!-- Create Task Modal -->
-<div id="create-task-modal" class="modal" style="display: none;">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h3>Create Scheduled Task</h3>
-            <button class="close" onclick="hideCreateTaskModal()">&times;</button>
-        </div>
-        <form id="create-task-form">
-            <div class="form-group">
-                <label for="task-name">Task Name:</label>
-                <input type="text" id="task-name" required placeholder="e.g., weekly-scrub">
-            </div>
-            <div class="form-group">
-                <label for="task-type">Task Type:</label>
-                <select id="task-type" required>
-                    <option value="scrub">Pool Scrub</option>
-                    <option value="snapshot">Snapshot</option>
-                    <option value="backup">Backup</option>
-                    <option value="health_check">Health Check</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label for="task-target">Target:</label>
-                <input type="text" id="task-target" required placeholder="e.g., tank or tank/data">
-            </div>
-            <div class="form-group">
-                <label for="task-schedule">Schedule (cron format):</label>
-                <input type="text" id="task-schedule" required placeholder="0 2 * * 0">
-                <small>Example: 0 2 * * 0 = Every Sunday at 2 AM</small>
-            </div>
-            <div class="modal-actions">
-                <button type="button" class="btn btn-secondary" onclick="hideCreateTaskModal()">Cancel</button>
-                <button type="submit" class="btn btn-primary">Create Task</button>
-            </div>
-        </form>
     </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-let scheduledTasks = [];
-
 document.addEventListener('DOMContentLoaded', function() {
-    loadSettingsPage();
-    document.getElementById('create-task-form').addEventListener('submit', handleCreateTask);
-    document.getElementById('settings-form').addEventListener('submit', handleSaveSettings);
+    loadSystemInfo();
+    loadAlertsConfig();
 });
-
-async function loadSettingsPage() {
-    await Promise.all([
-        loadSystemInfo(),
-        loadScheduledTasks()
-    ]);
-}
 
 async function loadSystemInfo() {
     try {
@@ -131,15 +55,6 @@ async function loadSystemInfo() {
     }
 }
 
-async function loadScheduledTasks() {
-    // For now, use mock data since scheduler API isn't implemented
-    scheduledTasks = [
-        { id: 1, name: 'weekly-scrub', task_type: 'scrub', target: 'tank', schedule: '0 2 * * 0', enabled: true },
-        { id: 2, name: 'daily-snapshot', task_type: 'snapshot', target: 'tank/data', schedule: '0 0 * * *', enabled: true }
-    ];
-    renderScheduledTasks();
-}
-
 function renderSystemInfo(status) {
     const container = document.getElementById('system-info');
     
@@ -147,110 +62,162 @@ function renderSystemInfo(status) {
         <div class="info-grid">
             <div class="info-item">
                 <label>CPU Usage:</label>
-                <span>${status.system.cpu_percent}%</span>
+                <span>${escapeHtml(status.system.cpu_percent)}%</span>
             </div>
             <div class="info-item">
                 <label>Memory:</label>
-                <span>${status.system.memory.percent}% (${formatBytes(status.system.memory.available)} free)</span>
+                <span>${escapeHtml(status.system.memory.percent)}% (${formatBytes(status.system.memory.available)} free)</span>
             </div>
             <div class="info-item">
                 <label>OS Disk:</label>
-                <span>${status.system.disk.percent}% (${formatBytes(status.system.disk.free)} free)</span>
+                <span>${escapeHtml(status.system.disk.percent)}% (${formatBytes(status.system.disk.free)} free)</span>
             </div>
             <div class="info-item">
                 <label>ZFS Pools:</label>
-                <span>${status.storage.pool_count}</span>
+                <span>${escapeHtml(status.storage.pool_count)}</span>
             </div>
             <div class="info-item">
                 <label>Disks:</label>
-                <span>${status.storage.disk_count}</span>
+                <span>${escapeHtml(status.storage.disk_count)}</span>
             </div>
         </div>
     `;
 }
 
-function renderScheduledTasks() {
-    const container = document.getElementById('scheduled-tasks');
-    
-    if (scheduledTasks.length === 0) {
-        container.innerHTML = '<p class="empty-state">No scheduled tasks. <a href="javascript:void(0)" onclick="showCreateTaskModal()">Create one</a></p>';
-        return;
+async function loadAlertsConfig() {
+    try {
+        const config = await api.getAlertsConfig();
+        renderAlertsConfig(config);
+        loadAlertHistory();
+    } catch (error) {
+        console.error('Failed to load alert configuration:', error);
+        showError('alerts-config', 'Failed to load alert configuration');
     }
-    
+}
+
+function renderAlertsConfig(cfg) {
+    const container = document.getElementById('alerts-config');
     container.innerHTML = `
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Type</th>
-                    <th>Target</th>
-                    <th>Schedule</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${scheduledTasks.map(task => `
-                    <tr>
-                        <td>${task.name}</td>
-                        <td>${task.task_type}</td>
-                        <td>${task.target}</td>
-                        <td><code>${task.schedule}</code></td>
-                        <td><span class="status status-${task.enabled ? 'online' : 'faulted'}">${task.enabled ? 'Enabled' : 'Disabled'}</span></td>
-                        <td>
-                            <button class="btn btn-sm btn-secondary" onclick="toggleTask(${task.id}, ${!task.enabled})">
-                                <i class="fas fa-${task.enabled ? 'pause' : 'play'}"></i>
-                            </button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteTask(${task.id})">
-                                <i class="fas fa-trash"></i>
-                            </button>
-                        </td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
+        <div class="settings-form">
+            <input type="hidden" id="alerts-current-token" value="${escapeHtml(cfg.telegram_bot_token)}">
+            <label class="toggle-row">
+                <input type="checkbox" id="alerts-enabled" ${cfg.enabled ? 'checked' : ''}>
+                <span>Enable alerts</span>
+            </label>
+            <div class="form-group">
+                <label for="alerts-token">Bot token</label>
+                <input type="password" id="alerts-token" value="${escapeHtml(cfg.telegram_bot_token)}"
+                       placeholder="123456789:AA...">
+            </div>
+            <div class="form-group">
+                <label for="alerts-chat">Chat id</label>
+                <input type="text" id="alerts-chat" value="${escapeHtml(cfg.telegram_chat_id)}"
+                       placeholder="123456789">
+                <p class="help-text">Your personal chat id; see the guide for how to find it.</p>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="alerts-threshold">Usage alert threshold (%)</label>
+                    <input type="number" id="alerts-threshold" min="1" max="100"
+                           value="${escapeHtml(cfg.pool_usage_threshold)}">
+                </div>
+                <div class="form-group">
+                    <label for="alerts-cooldown">Cooldown (minutes)</label>
+                    <input type="number" id="alerts-cooldown" min="0"
+                           value="${escapeHtml(cfg.cooldown_minutes)}">
+                </div>
+            </div>
+            <div class="form-actions">
+                <button type="button" id="alerts-save" class="btn btn-primary" onclick="saveAlertsConfig()">
+                    <i class="fas fa-save"></i> Save
+                </button>
+                <button type="button" id="alerts-test" class="btn" onclick="sendTestAlert()">
+                    <i class="fas fa-paper-plane"></i> Send test
+                </button>
+            </div>
+            <p id="alerts-message" class="form-status"></p>
+        </div>
     `;
 }
 
-function showCreateTaskModal() {
-    document.getElementById('create-task-modal').style.display = 'flex';
+function showAlertStatus(text, isError) {
+    const el = document.getElementById('alerts-message');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'form-status' + (isError ? ' error' : ' success');
 }
 
-function hideCreateTaskModal() {
-    document.getElementById('create-task-modal').style.display = 'none';
-}
+async function saveAlertsConfig() {
+    const saveBtn = document.getElementById('alerts-save');
+    const enabled = document.getElementById('alerts-enabled').checked;
+    const currentMask = document.getElementById('alerts-current-token').value;
+    let token = document.getElementById('alerts-token').value.trim();
+    const chatId = document.getElementById('alerts-chat').value.trim();
+    const threshold = parseInt(document.getElementById('alerts-threshold').value, 10);
+    const cooldown = parseInt(document.getElementById('alerts-cooldown').value, 10);
 
-async function handleCreateTask(e) {
-    e.preventDefault();
-    
-    const name = document.getElementById('task-name').value;
-    const taskType = document.getElementById('task-type').value;
-    const target = document.getElementById('task-target').value;
-    const schedule = document.getElementById('task-schedule').value;
-    
-    // TODO: Call API to create task
-    showAlert('Task creation coming soon', 'success');
-    hideCreateTaskModal();
-}
+    if (token === currentMask) token = null;
 
-function toggleTask(id, enabled) {
-    // TODO: Call API to toggle task
-    showAlert('Task toggle coming soon', 'success');
-}
-
-function deleteTask(id) {
-    if (!confirm('Delete this scheduled task?')) {
-        return;
+    saveBtn.disabled = true;
+    try {
+        const cfg = await api.updateAlertsConfig({
+            enabled,
+            telegram_bot_token: token,
+            telegram_chat_id: chatId,
+            pool_usage_threshold: threshold,
+            cooldown_minutes: cooldown,
+        });
+        showAlertStatus('Alert configuration saved.', false);
+        renderAlertsConfig(cfg);
+        loadAlertHistory();
+    } catch (error) {
+        showAlertStatus(error.message, true);
+    } finally {
+        saveBtn.disabled = false;
     }
-    // TODO: Call API to delete task
-    showAlert('Task deletion coming soon', 'success');
 }
 
-async function handleSaveSettings(e) {
-    e.preventDefault();
-    
-    // TODO: Save settings
-    showAlert('Settings saved (coming soon)', 'success');
+async function sendTestAlert() {
+    const testBtn = document.getElementById('alerts-test');
+    testBtn.disabled = true;
+    try {
+        await api.sendTestAlert();
+        showAlertStatus('Test message sent - check your phone.', false);
+    } catch (error) {
+        showAlertStatus('Test failed: ' + error.message, true);
+    } finally {
+        testBtn.disabled = false;
+    }
+}
+
+async function loadAlertHistory() {
+    const history = document.getElementById('alert-history');
+    try {
+        const entries = await api.getAlertHistory(20);
+        history.innerHTML = `
+            <h3><i class="fas fa-list"></i> Recent alerts</h3>
+            ${entries.length === 0
+                ? '<p class="help-text">No alerts sent yet.</p>'
+                : '<table class="data-table"><thead><tr><th>Time</th><th>Event</th><th>Message</th><th>Status</th></tr></thead><tbody>' +
+                  entries.map(e => `
+                    <tr>
+                        <td>${e.created_at ? escapeHtml(formatDate(e.created_at)) : '&mdash;'}</td>
+                        <td>${escapeHtml(e.event_key)}</td>
+                        <td>${escapeHtml(e.message)}</td>
+                        <td class="${e.delivered ? 'status-ok' : 'status-fail'}">
+                            ${e.delivered ? 'Delivered' : 'Failed' + (e.error ? ': ' + escapeHtml(e.error) : '')}
+                        </td>
+                    </tr>`).join('') +
+                  '</tbody></table>'}
+        `;
+    } catch (error) {
+        console.error('Failed to load alert history:', error);
+    }
+}
+
+function showError(elementId, message) {
+    const container = document.getElementById(elementId);
+    container.innerHTML = `<p class="error"><i class="fas fa-exclamation-circle"></i> ${escapeHtml(message)}</p>`;
 }
 </script>
 {% endblock %}

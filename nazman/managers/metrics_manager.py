@@ -20,16 +20,26 @@ from typing import Any, Callable, DefaultDict, Deque, Dict, List, Optional
 import psutil
 
 from ..config import get_settings
+from ..utils import zfs_query
+from .metrics_store import SYSTEM_POOL
 
 Sample = Dict[str, Any]  # {"ts": float, "value": float}
 
 
 class MetricsManager:
-    def __init__(self) -> None:
+    """In-memory metric recorder.
+
+    Collaborators are injected at wiring time: ``zfs`` (ZfsManager) resolves
+    pool->disk maps, ``store`` (MetricsStore) persists samples.
+    """
+
+    def __init__(self, zfs=None, store=None) -> None:
         self._buffers: DefaultDict[str, Deque[Sample]] = defaultdict(lambda: deque())
         self._collectors: Dict[str, Callable] = {}
         self._task: Optional[asyncio.Task] = None
         self._started = False
+        self._zfs = zfs
+        self._store = store
         self._default_size = get_settings().monitoring_history_size
         self._interval = get_settings().monitoring_refresh_interval
         # Latest captured values, used to persist samples to the metrics store.
@@ -99,14 +109,10 @@ class MetricsManager:
         For every pool with logging enabled, that pool's disk busy% values are
         stored under the pool name.
         """
-        try:
-            from .metrics_store import metrics_store, SYSTEM_POOL
-        except Exception:
+        if not self._store or not self._latest:
             return
 
-        if not self._latest:
-            return
-
+        metrics_store = self._store
         ts = int(time.time())
         try:
             enabled = [p for p in metrics_store.list_enabled_pools() if p != "*"]
@@ -147,34 +153,28 @@ class MetricsManager:
         return self._pool_disks_map.get(pool_name, [])
 
     async def _refresh_pool_disks(self) -> None:
-        from .zfs_manager import zfs_manager
-
-        series_names = get_disk_series_names()
+        series_names = self.disk_series_names()
         new_map: Dict[str, List[str]] = {}
-        try:
-            from .metrics_store import metrics_store
-
-            pool_names = metrics_store.list_enabled_pools()
-        except Exception:
-            pool_names = []
+        pool_names = self._store.list_enabled_pools() if self._store else []
 
         for pool in pool_names:
             if pool == "*":
                 continue
+            if self._zfs is None:
+                continue
             try:
-                status = await zfs_manager.get_pool_status(pool)
+                status = await self._zfs.get_pool_status(pool)
             except Exception:
                 continue
-            bases: List[str] = []
-            for group in ("data_vdevs", "special_vdevs", "log_vdevs", "cache_vdevs"):
-                for vdev in status.get(group, []):
-                    for child in vdev.get("children", []):
-                        leaf = child.get("name") or child.get("path") or ""
-                        base = normalize_base_name(leaf)
-                        if base in series_names and base not in bases:
-                            bases.append(base)
-            new_map[pool] = bases
+            new_map[pool] = zfs_query.pool_vdev_bases(status, list(series_names))
         self._pool_disks_map = new_map
+
+    def disk_series_names(self) -> Dict[str, str]:
+        """Mapping of base block device name -> metrics series name."""
+        collector = self._collectors.get("disk")
+        if isinstance(collector, _DiskCollector):
+            return collector.series_names()
+        return {}
 
     # ── Sampling ────────────────────────────────────────────────────────
 
@@ -360,59 +360,6 @@ def _scan_disk_devices() -> List[str]:
     return names
 
 
-def normalize_base_name(leaf: str) -> str:
-    """Map a ZFS leaf device name to a base block device name.
-
-    Handles kernel names (``sda1`` -> ``sda``, ``nvme0n1p1`` -> ``nvme0n1``),
-    ``/dev/...`` prefixes and ``/dev/disk/by-id/...`` symlinks, and bare by-id
-    alias strings (e.g. ``ata-WDC_...-part1``).
-    """
-    import os
-    name = leaf.strip()
-    if not name:
-        return leaf
-    # by-id kernel symlink target wrapping
-    if name.startswith("."):
-        name = name[1:]
-    leaf_bare = name.rsplit("/", 1)[-1]
-    # Try absolute leaf path directly
-    try:
-        if os.path.isabs(name) and os.path.exists(name):
-            return _strip_partition(os.path.realpath(name).rsplit("/", 1)[-1])
-    except Exception:
-        pass
-    # Try /dev/<leaf> (handles bare kernel names and bare by-id aliases)
-    for dev_dir in ("/dev", "/dev/disk/by-id"):
-        try:
-            p = f"{dev_dir}/{leaf_bare}"
-            if os.path.exists(p):
-                return _strip_partition(os.path.realpath(p).rsplit("/", 1)[-1])
-        except Exception:
-            pass
-    return _strip_partition(leaf_bare)
-
-
-def _strip_partition(name: str) -> str:
-    """Strip a partition suffix from a kernel device name."""
-    # nvme0n1p2 -> nvme0n1 ; mmcblk0p1 -> mmcblk0
-    import re
-    m = re.match(r"^(nvme\d+n\d+)p\d+$", name)
-    if m:
-        return m.group(1)
-    m = re.match(r"^(mmcblk\d+)p\d+$", name)
-    if m:
-        return m.group(1)
-    # sda1, vda1, sdb2 ...
-    m = re.match(r"^(sd[a-z]+)\d+$", name)
-    if m:
-        return m.group(1)
-    # hdX / vdX partitions
-    m = re.match(r"^([shv]d[a-z]+)\d+$", name)
-    if m:
-        return m.group(1)
-    return name
-
-
 def _read_io_ticks(base: str) -> Optional[int]:
     """Read /sys/block/<base>/stat field 9 (io_ticks = ms busy)."""
     try:
@@ -494,27 +441,12 @@ def _collect_memory() -> float:
     return psutil.virtual_memory().percent
 
 
-# Singleton instance
-metrics_manager = MetricsManager()
-
-# Register default metrics
-metrics_manager.register("cpu", _collect_cpu)
-metrics_manager.register("memory", _collect_memory)
-metrics_manager.register("net", _NetworkCollector())
-metrics_manager.register("disk", _DiskCollector())
-
-
-def get_disk_series_names() -> Dict[str, str]:
-    """Return a mapping of base block device name -> metrics series name."""
-    collector = metrics_manager._collectors.get("disk")
-    if isinstance(collector, _DiskCollector):
-        return collector.series_names()
-    return {}
-
-
-def get_net_metric_name() -> str:
-    """Return the metrics series name for the network metric."""
-    return "net"
+def register_default_collectors(manager: MetricsManager) -> None:
+    """Attach the built-in cpu/memory/net/disk collectors (called at wiring)."""
+    manager.register("cpu", _collect_cpu)
+    manager.register("memory", _collect_memory)
+    manager.register("net", _NetworkCollector())
+    manager.register("disk", _DiskCollector())
 
 
 def get_selected_network_interface() -> Optional[str]:

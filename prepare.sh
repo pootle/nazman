@@ -80,9 +80,8 @@ if [[ "$IS_RPI" -eq 1 ]]; then
     fi
 fi
 
-echo "Updating package lists and upgrading installed packages..."
+echo "Updating package lists..."
 apt-get update -y
-apt-get upgrade -y
 
 # On Debian-family (Raspberry Pi OS), ZFS requires DKMS source plus the kernel
 # headers to build the module locally. Install them explicitly before the
@@ -105,6 +104,8 @@ apt-get install -y \
     parted \
     gdisk \
     smartmontools \
+    nvme-cli \
+    sqlite3 \
     git \
     curl \
     wget \
@@ -117,6 +118,35 @@ apt-get install -y \
 #   e2fsprogs provides mkfs.ext4
 #   coreutils provides chown/chmod
 apt-get install -y util-linux e2fsprogs coreutils
+
+# ── NFSv4 availability check ───────────────────────────────────────────
+# NAZMan's NFS sharing uses ZFS sharenfs, which relies on the kernel NFS
+# server.  Ensure the nfsd module is loaded and the proc filesystem is
+# accessible so that NFSv4 is available to clients.
+echo "Checking NFSv4 support..."
+if ! lsmod | grep -q nfsd; then
+    modprobe nfsd 2>/dev/null || true
+fi
+if [[ -d /proc/fs/nfsd ]]; then
+    echo "NFSv4 support is available (/proc/fs/nfsd present)."
+else
+    echo ""
+    echo "==============================================="
+    echo "WARNING: NFSv4 support is NOT available." >&2
+    echo "" >&2
+    echo "The /proc/fs/nfsd directory is missing, which means the nfsd" >&2
+    echo "kernel module is not loaded.  This can happen on minimal installs" >&2
+    echo "or if the kernel was updated without rebooting." >&2
+    echo "" >&2
+    echo "To fix:" >&2
+    echo "  sudo modprobe nfsd" >&2
+    echo "  sudo systemctl restart nfs-kernel-server" >&2
+    echo "" >&2
+    echo "If modprobe fails, ensure nfs-kernel-server is installed and" >&2
+    echo "reboot into the running kernel." >&2
+    echo "===============================================" >&2
+    echo ""
+fi
 
 # Post-install ZFS sanity check (DKMS builds the module; newly-shipped Pi
 # kernels can break the build). If the module isn't functional, report the
@@ -143,6 +173,59 @@ if [[ "$IS_RPI" -eq 1 ]]; then
         echo "===============================================" >&2
     fi
 fi
+
+# ── ZFS version gate ───────────────────────────────────────────────────────
+# NAZMan's pool details read sector size per vdev via `zpool get ... all-vdevs`
+# (a per-vdev property form), which requires OpenZFS 2.2 or newer.  Abort the
+# install on older ZFS rather than shipping a build that cannot show vdev info.
+REQUIRED_ZFS_MAJOR=2
+REQUIRED_ZFS_MINOR=2
+
+zfs_version_ok() {
+    local v="$1" major minor rest
+    v="${v#zfs-}"
+    major="${v%%.*}"
+    rest="${v#*.}"
+    minor="${rest%%.*}"
+    if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$minor" =~ ^[0-9]+$ ]]; then
+        [[ "$major" -gt "$REQUIRED_ZFS_MAJOR" ]] && return 0
+        [[ "$major" -eq "$REQUIRED_ZFS_MAJOR" && "$minor" -ge "$REQUIRED_ZFS_MINOR" ]] && return 0
+    fi
+    return 1
+}
+
+if ! command -v zpool &>/dev/null; then
+    echo "ERROR: ZFS is not installed (zpool not found). NAZMan requires ZFS ${REQUIRED_ZFS_MAJOR}.${REQUIRED_ZFS_MINOR} or newer."
+    exit 1
+fi
+
+ZPOOL_VERSION="$(zpool version 2>/dev/null | awk '/^zfs-/ {print $1; exit}')"
+if [[ -z "$ZPOOL_VERSION" ]] || ! zfs_version_ok "$ZPOOL_VERSION"; then
+    echo ""
+    echo "==============================================="
+    echo "ERROR: NAZMan requires OpenZFS ${REQUIRED_ZFS_MAJOR}.${REQUIRED_ZFS_MINOR} or newer." >&2
+    echo "This system provides: ${ZPOOL_VERSION:-unknown}" >&2
+    echo "" >&2
+    echo "The pool details view reads each vdev's sector size via" >&2
+    echo "'zpool get ... all-vdevs', which only exists in OpenZFS 2.2+." >&2
+    echo "" >&2
+    if [[ "$IS_RPI" -eq 1 ]]; then
+        echo "Raspberry Pi OS: install newer ZFS from trixie-backports:" >&2
+        echo "  sudo apt install -t trixie-backports zfs-dkms zfsutils-linux zfs-zed" >&2
+        echo "  sudo dkms status" >&2
+        echo "  sudo dkms build zfs/<version> -k \$(uname -r)" >&2
+        echo "  sudo modprobe zfs && zpool version" >&2
+    else
+        echo "Upgrade to a release with ZFS 2.2+ (e.g. Ubuntu 24.04 LTS or" >&2
+        echo "newer), or install a newer ZFS build, then re-run this script." >&2
+    fi
+    echo "" >&2
+    echo "Install aborted." >&2
+    echo "===============================================" >&2
+    exit 1
+fi
+
+echo "ZFS ${ZPOOL_VERSION} OK (requires >= ${REQUIRED_ZFS_MAJOR}.${REQUIRED_ZFS_MINOR})."
 
 echo ""
 echo "prepare.sh complete. Run: sudo ./build.sh"

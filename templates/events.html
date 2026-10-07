@@ -112,7 +112,7 @@ async function loadCommandLog() {
             return;
         }
         tbody.innerHTML = entries.map(function (e) {
-            const ts = e.ts ? new Date(e.ts).toLocaleString() : '';
+            const ts = e.ts ? formatDate(e.ts) : '';
             return `<tr>
                 <td class="mono">${escapeHtml(ts)}</td>
                 <td>${opBadge(e.op)}</td>

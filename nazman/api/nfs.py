@@ -5,9 +5,10 @@ from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import nfs_manager
+from ..managers.nfs_manager import NfsManager
+from ..wiring import get_nfs_manager
 
-router = APIRouter(prefix="/api/nfs", tags=["nfs"])
+router = APIRouter(prefix="/api/nfs", tags=["nfs"], dependencies=[Depends(get_current_user)])
 
 
 class NfsShareCreate(BaseModel):
@@ -28,6 +29,7 @@ class NfsShareResponse(BaseModel):
     export_path: str
     sharenfs: str
     enabled: bool
+    paused: bool = False
 
 
 class ActiveExportResponse(BaseModel):
@@ -39,7 +41,7 @@ class ActiveExportResponse(BaseModel):
 @router.get("/", response_model=List[NfsShareResponse])
 async def list_exports(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """List every dataset and its live ZFS sharenfs value."""
     return await nfs_manager.list_exports(db)
@@ -47,7 +49,7 @@ async def list_exports(
 
 @router.get("/active", response_model=List[ActiveExportResponse])
 async def list_active_exports(
-    current_user: dict = Depends(get_current_user),
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """List currently active NFS exports from the kernel export table."""
     return await nfs_manager.get_active_exports()
@@ -57,7 +59,7 @@ async def list_active_exports(
 async def create_export(
     share: NfsShareCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Create/update a dataset's NFS share via sharenfs."""
     try:
@@ -76,7 +78,7 @@ async def update_export(
     dataset_name: str,
     update: NfsShareUpdate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Update a dataset's NFS share (options, client, enable/disable)."""
     try:
@@ -96,19 +98,35 @@ async def update_export(
 async def delete_export(
     dataset_name: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
-    """Disable (unshare) a dataset's NFS share."""
+    """Permanently remove a dataset's NFS share (sharenfs -> off)."""
     try:
         await nfs_manager.delete_export(db, dataset_name)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"message": "Export disabled"}
+    return {"message": "Export removed"}
 
 
 @router.get("/presence")
 async def get_presence(
-    current_user: dict = Depends(get_current_user),
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
 ):
     """Return whether the NFS kernel server (exportfs) is installed."""
     return {"installed": nfs_manager.is_server_present()}
+
+
+class InstallResponse(BaseModel):
+    installed: bool
+    message: str
+
+
+@router.post("/install", response_model=InstallResponse)
+async def install_server(
+    nfs_manager: NfsManager = Depends(get_nfs_manager),
+):
+    """Install the NFS kernel server (nfs-kernel-server) on this server via apt."""
+    try:
+        return await nfs_manager.install_server()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

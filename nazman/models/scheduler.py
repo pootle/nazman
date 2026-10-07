@@ -11,7 +11,6 @@ def _utcnow() -> datetime:
 class TaskType(str, enum.Enum):
     SCRUB = "scrub"
     SNAPSHOT = "snapshot"
-    BACKUP = "backup"
     ZFS_BACKUP = "zfs_backup"
     HEALTH_CHECK = "health_check"
 

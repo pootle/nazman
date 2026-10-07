@@ -260,6 +260,3 @@ class MetricsStore:
         except OSError:
             return 0
 
-
-# Singleton instance
-metrics_store = MetricsStore()

@@ -14,13 +14,9 @@ class Settings(BaseSettings):
     database_path: str = "/var/lib/nazman/nazman.db"
     
     # Backup
-    backup_enabled: bool = True
-    backup_repo_path: str = "/mnt/backup/nazman-config"
-    backup_auto_commit: bool = True
-    backup_push_on_commit: bool = True
     backup_mount_base: str = "/mnt/backup"  # parent dir under which backup disks are mounted
-    backup_gzip_level: int = 6
     backup_full_margin: float = 1.2  # capacity safety margin multiplier for full backups
+    backup_config_retention: int = 5  # config bundles kept per backup volume
     
     # Auth
     auth_enabled: bool = True
@@ -31,6 +27,14 @@ class Settings(BaseSettings):
     monitoring_history_size: int = 12
     monitoring_enable_websocket: bool = True
     network_interface: str = ""
+
+    # Alerting (Telegram)
+    alerts_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    alert_pool_usage_threshold: int = 90
+    alert_cooldown_minutes: int = 60
+    alerts_poll_interval: int = 60
 
     # Metrics logging (per-pool disk + system metrics to disk)
     metrics_log_enabled: bool = False
@@ -127,6 +131,17 @@ def set_setting(key: str, value: Any) -> bool:
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Create the conf 0600 before writing: it holds the admin password
+        # hash and Telegram tokens, and Path.write_text would otherwise create
+        # it 0644. An existing file keeps the mode it already has, so a live
+        # install's permissions are never changed out from under it.
+        if not path.exists():
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                pass  # created concurrently; it owns its own mode
+            else:
+                os.close(fd)
         path.write_text("\n".join(out) + "\n", encoding="utf-8")
         updated = True
     except OSError:
@@ -154,10 +169,5 @@ def ensure_directories():
         # Metrics log directory
         metrics_dir = Path(settings.metrics_log_path).parent
         metrics_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Backup directory
-        if settings.backup_enabled:
-            backup_dir = Path(settings.backup_repo_path)
-            backup_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         pass

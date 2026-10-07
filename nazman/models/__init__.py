@@ -1,13 +1,17 @@
 from .pool import Pool
 from .disk import Disk
-from .backup import BackupCommit
 from .scheduler import ScheduledTask, TaskHistory
-from .backup_zfs import BackupDisk, BackupSchedule, BackupRun
+from .backup_zfs import (
+    BackupGroup, BackupGroupDataset, BackupSet, BackupSession,
+    BackupDisk, BackupRun,
+)
+from .alert import AlertLog
 
 __all__ = [
     "Pool",
     "Disk",
-    "BackupCommit",
     "ScheduledTask", "TaskHistory",
-    "BackupDisk", "BackupSchedule", "BackupRun"
+    "BackupGroup", "BackupGroupDataset", "BackupSet", "BackupSession",
+    "BackupDisk", "BackupRun",
+    "AlertLog",
 ]

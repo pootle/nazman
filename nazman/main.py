@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -5,72 +7,89 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pathlib import Path
 
 from .config import get_settings, ensure_directories
-from .database import init_db
-from .utils.exceptions import NAZManError
+from .database import get_db_context, init_db
+from .utils.exceptions import NAZManError, NotFoundError
+from .utils.guide import guide_page_context
+from .wiring import get_container
 from .api import (
     disks_router, pools_router, datasets_router,
-    nfs_router, smb_router, snapshots_router, backup_router, zfs_backup_router,
-    system_router, metrics_router, auth_router,
+    backup_groups_router, nfs_router, smb_router, snapshots_router,
+    backup_router, zfs_backup_router,
+    system_restore_router,
+    system_router, health_router, metrics_router, auth_router, alerts_router,
 )
 
 # Get application settings
 settings = get_settings()
 
-# Create FastAPI app
-app = FastAPI(
-    title=settings.app_title,
-    version=settings.app_version,
-    description="Web-based ZFS NAS management for Ubuntu Server"
-)
 
-# Ensure required directories exist
-ensure_directories()
-
-
-@app.exception_handler(NAZManError)
-async def nazman_error_handler(request: Request, exc: NAZManError):
-    """Convert domain errors into a 400 with a meaningful detail message."""
-    return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-# Initialize database
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
 
-    # Start scheduler
-    from .managers import scheduler_manager
-    await scheduler_manager.start()
-
-    # Start metrics recorder
-    from .managers import metrics_manager
-    await metrics_manager.start()
+    container = get_container()
 
     # Initialise the persistent metrics store and load per-pool logging flags.
-    from .managers.metrics_store import metrics_store
-    metrics_store.connect()
+    container.metrics_store.connect()
+
+    # Fail sessions/runs a previous process left 'running' (crash/reboot) and
+    # destroy their orphaned snapshots before the scheduler can start new work.
+    with get_db_context() as db:
+        await container.backup_groups.recover_orphaned_backups(db)
+
+    # Start the scheduler (loads persisted tasks) and the metrics recorder.
+    await container.scheduler.start()
+    # Reconcile backup group crons into scheduler jobs, so a group configured
+    # in the UI survives a restart (and a job whose group is gone is removed).
+    with get_db_context() as db:
+        await container.backup_groups.sync_scheduled_tasks(db)
+    await container.metrics.start()
+
+    # Start the alert poller (no-op while alerting is disabled).
+    await container.alerts.start()
 
     # Initialise + prune the persistent command log store.
     from .utils.command_log_store import command_log_store
     command_log_store.connect()
     command_log_store.prune()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    from .managers import scheduler_manager
-    await scheduler_manager.stop()
+    yield
 
-    from .managers import metrics_manager
-    await metrics_manager.stop()
-
-    from .managers.metrics_store import metrics_store
-    metrics_store.close()
+    await container.scheduler.stop()
+    await container.metrics.stop()
+    await container.alerts.stop()
+    container.metrics_store.close()
 
     from .utils.command_log_store import command_log_store
     command_log_store.close()
 
     # Ephemeral kernel-name knowledge does not survive restarts.
-    from .managers.disk_manager import clear_device_map
+    from .utils.devices import clear_device_map
     clear_device_map()
+
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.app_title,
+    version=settings.app_version,
+    description="Web-based ZFS NAS management for Ubuntu Server",
+    lifespan=lifespan,
+)
+
+# Ensure required directories exist
+ensure_directories()
+
+
+@app.exception_handler(NotFoundError)
+async def not_found_error_handler(request: Request, exc: NotFoundError):
+    """Domain 'entity does not exist' errors map to 404."""
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(NAZManError)
+async def nazman_error_handler(request: Request, exc: NAZManError):
+    """Convert domain errors into a 400 with a meaningful detail message."""
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 # Mount static files
 static_path = Path(__file__).parent.parent / "static"
@@ -82,6 +101,7 @@ templates = Jinja2Templates(directory=str(templates_path))
 
 # Include API routers
 app.include_router(system_router)
+app.include_router(health_router)
 app.include_router(disks_router)
 app.include_router(pools_router)
 app.include_router(datasets_router)
@@ -89,9 +109,12 @@ app.include_router(nfs_router)
 app.include_router(smb_router)
 app.include_router(snapshots_router)
 app.include_router(backup_router)
+app.include_router(backup_groups_router)
 app.include_router(zfs_backup_router)
+app.include_router(system_restore_router)
 app.include_router(metrics_router)
 app.include_router(auth_router)
+app.include_router(alerts_router)
 
 
 # Web UI routes
@@ -149,6 +172,12 @@ async def backup_page(request: Request):
     return templates.TemplateResponse(request, "backup.html")
 
 
+@app.get("/restore", response_class=HTMLResponse)
+async def restore_page(request: Request):
+    """Restore / system rebuild page."""
+    return templates.TemplateResponse(request, "restore.html")
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     """Settings page."""
@@ -165,3 +194,14 @@ async def events_page(request: Request):
 async def monitoring_page(request: Request):
     """Performance monitoring page."""
     return templates.TemplateResponse(request, "monitoring.html")
+
+
+@app.get("/guide", response_class=HTMLResponse)
+@app.get("/guide/{page}", response_class=HTMLResponse)
+async def guide_page(request: Request, page: str = "overview"):
+    """User guide pages rendered from the docs/ markdown sources."""
+    ctx = guide_page_context(page)
+    if ctx is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Guide page not found")
+    return templates.TemplateResponse(request, "guide.html", ctx)

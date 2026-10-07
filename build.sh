@@ -89,6 +89,34 @@ if [[ "$install_nfs" == "y" ]]; then
     apt-get install -y nfs-kernel-server
     systemctl enable nfs-kernel-server
     systemctl start nfs-kernel-server
+
+    # zfs-share.service runs `zfs share -a` before nfs-server.service; on slow
+    # boots the kernel export table is left empty (exportfs -r only re-reads
+    # /etc/exports). Re-register ZFS shares after every nfs-server start.
+    mkdir -p /etc/systemd/system/nfs-server.service.d
+    cat > /etc/systemd/system/nfs-server.service.d/zfs-share.conf << 'EOF'
+# Re-register ZFS sharenfs exports once the NFS server is up; a reboot may
+# otherwise leave the kernel export table empty.
+[Service]
+ExecStartPost=/usr/sbin/zfs share -a
+EOF
+    systemctl daemon-reload
+
+    # Verify NFSv4 support is available.
+    if ! lsmod | grep -q nfsd; then
+        modprobe nfsd 2>/dev/null || true
+    fi
+    if [[ -d /proc/fs/nfsd ]]; then
+        echo "NFSv4 support is available."
+    else
+        echo ""
+        echo "==============================================="
+        echo "WARNING: NFSv4 support is NOT available." >&2
+        echo "The nfsd kernel module is not loaded.  Try:" >&2
+        echo "  sudo modprobe nfsd && sudo systemctl restart nfs-kernel-server" >&2
+        echo "===============================================" >&2
+        echo ""
+    fi
 fi
 
 if [[ "$install_smb" == "y" ]]; then
@@ -126,6 +154,13 @@ fi
 "$DEST/venv/bin/pip" install -r "$DEST/requirements.txt"
 
 echo "5/7 Writing default configuration (/etc/nazman/nazman.conf)..."
+if [[ -f /etc/nazman/nazman.conf ]]; then
+    echo "  existing /etc/nazman/nazman.conf found; leaving it unchanged."
+else
+# Created 0600 before it is written: the conf holds the admin password hash
+# and Telegram tokens, and a freshly created file would otherwise be 0644
+# until the chmod below ran.
+install -m 600 /dev/null /etc/nazman/nazman.conf
 cat > /etc/nazman/nazman.conf << 'EOF'
 # NAZMan configuration (pydantic-settings, flat key = value format)
 
@@ -133,10 +168,7 @@ cat > /etc/nazman/nazman.conf << 'EOF'
 DATABASE_PATH = /var/lib/nazman/nazman.db
 
 # Backup
-BACKUP_ENABLED = true
-BACKUP_REPO_PATH = /mnt/backup/nazman-config
-BACKUP_AUTO_COMMIT = true
-BACKUP_PUSH_ON_COMMIT = true
+BACKUP_MOUNT_BASE = /mnt/backup
 
 # Auth
 AUTH_ENABLED = true
@@ -146,6 +178,14 @@ AUTH_PASSWORD_HASH =
 MONITORING_REFRESH_INTERVAL = 5
 MONITORING_ENABLE_WEBSOCKET = true
 
+# Alerting (Telegram)
+# ALERTS_ENABLED = false
+# TELEGRAM_BOT_TOKEN =
+# TELEGRAM_CHAT_ID =
+# ALERT_POOL_USAGE_THRESHOLD = 90
+# ALERT_COOLDOWN_MINUTES = 60
+# ALERTS_POLL_INTERVAL = 60
+
 # Logging
 LOGGING_LEVEL = INFO
 LOGGING_FILE = /var/log/nazman/nazman.log
@@ -154,6 +194,12 @@ LOGGING_FILE = /var/log/nazman/nazman.log
 APP_HOST = 0.0.0.0
 APP_PORT = 8080
 EOF
+fi
+# The conf holds the admin password hash and the state dir holds the DB and
+# JWT secret; neither should be world-readable.
+chmod 600 /etc/nazman/nazman.conf
+chmod 700 /var/lib/nazman
+[[ -f /etc/nazman/auth.secret ]] && chmod 600 /etc/nazman/auth.secret
 
 echo "6/7 Creating shared anonymous user/group (nfsanon, 65533) for NFS & SMB..."
 if ! getent group nfsanon &>/dev/null; then
@@ -175,11 +221,26 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/nazman
-ExecStart=/opt/nazman/venv/bin/uvicorn nazman.main:app --host 0.0.0.0 --port 8080
+EnvironmentFile=/etc/nazman/nazman.conf
+ExecStart=/opt/nazman/venv/bin/uvicorn nazman.main:app --host ${APP_HOST:-0.0.0.0} --port ${APP_PORT:-8080}
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+
+# Systemd hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/nazman /var/log/nazman /etc/nazman
+ReadOnlyPaths=/etc/zfs /etc/exports /etc/samba/smb.conf
 
 [Install]
 WantedBy=multi-user.target

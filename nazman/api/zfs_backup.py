@@ -1,47 +1,67 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
+import logging
 from datetime import datetime
 from pydantic import BaseModel
 
 from ..database import get_db
 from ..auth import get_current_user
-from ..managers import zfs_backup_manager
-from ..models.backup_zfs import BackupDisk, BackupRun, BackupSchedule
-from ..models.disk import Disk
+from ..managers.zfs_backup_manager import ZfsBackupManager
+from ..wiring import get_zfs_backup_manager
 
-router = APIRouter(prefix="/api/backup-zfs", tags=["backup-zfs"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/backup-zfs", tags=["backup-zfs"], dependencies=[Depends(get_current_user)])
 
 
 class BackupDiskResponse(BaseModel):
     id: int
     disk_id: int
-    device_path: str
+    slot_uuid: Optional[str] = None
+    partition_number: int = 1
+    device_path: Optional[str] = None  # derived from disks.by_id + partition_number
+    label: Optional[str] = None
     fs_type: str
     mount_point: str
     fs_uuid: str
-    total_bytes: int
-    free_bytes: int
-    status: str
+    total_bytes: int = 0  # live probe, never stored
+    free_bytes: int = 0  # live probe, never stored
+    status: str  # live probe, never stored
+    unmount_after_backup: bool
+    error: Optional[str] = None  # set while a declaration is reported failed
 
     model_config = {"from_attributes": True}
 
 
+class UpdateBackupDiskRequest(BaseModel):
+    unmount_after_backup: Optional[bool] = None
+
+
 class DeclareRequest(BaseModel):
     confirm: bool = False
+    slot_uuid: Optional[str] = None
+    label: Optional[str] = None
+    wipe_raid: bool = False
+    backup_set_id: Optional[int] = None
 
 
 class BackupRunResponse(BaseModel):
     id: int
+    session_id: Optional[int] = None
+    group_id: Optional[int] = None
+    backup_set_id: Optional[int] = None
     dataset_name: str
     backup_disk_id: Optional[int]
     backup_type: str
-    stream_file: str
-    snapshot: str
+    promoted_from: Optional[str] = None
+    stream_file: Optional[str] = None
+    snapshot: Optional[str] = None
     base_snapshot: Optional[str]
     full_anchor: Optional[str]
     size_bytes: int
     changed_bytes: int
+    phase: Optional[str] = None
     status: str
     error: Optional[str]
     started_at: Optional[datetime]
@@ -50,60 +70,81 @@ class BackupRunResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class RunRequest(BaseModel):
-    dataset_name: str
-    backup_disk_id: int
-    backup_type: str = "full"
+class RestoreFileRequest(BaseModel):
+    stream_file: str
+    target_dataset: str
+    force: bool = False
 
 
 class RestoreRunRequest(BaseModel):
-    run_id: int = None
-    stream_file: str = None
-    dataset_name: str
+    target_dataset: str
+    force: bool = False
 
 
 @router.get("/disks", response_model=List[BackupDiskResponse])
 async def list_backup_disks(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
     return await zfs_backup_manager.list_backup_disks(db)
 
 
-@router.get("/disks/candidates", response_model=List[dict])
-async def backup_disk_candidates(
+@router.get("/disks/used")
+async def list_used_disks(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
-    """Disks eligible to be declared as a backup target (present, non-OS, not already declared)."""
-    from ..managers.disk_manager import disk_manager as dm, get_device_name
-    disks = await dm.sync_disks_to_database(db)
-    declared = {d.disk_id for d in db.query(BackupDisk).all()}
-    out = []
-    for disk in disks:
-        if disk.is_os_disk or disk.id in declared:
-            continue
-        out.append({
-            "id": disk.id,
-            "model": disk.model,
-            "serial": disk.serial,
-            "size_bytes": disk.size_bytes,
-            "disk_type": disk.disk_type,
-            "device_name": get_device_name(disk),
-        })
-    return out
+    """(disk_id, slot_uuid) pairs unavailable as backup targets.
+
+    Includes already-declared backup disks plus every device currently held
+    by an imported pool (whole disks and partition members).  slot_uuid is
+    None when the whole disk is held.  Used by the UI to disable those
+    options in the backup-disk picker.
+    """
+    return await zfs_backup_manager.used_backup_targets(db)
 
 
-@router.post("/disks/{disk_id}/declare", response_model=BackupDiskResponse)
+@router.post("/disks/{disk_id}/declare", response_model=BackupDiskResponse, status_code=202)
 async def declare_backup_disk(
     disk_id: int,
     req: DeclareRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
+    """Kick off a backup-disk declaration.
+
+    The wipe+format runs in the background; this returns immediately with a
+    ``pending`` entry that flips to the real disk (success) or ``failed``.
+    ``backup_set_id`` files the new volume into a set straight away, so the
+    setup flow does not need a second step.
+    """
     try:
-        return await zfs_backup_manager.declare_backup_disk(db, disk_id, confirm=req.confirm)
+        return await zfs_backup_manager.start_declare_backup_disk(
+            db, disk_id, confirm=req.confirm,
+            slot_uuid=req.slot_uuid, label=req.label,
+            wipe_raid=req.wipe_raid, backup_set_id=req.backup_set_id,
+        )
     except Exception as e:
+        logger.error("declare_backup_disk failed for disk %s: %s", disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/disks/{disk_id}/raid-info")
+async def disk_raid_info(
+    disk_id: int,
+    slot_uuid: Optional[str] = None,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    """Software RAID metadata on the device before a destructive declare."""
+    try:
+        return await zfs_backup_manager.get_raid_info(db, disk_id, slot_uuid=slot_uuid)
+    except Exception as e:
+        logger.error("raid-info failed for disk %s: %s", disk_id, e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -111,205 +152,149 @@ async def declare_backup_disk(
 async def mount_backup_disk(
     backup_disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
-    return await zfs_backup_manager.mount_backup_disk(db, backup_disk_id)
+    try:
+        return await zfs_backup_manager.mount_backup_disk(db, backup_disk_id)
+    except Exception as e:
+        logger.error("mount backup disk %s failed: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/disks/{backup_disk_id}/unmount", response_model=BackupDiskResponse)
 async def unmount_backup_disk(
     backup_disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
-    return await zfs_backup_manager.unmount_backup_disk(db, backup_disk_id)
+    try:
+        return await zfs_backup_manager.unmount_backup_disk(db, backup_disk_id)
+    except Exception as e:
+        logger.error("unmount backup disk %s failed: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/disks/{backup_disk_id}/scan", response_model=BackupDiskResponse)
 async def scan_backup_disk(
     backup_disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
     return await zfs_backup_manager.scan_backup_disk(db, backup_disk_id)
+
+
+@router.post("/disks/{backup_disk_id}/wake", response_model=BackupDiskResponse)
+async def wake_backup_disk(
+    backup_disk_id: int,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    """Software wake/replug: force a missing backup disk's bridge to re-enumerate."""
+    try:
+        return await zfs_backup_manager.wake_backup_disk(db, backup_disk_id)
+    except Exception as e:
+        logger.error("wake backup disk %s failed: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/disks/{backup_disk_id}", response_model=BackupDiskResponse)
+async def update_backup_disk(
+    backup_disk_id: int,
+    req: UpdateBackupDiskRequest,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    return await zfs_backup_manager.update_backup_disk(
+        db, backup_disk_id, unmount_after_backup=req.unmount_after_backup
+    )
 
 
 @router.delete("/disks/{backup_disk_id}")
 async def deregister_backup_disk(
     backup_disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
+    """Undeclare a volume.  The media is left alone, so the manifest can still
+    be read for a new-server restore; runs and set membership are cleared so no
+    chain points at a disk NAZMan no longer knows about."""
     await zfs_backup_manager.deregister_backup_disk(db, backup_disk_id)
-    # Orphaned schedule-driven ScheduledTask jobs are removed by reconciliation.
-    await zfs_backup_manager.sync_scheduled_tasks(db)
     return {"message": "Backup disk deregistered"}
-
-
-@router.get("/datasets", response_model=List[dict])
-async def list_backupable_datasets(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """All datasets with their backup status and latest run info for the UI."""
-    # Enumerate datasets live from ZFS; there is no DB table of datasets.
-    from ..managers.nfs_manager import nfs_manager
-    dataset_names = await nfs_manager._list_dataset_names()
-    schedules = {s.dataset_name: s for s in db.query(BackupSchedule).all()}
-    out = []
-    for name in dataset_names:
-        sched = schedules.get(name)
-        last = (
-            db.query(BackupRun)
-            .filter(BackupRun.dataset_name == name)
-            .order_by(BackupRun.id.desc())
-            .first()
-        )
-        # Total data changed since the last full backup (sum of incremental
-        # streams after the most recent full) — informs when to run the next full.
-        changed_since_full = 0
-        runs_since_full = (
-            db.query(BackupRun)
-            .filter(
-                BackupRun.dataset_name == name,
-                BackupRun.status == "success",
-            )
-            .order_by(BackupRun.id.desc())
-            .all()
-        )
-        for r in runs_since_full:
-            if r.backup_type == "full":
-                break
-            changed_since_full += r.changed_bytes or 0
-        full_runs = (
-            db.query(BackupRun)
-            .filter(BackupRun.dataset_name == name, BackupRun.status == "success")
-            .count()
-        )
-        out.append({
-            "name": name,
-            "full_cron": sched.full_cron if sched else None,
-            "incremental_cron": sched.incremental_cron if sched else None,
-            "enabled": sched.enabled if sched else False,
-            "last_type": last.backup_type if last else None,
-            "last_status": last.status if last else None,
-            "last_changed_bytes": last.changed_bytes if last else 0,
-            "changed_since_full": changed_since_full,
-            "full_runs": full_runs,
-        })
-    return out
 
 
 @router.get("/runs", response_model=List[BackupRunResponse])
 async def list_backup_runs(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+    group_id: Optional[int] = None,
+    limit: int = 200,
 ):
-    return db.query(BackupRun).order_by(BackupRun.id.desc()).limit(200).all()
-
-
-@router.post("/runs", response_model=BackupRunResponse)
-async def run_backup(
-    req: RunRequest,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    return await zfs_backup_manager.run_backup(
-        db,
-        dataset_name=req.dataset_name,
-        backup_disk_id=req.backup_disk_id,
-        backup_type=req.backup_type,
-    )
-
-
-@router.get("/schedules", response_model=List[dict])
-async def list_backup_schedules(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    rows = []
-    for s in db.query(BackupSchedule).all():
-        rows.append({
-            "id": s.id, "dataset_name": s.dataset_name,
-            "backup_disk_id": s.backup_disk_id,
-            "full_cron": s.full_cron, "incremental_cron": s.incremental_cron,
-            "full_retention": s.full_retention,
-            "incremental_retention": s.incremental_retention,
-            "enabled": s.enabled,
-        })
-    return rows
-
-
-@router.post("/schedules")
-async def upsert_backup_schedule(
-    body: dict,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """Create or update a backup schedule for a dataset."""
-    dataset_name = body.get("dataset_name")
-    if not dataset_name:
-        raise HTTPException(status_code=400, detail="dataset_name required")
-    sched = db.query(BackupSchedule).filter(BackupSchedule.dataset_name == dataset_name).first()
-    if not sched:
-        sched = BackupSchedule(dataset_name=dataset_name)
-        db.add(sched)
-    sched.backup_disk_id = body.get("backup_disk_id")
-    sched.full_cron = body.get("full_cron")
-    sched.incremental_cron = body.get("incremental_cron")
-    sched.full_retention = body.get("full_retention", 3)
-    sched.incremental_retention = body.get("incremental_retention", 7)
-    sched.enabled = body.get("enabled", True)
-    db.commit()
-    db.refresh(sched)
-
-    # Reconcile ScheduledTask jobs so saved crons actually fire.
-    await zfs_backup_manager.sync_scheduled_tasks(db)
-    return {"id": sched.id, "dataset_name": sched.dataset_name}
-
-
-@router.delete("/schedules/{dataset_name:path}")
-async def delete_backup_schedule(
-    dataset_name: str,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """Disable/remove a dataset's backup schedule (also unschedules its tasks)."""
-    sched = db.query(BackupSchedule).filter(BackupSchedule.dataset_name == dataset_name).first()
-    if sched:
-        sched.enabled = False
-        sched.full_cron = None
-        sched.incremental_cron = None
-        db.commit()
-    await zfs_backup_manager.sync_scheduled_tasks(db)
-    return {"message": "Schedule removed"}
+    """Recent per-dataset runs across every group (sessions are the write path)."""
+    return await zfs_backup_manager.list_runs(db, group_id=group_id, limit=limit)
 
 
 @router.get("/disks/{backup_disk_id}/streams", response_model=List[dict])
 async def list_disk_streams(
     backup_disk_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
     """List backup stream files on a mounted backup disk (for new-server restore)."""
     return await zfs_backup_manager.list_stream_files(db, backup_disk_id)
 
 
+@router.get("/disks/{backup_disk_id}/manifest", response_model=dict)
+async def get_disk_manifest(
+    backup_disk_id: int,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    """The volume's aggregate backup manifest (pools, datasets, config)."""
+    try:
+        return await zfs_backup_manager.get_volume_manifest(db, backup_disk_id)
+    except Exception as e:
+        logger.error("get_manifest failed for disk %s: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/disks/{backup_disk_id}/rebuild-manifest", response_model=dict)
+async def rebuild_disk_manifest(
+    backup_disk_id: int,
+    db: Session = Depends(get_db),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
+):
+    """Regenerate the manifest by scanning streams and sidecars on the volume."""
+    try:
+        return await zfs_backup_manager.rebuild_manifest(db, backup_disk_id)
+    except Exception as e:
+        logger.error("rebuild_manifest failed for disk %s: %s", backup_disk_id, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/restore-file")
 async def restore_from_file(
-    body: dict,
+    req: RestoreFileRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
     """Restore a dataset from an arbitrary stream file on a mounted backup disk,
     independent of any stored run record (same-server crash or brand-new server)."""
-    stream_file = body.get("stream_file")
-    dataset_name = body.get("dataset_name")
-    if not stream_file or not dataset_name:
-        raise HTTPException(status_code=400, detail="stream_file and dataset_name required")
     try:
-        return await zfs_backup_manager.restore_dataset(stream_file, dataset_name)
+        return await zfs_backup_manager.restore_dataset(
+            db, req.stream_file, req.target_dataset, force=req.force
+        )
     except Exception as e:
+        logger.error("restore_from_file failed: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -318,15 +303,16 @@ async def restore_run(
     run_id: int,
     req: RestoreRunRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    zfs_backup_manager: ZfsBackupManager = Depends(get_zfs_backup_manager),
+
 ):
     """Restore a dataset from a stored stream file (full, or incremental chain)."""
-    run = db.query(BackupRun).filter(BackupRun.id == run_id).first()
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    dataset_name = req.dataset_name or run.dataset_name
+    run = zfs_backup_manager.get_run(db, run_id)
     try:
-        result = await zfs_backup_manager.restore_dataset(run.stream_file, dataset_name)
+        result = await zfs_backup_manager.restore_dataset(
+            db, run.stream_file, req.target_dataset, force=req.force
+        )
     except Exception as e:
+        logger.error("restore_run %s failed: %s", run_id, e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
     return result

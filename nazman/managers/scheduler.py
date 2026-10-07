@@ -1,33 +1,52 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Awaitable, Callable
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import logging
 
 from ..models.scheduler import ScheduledTask, TaskHistory, TaskType
 from ..utils.commands import run_zpool, run_zfs
 from ..utils.validation import validate_schedule
 from ..utils.exceptions import NAZManError
+from ..managers.alert_manager import AlertManager
+
+logger = logging.getLogger(__name__)
+
+# An executor runs one unit of scheduled work inside a caller-provided session.
+TaskExecutor = Callable[[ScheduledTask, Session], Awaitable[None]]
 
 
 class SchedulerManager:
-    """Manages scheduled tasks for scrubs, snapshots, etc."""
-    
-    def __init__(self):
-        self.scheduler = AsyncIOScheduler()
+    """Manages scheduled tasks for scrubs, snapshots, etc.
+
+    Domain-specific job types (backups) are provided as *executors* injected at
+    wiring time (``register_executor``), so the scheduler never imports the
+    backup managers (which would create import cycles).
+    """
+
+    def __init__(self, alerter: Optional["AlertManager"] = None):
+        self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._started = False
+        self._executors: Dict[str, TaskExecutor] = {}
+        # Optional collaborator for failure notifications; injected by wiring.
+        self._alerter = alerter
+
+    def register_executor(self, task_type: str, executor: TaskExecutor) -> None:
+        """Bind an async ``executor(task, db)`` to a task type value."""
+        self._executors[task_type] = executor
     
     async def start(self):
         """Start the scheduler."""
         if not self._started:
             self.scheduler.start()
             self._started = True
-            # Reload persistent schedule-driven jobs (e.g. ZFS backups) that
-            # are derived from backup_schedules rows.
+            # Reload all persistent tasks from the database
             from ..database import get_db_context
-            from .zfs_backup_manager import zfs_backup_manager
             with get_db_context() as db:
-                await zfs_backup_manager.sync_scheduled_tasks(db)
+                tasks = db.query(ScheduledTask).filter(ScheduledTask.enabled == True).all()
+                for task in tasks:
+                    await self._schedule_task(task)
     
     async def stop(self):
         """Stop the scheduler."""
@@ -120,9 +139,8 @@ class SchedulerManager:
     
     async def run_task_now(self, task_id: int) -> None:
         """Run a task immediately."""
-        # This would trigger the task execution
-        # For now, just log that it was triggered
-        print(f"Task {task_id} triggered manually")
+        logger.info(f"Task {task_id} triggered manually")
+        await self._execute_task(task_id)
     
     async def get_task_history(self, db: Session, task_id: Optional[int] = None) -> List[TaskHistory]:
         """Get task execution history."""
@@ -146,21 +164,24 @@ class SchedulerManager:
                 hour=hour,
                 day=day,
                 month=month,
-                day_of_week=day_of_week
+                day_of_week=day_of_week,
+                timezone=timezone.utc
             )
             
-            # Add job to scheduler
+            # Add job to scheduler with misfire handling
             self.scheduler.add_job(
                 self._execute_task,
                 trigger=trigger,
                 args=[task.id],
                 id=f"task_{task.id}",
                 name=task.name,
-                replace_existing=True
+                replace_existing=True,
+                misfire_grace_time=3600,  # 1 hour grace time for missed runs
+                coalesce=True  # Combine missed runs into one
             )
             
         except Exception as e:
-            print(f"Failed to schedule task {task.id}: {str(e)}")
+            logger.error(f"Failed to schedule task {task.id}: {str(e)}")
     
     async def _unschedule_task(self, task: ScheduledTask) -> None:
         """Remove a task from the scheduler."""
@@ -169,10 +190,14 @@ class SchedulerManager:
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
         except Exception as e:
-            print(f"Failed to unschedule task {task.id}: {str(e)}")
+            logger.error(f"Failed to unschedule task {task.id}: {str(e)}")
     
     async def _execute_task(self, task_id: int) -> None:
-        """Execute a scheduled task."""
+        """Execute a scheduled task.
+
+        The session is opened here (background scope) and passed to the task
+        implementation; managers never open their own sessions.
+        """
         from ..database import get_db_context
         
         with get_db_context() as db:
@@ -191,16 +216,17 @@ class SchedulerManager:
             
             try:
                 # Execute based on task type
-                if task.task_type == TaskType.SCRUB.value:
+                executor = self._executors.get(task.task_type)
+                if executor is not None:
+                    await executor(task, db)
+                elif task.task_type == TaskType.SCRUB.value:
                     await self._execute_scrub(task.target)
                 elif task.task_type == TaskType.SNAPSHOT.value:
                     await self._execute_snapshot(task.target, task.config)
-                elif task.task_type == TaskType.BACKUP.value:
-                    await self._execute_backup()
-                elif task.task_type == TaskType.ZFS_BACKUP.value:
-                    await self._execute_zfs_backup(task.config)
                 elif task.task_type == TaskType.HEALTH_CHECK.value:
                     await self._execute_health_check(task.target)
+                else:
+                    raise NAZManError(f"No executor registered for task type '{task.task_type}'")
                 
                 # Update history
                 history.status = "success"
@@ -213,6 +239,13 @@ class SchedulerManager:
                 history.status = "failed"
                 history.error = str(e)
                 history.completed_at = datetime.now(timezone.utc)
+                if self._alerter is not None:
+                    await self._alerter.notify(
+                        f"task:{task.name}",
+                        f"Scheduled task '{task.name}' ({task.task_type} for "
+                        f"{task.target}) failed: {e}",
+                        severity="error",
+                    )
             
             db.commit()
     
@@ -244,50 +277,22 @@ class SchedulerManager:
             await self._apply_retention(dataset_name, config["retention"])
     
     async def _apply_retention(self, dataset_name: str, retention: int) -> None:
-        """Apply snapshot retention policy."""
-        # List snapshots for dataset
+        """Apply snapshot retention policy.
+
+        Only destroys snapshots with the ``auto-`` prefix (created by this scheduler).
+        User-created snapshots and ``backup-*`` anchors are never touched.
+        """
         stdout, stderr, returncode = await run_zfs(
-            "list", "-H", "-o", "name", "-t", "snapshot", "-r", dataset_name, op="read",
+            "list", "-H", "-o", "name", "-t", "snapshot", dataset_name, op="read",
         )
-        
+
         if returncode == 0:
             snapshots = [s for s in stdout.strip().split('\n') if s]
-            
-            # Sort by creation time (newest first)
-            snapshots.sort(reverse=True)
-            
-            # Delete old snapshots
-            for snapshot in snapshots[retention:]:
-                await run_zfs("destroy", snapshot, timeout=60)
-    
-    async def _execute_backup(self) -> None:
-        """Execute a backup."""
-        from .backup_manager import backup_manager
-        from ..database import get_db_context
+            auto_snaps = [s for s in snapshots if f"@auto-" in s]
+            auto_snaps.sort(reverse=True)
 
-        with get_db_context() as db:
-            await backup_manager.backup_configuration(db)
-
-    async def _execute_zfs_backup(self, config: Dict[str, Any]) -> None:
-        """Execute a ZFS data backup (dataset -> backup disk)."""
-        from .zfs_backup_manager import zfs_backup_manager
-        from ..database import get_db_context
-
-        config = config or {}
-        dataset_name = config.get("dataset_name")
-        backup_disk_id = config.get("backup_disk_id")
-        backup_type = config.get("type", "full") or "full"
-        if not dataset_name or not backup_disk_id:
-            raise NAZManError("ZFS backup task requires dataset_name and backup_disk_id")
-
-        with get_db_context() as db:
-            await zfs_backup_manager.run_backup(
-                db,
-                dataset_name=dataset_name,
-                backup_disk_id=backup_disk_id,
-                backup_type=backup_type,
-            )
-
+            for snapshot in auto_snaps[retention:]:
+                await run_zfs("destroy", snapshot, timeout=60, check=False)
     
     async def _execute_health_check(self, target: str) -> None:
         """Execute a health check."""
@@ -302,11 +307,8 @@ class SchedulerManager:
         # Parse status and check for errors
         import json
         data = json.loads(stdout)
-        pool_info = data.get("pools", [{}])[0] if data.get("pools") else {}
-        
+        pools = data.get("pools", {})
+        pool_info = pools.get(target, {}) if isinstance(pools, dict) else {}
+
         if pool_info.get("state") != "ONLINE":
             raise NAZManError(f"Pool {target} is not ONLINE: {pool_info.get('state')}")
-
-
-# Singleton instance
-scheduler_manager = SchedulerManager()

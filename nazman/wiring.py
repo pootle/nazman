@@ -1,0 +1,193 @@
+"""Application object graph: construction and access to managers/services.
+
+Managers are plain classes with no module-level instances; the container is
+built lazily once per process (or per test) so nothing with side effects
+(threads, schedulers, settings snapshots) happens at import time. Cross-domain
+collaborators are wired here via constructor injection, which keeps the
+manager modules free of one another.
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from .managers.disk_manager import DiskManager
+from .managers.zfs_manager import ZfsManager
+from .managers.nfs_manager import NfsManager
+from .managers.smb_manager import SmbManager
+from .managers.snapshot_manager import SnapshotManager
+from .managers.backup_manager import BackupManager
+from .managers.zfs_backup_manager import ZfsBackupManager
+from .managers.scheduler import SchedulerManager
+from .managers.metrics_manager import MetricsManager, register_default_collectors
+from .managers.metrics_store import MetricsStore
+from .managers.alert_manager import AlertManager
+from .models.scheduler import TaskType
+from .services.backup_group_service import BackupGroupService
+from .services.destruction import DestructionService
+from .services.disk_view import DiskViewService
+from .services.system_restore import SystemRestoreService
+from .utils.exceptions import NAZManError
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Container:
+    disk: DiskManager
+    zfs: ZfsManager
+    nfs: NfsManager
+    smb: SmbManager
+    snapshot: SnapshotManager
+    backup: BackupManager
+    zfs_backup: ZfsBackupManager
+    scheduler: SchedulerManager
+    metrics: MetricsManager
+    metrics_store: MetricsStore
+    alerts: AlertManager
+    destruction: DestructionService
+    disk_view: DiskViewService
+    system_restore: SystemRestoreService
+    backup_groups: BackupGroupService
+
+
+def build_container() -> Container:
+    """Construct the full object graph with collaborators injected."""
+    zfs = ZfsManager()
+    # Provider is late-bound so ZfsManager patches (tests) take effect.
+    disk = DiskManager(pool_members_provider=lambda: zfs.get_pool_members())
+    nfs = NfsManager()
+    smb = SmbManager()
+    snapshot = SnapshotManager()
+    backup = BackupManager(zfs=zfs)
+    alerts = AlertManager()
+    scheduler = SchedulerManager(alerter=alerts)
+    zfs_backup = ZfsBackupManager(zfs=zfs, backup=backup)
+    metrics_store = MetricsStore()
+    metrics = MetricsManager(zfs=zfs, store=metrics_store)
+    register_default_collectors(metrics)
+
+    destruction = DestructionService(zfs=zfs, nfs=nfs, smb=smb)
+    disk_view = DiskViewService(disk=disk, zfs=zfs, zfs_backup=zfs_backup)
+    system_restore = SystemRestoreService(
+        disk=disk, zfs=zfs, zfs_backup=zfs_backup, backup=backup, scheduler=scheduler,
+    )
+    backup_groups = BackupGroupService(
+        zfs_backup=zfs_backup, backup=backup, scheduler=scheduler, alerter=alerts,
+    )
+
+    _register_backup_jobs(scheduler, backup_groups)
+
+    return Container(
+        disk=disk,
+        zfs=zfs,
+        nfs=nfs,
+        smb=smb,
+        snapshot=snapshot,
+        backup=backup,
+        zfs_backup=zfs_backup,
+        scheduler=scheduler,
+        metrics=metrics,
+        metrics_store=metrics_store,
+        alerts=alerts,
+        destruction=destruction,
+        disk_view=disk_view,
+        system_restore=system_restore,
+        backup_groups=backup_groups,
+    )
+
+
+def _register_backup_jobs(
+    scheduler: SchedulerManager,
+    backup_groups: BackupGroupService,
+) -> None:
+    """Bind backup task types to scheduler executors (no manager imports below)."""
+    async def run_zfs_backup(task, db):
+        config = task.config or {}
+        group_id = config.get("group_id")
+        backup_type = config.get("type", "full") or "full"
+        if not group_id:
+            raise NAZManError("Backup job requires group_id")
+        await backup_groups.start_session(db, group_id, backup_type)
+
+    scheduler.register_executor(TaskType.ZFS_BACKUP.value, run_zfs_backup)
+
+
+_container: Optional[Container] = None
+
+
+def get_container() -> Container:
+    """Return the process container, building it lazily on first use."""
+    global _container
+    if _container is None:
+        _container = build_container()
+    return _container
+
+
+def reset_container() -> None:
+    """Discard the current container (test isolation; next access rebuilds)."""
+    global _container
+    _container = None
+
+
+# ── FastAPI dependency providers ────────────────────────────────────────
+
+def get_zfs_manager() -> ZfsManager:
+    return get_container().zfs
+
+
+def get_disk_manager() -> DiskManager:
+    return get_container().disk
+
+
+def get_nfs_manager() -> NfsManager:
+    return get_container().nfs
+
+
+def get_smb_manager() -> SmbManager:
+    return get_container().smb
+
+
+def get_snapshot_manager() -> SnapshotManager:
+    return get_container().snapshot
+
+
+def get_backup_manager() -> BackupManager:
+    return get_container().backup
+
+
+def get_zfs_backup_manager() -> ZfsBackupManager:
+    return get_container().zfs_backup
+
+
+def get_scheduler_manager() -> SchedulerManager:
+    return get_container().scheduler
+
+
+def get_metrics_manager() -> MetricsManager:
+    return get_container().metrics
+
+
+def get_metrics_store() -> MetricsStore:
+    return get_container().metrics_store
+
+
+def get_alert_manager() -> AlertManager:
+    return get_container().alerts
+
+
+def get_destruction_service() -> DestructionService:
+    return get_container().destruction
+
+
+def get_disk_view_service() -> DiskViewService:
+    return get_container().disk_view
+
+
+def get_system_restore_service() -> SystemRestoreService:
+    return get_container().system_restore
+
+
+def get_backup_group_service() -> BackupGroupService:
+    return get_container().backup_groups

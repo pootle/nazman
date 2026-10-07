@@ -135,7 +135,6 @@ let allDisks = [];
 let diskPartitions = {};
 
 let pickerVdevId = null;
-let pickerAlreadyUsed = new Set();  // "disk_id" or "disk_id:slot_uuid"
 
 document.addEventListener('DOMContentLoaded', function() {
     loadPoolsPage();
@@ -168,8 +167,12 @@ function renderPools() {
     container.innerHTML = pools.map(pool => {
         const usable = pool.usable_bytes || 0;
         const pct = pool.used_capacity_pct != null ? pool.used_capacity_pct : null;
-        const used = usable && pct != null ? usable * pct / 100 : null;
-        const free = usable && used != null ? usable - used : pool.free_bytes;
+        const used = pool.allocated_bytes != null
+            ? pool.allocated_bytes
+            : (usable && pct != null ? usable * pct / 100 : null);
+        const free = pool.free_bytes != null
+            ? pool.free_bytes
+            : (usable && used != null ? usable - used : null);
 
         const usageHtml = usable > 0 && pct != null ? `
             <div class="pool-usage-bar" style="background:#444;border-radius:4px;height:10px;overflow:hidden;margin:6px 0">
@@ -188,30 +191,30 @@ function renderPools() {
                 <table class="data-table pool-dataset-table">
                     <thead><tr><th>Dataset</th><th>Used</th><th>Referenced</th><th>Mountpoint</th></tr></thead>
                     <tbody>${pool.datasets.map(d => `<tr>
-                        <td><code>${d.name}</code></td>
-                        <td>${d.used || '-'}</td>
-                        <td>${d.referenced || '-'}</td>
-                        <td><small class="text-muted">${d.mountpoint || '-'}</small></td>
+                        <td><a href="javascript:void(0)" onclick="Details.dataset('${escapeHtml(d.name)}'); return false;" title="View dataset details">${escapeHtml(d.name)}</a></td>
+                        <td>${escapeHtml(d.used || '-')}</td>
+                        <td>${escapeHtml(d.referenced || '-')}</td>
+                        <td><small class="text-muted">${escapeHtml(d.mountpoint || '-')}</small></td>
                     </tr>`).join('')}</tbody>
                 </table>
             </div>` : '';
 
         return `
         <div class="pool-card">
-            <h3>${pool.name}</h3>
+            <h3>${escapeHtml(pool.name)}</h3>
             <div class="pool-info">
-                <span class="status status-${pool.status}">${pool.status}</span>
-                <span class="topology">${pool.topology}</span>
+                <span class="status status-${escapeHtml(pool.status)}">${escapeHtml(pool.status)}</span>
+                <span class="topology">${escapeHtml(pool.topology)}</span>
                 ${usable > 0 ? `<span>Usable: ${formatBytes(usable)}</span>` : ''}
                 ${ratioHtml}
             </div>
             ${usageHtml}
             ${datasetHtml}
             <div class="pool-actions">
-                <button class="btn btn-sm btn-secondary" onclick="viewPoolStatus('${pool.name}')">
+                <button class="btn btn-sm btn-secondary" onclick="viewPoolStatus('${escapeHtml(pool.name)}')">
                     <i class="fas fa-info-circle"></i> Details
                 </button>
-                <button class="btn btn-sm btn-danger" onclick="destroyPool('${pool.name}')">
+                <button class="btn btn-sm btn-danger" onclick="destroyPool('${escapeHtml(pool.name)}')">
                     <i class="fas fa-trash"></i> Destroy
                 </button>
             </div>
@@ -224,7 +227,7 @@ function updatePoolSelects() {
     ['scrub-pool-select', 'export-pool-select', 'import-pool-select', 'metric-log-pool-select'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = '<option value="">-- Select Pool --</option>' +
-            pools.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+            pools.map(p => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join('');
     });
 }
 
@@ -261,17 +264,6 @@ async function toggleMetricLogging() {
         console.error(e);
         showAlert('Failed to update logging: ' + e.message, 'error');
     }
-}
-
-function formatSize(bytes) {
-    if (!bytes) return 'Unknown';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    let i = 0;
-    while (bytes >= 1024 && i < units.length - 1) {
-        bytes /= 1024;
-        i++;
-    }
-    return bytes.toFixed(2) + ' ' + units[i];
 }
 
 // ── Create Pool Modal ──────────────────────────────────────
@@ -363,74 +355,33 @@ function getUsedDeviceKeys(excludeVdevId) {
 
 function openDevicePicker(vdevId) {
     pickerVdevId = vdevId;
-    pickerAlreadyUsed = getUsedDeviceKeys(vdevId);
+
+    const used = getUsedDeviceKeys(vdevId);
+    const disabledWhole = new Set();
+    const disabledPartitions = {};
+    for (const key of used) {
+        const [diskId, slot] = key.split(':');
+        if (slot) {
+            if (!disabledPartitions[diskId]) disabledPartitions[diskId] = new Set();
+            disabledPartitions[diskId].add(slot);
+        } else {
+            disabledWhole.add(diskId);
+        }
+    }
 
     const block = document.getElementById(`vdev-${vdevId}`);
     const role = block.querySelector('.vdev-role').value;
     document.getElementById('device-picker-title').textContent = `Select Device — ${role}`;
 
-    const container = document.getElementById('device-picker-list');
-    let html = '';
-
-    for (const disk of allDisks) {
-        if (disk.status === 'dead') continue;
-        const parts = diskPartitions[disk.id] || [];
-
-        if (disk.is_os_disk) {
-            // OS disks (e.g. they host the root raid) are only offered as
-            // individual partitions, never as a whole disk.  OS-reserved
-            // partitions (boot/EFI/md members) are disabled.
-            for (const p of parts) {
-                const key = `${disk.id}:${p.slot_uuid}`;
-                const disabled = pickerAlreadyUsed.has(key) || p.reserved;
-                const hint = p.reserved ? ' reserved (OS)' : '';
-                html += `
-                    <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
-                        <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
-                        <span style="flex:1">
-                            ${disk.device_name} <small class="text-muted">p${p.number}</small>
-                            <small class="text-muted" style="margin-left:8px">${formatSize(p.size_bytes)}</small>
-                        </span>
-                        <small class="text-muted">${p.reserved ? hint : p.slot_uuid.substring(0, 8) + '...'}</small>
-                    </label>`;
-            }
-            continue;
-        }
-
-        if (parts.length > 0) {
-            for (const p of parts) {
-                const key = `${disk.id}:${p.slot_uuid}`;
-                const disabled = pickerAlreadyUsed.has(key);
-                html += `
-                    <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
-                        <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
-                        <span style="flex:1">
-                            ${disk.device_name} <small class="text-muted">p${p.number}</small>
-                            <small class="text-muted" style="margin-left:8px">${formatSize(p.size_bytes)}</small>
-                        </span>
-                        <small class="text-muted">${p.slot_uuid.substring(0, 8)}...</small>
-                    </label>`;
-            }
-        } else {
-            const key = `${disk.id}`;
-            const disabled = pickerAlreadyUsed.has(key);
-            html += `
-                <label class="device-picker-item" style="display:flex;align-items:center;gap:8px;padding:6px 0;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.4' : '1'}">
-                    <input type="checkbox" class="device-pick-cb" value="${key}" ${disabled ? 'disabled' : ''}>
-                    <span style="flex:1">
-                        ${disk.device_name}
-                        <small class="text-muted" style="margin-left:8px">${formatSize(disk.size_bytes)} ${disk.disk_type}</small>
-                    </span>
-                    <small class="text-muted">whole disk</small>
-                </label>`;
-        }
-    }
-
-    if (!html) {
-        html = '<p class="empty-state">No available devices. Partition disks first on the Disks page.</p>';
-    }
-
-    container.innerHTML = html;
+    DevicePicker.render(document.getElementById('device-picker-list'), {
+        disks: allDisks,
+        partitionsByDisk: diskPartitions,
+        single: false,
+        excludeOsDisks: false,
+        alwaysAllowWholeDisk: false,
+        disabledWhole,
+        disabledPartitions,
+    });
     document.getElementById('device-picker-modal').style.display = 'flex';
 }
 
@@ -440,7 +391,7 @@ function hideDevicePicker() {
 }
 
 function confirmDevicePicker() {
-    const checked = [...document.querySelectorAll('.device-pick-cb:checked')].map(cb => cb.value);
+    const checked = DevicePicker.selectedKeys(document.getElementById('device-picker-list'));
     if (checked.length === 0) {
         showAlert('Select at least one device', 'error');
         return;
@@ -458,15 +409,15 @@ function confirmDevicePicker() {
         const row = document.createElement('div');
         row.className = 'device-row';
         row.dataset.deviceKey = key;
-        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:4px;padding:4px 8px;background:#333;border-radius:4px';
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:4px;padding:4px 8px;background:#ecf0f1;border-radius:4px';
 
         let label;
         if (slotUuid) {
             const part = (diskPartitions[diskId] || []).find(p => p.slot_uuid === slotUuid);
             label = `${disk.device_name} p${part?.number || '?'} `;
-            label += `<small class="text-muted">${slotUuid.substring(0, 8)}... ${part ? formatSize(part.size_bytes) : ''}</small>`;
+            label += `<small class="text-muted">${slotUuid.substring(0, 8)}... ${part ? formatBytes(part.size_bytes) : ''}</small>`;
         } else {
-            label = `${disk.device_name} <small class="text-muted">${formatSize(disk.size_bytes)} whole disk</small>`;
+            label = `${disk.device_name} <small class="text-muted">${formatBytes(disk.size_bytes)} whole disk</small>`;
         }
 
         row.innerHTML = `
@@ -571,112 +522,8 @@ async function importPool() {
     }
 }
 
-async function viewPoolStatus(poolName) {
-    try {
-        const status = await api.getPoolStatus(poolName);
-        showPoolDetailsModal(status);
-    } catch (error) {
-        showAlert('Failed: ' + error.message, 'error');
-    }
-}
-
-function showPoolDetailsModal(status) {
-    function parseSize(str) {
-        if (!str) return 0;
-        const m = str.match(/([\d.]+)\s*([KMGTP]i?B?)/i);
-        if (!m) return parseFloat(str) || 0;
-        const val = parseFloat(m[1]);
-        const unit = m[2][0].toUpperCase();
-        const mult = {K: 1024, M: 1024**2, G: 1024**3, T: 1024**4, P: 1024**5};
-        return val * (mult[unit] || 1);
-    }
-
-    function vdevSummary(vdevs, label) {
-        if (!vdevs || vdevs.length === 0) return '';
-        const items = vdevs.map(v => {
-            const type = v.type || 'unknown';
-            const devs = (v.children || []).map(c => {
-                const state = c.state || '';
-                const size = c.size || '';
-                return `<div style="padding-left:8px">${c.name || '?'} <span style="opacity:0.6">${size}</span> <span class="status status-${state}">${state}</span></div>`;
-            }).join('');
-            return `<li><strong>${type}</strong>${devs ? '' : ': no devices'}${devs}</li>`;
-        }).join('');
-        return `<div style="margin-bottom:8px"><strong>${label}</strong><ul style="margin:4px 0 0 16px;list-style:none">${items}</ul></div>`;
-    }
-
-    function vdevSize(vdevs) {
-        if (!vdevs || vdevs.length === 0) return null;
-        let total = 0;
-        for (const v of vdevs) {
-            const kids = v.children || [];
-            const sizes = kids.map(c => parseSize(c.size)).filter(s => s > 0);
-            if (sizes.length === 0) continue;
-            const type = v.type || 'stripe';
-            if (type === 'mirror') {
-                total += Math.min(...sizes);
-            } else if (type === 'raidz1') {
-                total += sizes.reduce((a, b) => a + b, 0) - Math.min(...sizes);
-            } else if (type === 'raidz2') {
-                const sorted = [...sizes].sort((a, b) => a - b);
-                total += sizes.reduce((a, b) => a + b, 0) - sorted[0] - sorted[1];
-            } else if (type === 'raidz3') {
-                const sorted = [...sizes].sort((a, b) => a - b);
-                total += sizes.reduce((a, b) => a + b, 0) - sorted[0] - sorted[1] - sorted[2];
-            } else {
-                total += sizes.reduce((a, b) => a + b, 0);
-            }
-        }
-        return total || null;
-    }
-
-    const dataUsable = vdevSize(status.data_vdevs);
-    const rawSize = (status.data_vdevs || []).concat(status.special_vdevs || [], status.log_vdevs || [], status.cache_vdevs || [])
-        .flatMap(v => (v.children || []).map(c => parseSize(c.size)))
-        .reduce((a, b) => a + b, 0);
-
-    let html = `
-        <div style="margin-bottom:12px">
-            <span class="status status-${status.status}" style="font-size:1.1em">${status.status}</span>
-            <span class="topology" style="margin-left:8px">${status.topology}</span>
-        </div>`;
-
-    if (rawSize > 0) {
-        html += `<div style="margin-bottom:12px"><strong>Raw capacity:</strong> ${formatBytes(rawSize)}</div>`;
-    }
-    if (dataUsable && dataUsable !== rawSize) {
-        html += `<div style="margin-bottom:12px"><strong>Usable (data):</strong> ${formatBytes(dataUsable)}</div>`;
-    }
-
-    html += vdevSummary(status.data_vdevs, 'Data Vdevs');
-    html += vdevSummary(status.special_vdevs, 'Special Vdevs');
-    html += vdevSummary(status.log_vdevs, 'Log Vdevs');
-    html += vdevSummary(status.cache_vdevs, 'Cache Vdevs');
-
-    if (status.scan && status.scan.state) {
-        html += `<div style="margin-top:8px"><strong>Last scrub:</strong> ${status.scan.state} ${status.scan.end_time || ''}</div>`;
-    }
-
-    const modal = document.createElement('div');
-    modal.className = 'modal';
-    modal.style.display = 'flex';
-    modal.style.zIndex = '2000';
-    modal.innerHTML = `
-        <div class="modal-content" style="max-width:500px">
-            <div class="modal-header">
-                <h3>Pool "${status.name}"</h3>
-                <button class="close" onclick="this.closest('.modal').remove()">&times;</button>
-            </div>
-            <div class="modal-body" style="padding:20px">
-                ${html}
-                <div style="text-align:right;margin-top:16px">
-                    <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">Close</button>
-                </div>
-            </div>
-        </div>
-    `;
-    document.body.appendChild(modal);
-    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+function viewPoolStatus(poolName) {
+    Details.pool(poolName);
 }
 
 async function destroyPool(poolName) {
