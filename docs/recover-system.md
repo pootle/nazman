@@ -82,4 +82,4 @@ shares themselves are re-exported when you recreate/save each one.
 > recreated → backups resumed. A full recovery is possible from the external
 > disks alone; surviving pool disks only save the restore step.
 
-Next: [Troubleshooting](troubleshooting)
+Next: [Install & Update](install-update)

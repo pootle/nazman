@@ -6,6 +6,7 @@ password.
 
 This guide walks through the whole lifecycle of a NAS in reading order: storage,
 data, sharing, protection, and — when something goes wrong — recovery.
+Installing or updating NAZMan itself is covered by [Install & Update](install-update).
 
 ## What you can do
 
@@ -34,6 +35,8 @@ These pages are covered in detail next:
 4. [Set up backups](backup) — declare an external backup disk (it is seeded
    with the configuration automatically) and schedule dataset backups. Use
    [Restore](restore) to recover or rebuild.
+5. [Install & Update](install-update) — install NAZMan on a new host or update
+   the running service.
 
 ## Reading this guide
 

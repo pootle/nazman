@@ -98,6 +98,7 @@ docs/alerts.md
 docs/disk-failure.md
 docs/recover-dataset.md
 docs/recover-system.md
+docs/install-update.md
 docs/troubleshooting.md
 
 # Tests

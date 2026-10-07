@@ -18,6 +18,7 @@ GUIDE_PAGES: List[Tuple[str, str]] = [
     ("disk-failure", "Handle a Disk Failure"),
     ("recover-dataset", "Recover a Dataset"),
     ("recover-system", "Recover a Complete System"),
+    ("install-update", "Install & Update"),
     ("troubleshooting", "Troubleshooting"),
 ]
 
