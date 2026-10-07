@@ -230,6 +230,7 @@ class SystemRestoreService:
             "media": {},
         }
         updated = ""
+        group = None
         for manifest in manifests:
             if not manifest:
                 continue
@@ -237,6 +238,8 @@ class SystemRestoreService:
                 if merged.get(key) is None and manifest.get(key) is not None:
                     merged[key] = manifest[key]
             updated = max(updated, manifest.get("updated_at") or "")
+            if group is None and manifest.get("group"):
+                group = manifest["group"]
             if manifest.get("media") and not merged["media"]:
                 merged["media"] = manifest["media"]
             for pool in manifest.get("pools") or []:
@@ -268,6 +271,8 @@ class SystemRestoreService:
                     runs[:] = [r for r in runs if r.get("stream_file") != run.get("stream_file")]
                     runs.append(run)
         merged["updated_at"] = updated or None
+        if group:
+            merged["group"] = group
         for ds in merged["datasets"]:
             ds["backups"].sort(key=lambda r: r.get("created_at") or "")
         return merged
@@ -316,6 +321,7 @@ class SystemRestoreService:
             sets.append({
                 **summary,
                 "set_id": set_id,
+                "group": merged.get("group"),
                 "volume_count": len(volume_views),
                 "volumes": volume_views,
                 # Kept for the single-volume case, where it is the set itself.
@@ -325,6 +331,18 @@ class SystemRestoreService:
                     v["volume_id"] for v in volumes
                 }) or summary.get("media_fs_uuids") or [],
             })
+        # Within one group ring, every set carrying the newest updates is the
+        # currently "latest" backup; ties (e.g. after replication) are all marked.
+        newest_at: Dict[str, str] = {}
+        for s in sets:
+            grp = s.get("group")
+            ts = s.get("updated_at") or ""
+            if grp and ts and ts > newest_at.get(grp, ""):
+                newest_at[grp] = ts
+        for s in sets:
+            grp = s.get("group")
+            ts = s.get("updated_at") or ""
+            s["is_latest"] = bool(grp and ts and ts == newest_at.get(grp))
         return sets
 
     async def _volumes_of(self, db: Session, set_id: str) -> List[Dict[str, Any]]:

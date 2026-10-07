@@ -32,6 +32,11 @@ async def lifespan(app: FastAPI):
     # Initialise the persistent metrics store and load per-pool logging flags.
     container.metrics_store.connect()
 
+    # Fail sessions/runs a previous process left 'running' (crash/reboot) and
+    # destroy their orphaned snapshots before the scheduler can start new work.
+    with get_db_context() as db:
+        await container.backup_groups.recover_orphaned_backups(db)
+
     # Start the scheduler (loads persisted tasks) and the metrics recorder.
     await container.scheduler.start()
     # Reconcile backup group crons into scheduler jobs, so a group configured

@@ -160,7 +160,7 @@ async def run_pipeline(
     stdin_path: Optional[str] = None,
     stdout_path: Optional[str] = None,
 ) -> Tuple[str, str, int]:
-    """Run a pipeline of argv commands (e.g. ``zfs send ... | gzip``) without a shell.
+    """Run a pipeline of argv commands (e.g. ``zfs send -c ... | tee | sha256sum``) without a shell.
 
     Each stage is exec'd directly with its argv list; stdout of one stage is
     connected to stdin of the next via an OS pipe.  Optionally the first stage

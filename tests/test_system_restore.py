@@ -11,7 +11,8 @@ from tests.conftest import override_manager
 
 
 def _write_volume(root: Path, media_uuid: str = "AAA", set_id=None,
-                  stream: str = "data/tank/media/full-1.zfs.gz") -> dict:
+                  stream: str = "data/tank/media/full-1.zfs.gz", group=None,
+                  updated_at=None) -> dict:
     manifest = bm.new_manifest(media={"fs_uuid": media_uuid, "label": "vol1"})
     bm.merge_pools(manifest, [{
         "name": "tank", "ashift": 12,
@@ -36,7 +37,12 @@ def _write_volume(root: Path, media_uuid: str = "AAA", set_id=None,
         {"name": "tank/media", "pool": "tank", "properties": {}, "mountpoint": "/tank/media"},
         run,
     )
+    if group is not None:
+        manifest["group"] = group
     bm.save_manifest(root, manifest)
+    if updated_at is not None:
+        manifest["updated_at"] = updated_at
+        bm.atomic_write_json(Path(root) / bm.MANIFEST_NAME, manifest)
     stream_path = root / stream
     stream_path.parent.mkdir(parents=True, exist_ok=True)
     stream_path.write_bytes(b"x")
@@ -350,6 +356,73 @@ async def test_discover_backup_sets_keeps_unstamped_volumes_separate(db_session,
     sets = await service.discover_backup_sets(db_session)
     assert {s["set_id"] for s in sets} == {"AAA", "BBB"}
     assert all(s["volume_count"] == 1 for s in sets)
+
+
+def _scan_service(tmp_path, volumes):
+    """A scanner whose mounts resolve each candidate UUID to a volume dir."""
+    by_uuid = {vol_fs: path for path, vol_fs in volumes}
+
+    async def mount_readonly(candidate):
+        return by_uuid[candidate["fs_uuid"]]
+
+    service = SystemRestoreService()
+    service.list_candidates = AsyncMock(return_value=[
+        _candidate(fs) for _, fs in volumes
+    ])
+    service._mount_readonly = mount_readonly
+    service._unmount = AsyncMock()
+    return service
+
+
+@pytest.mark.asyncio
+async def test_discover_backup_sets_marks_latest_per_group(db_session, tmp_path):
+    vol_a = tmp_path / "a"; vol_a.mkdir()
+    vol_b = tmp_path / "b"; vol_b.mkdir()
+    vol_c = tmp_path / "c"; vol_c.mkdir()
+    _write_volume(vol_a, media_uuid="AAA", set_id=101, group="Media",
+                  updated_at="2026-02-01T00:00:00+00:00")
+    _write_volume(vol_b, media_uuid="BBB", set_id=102, group="Media",
+                  updated_at="2026-02-08T00:00:00+00:00")
+    _write_volume(vol_c, media_uuid="CCC", set_id=201, group="Docs",
+                  updated_at="2026-01-15T00:00:00+00:00")
+
+    service = _scan_service(tmp_path, [(vol_a, "AAA"), (vol_b, "BBB"), (vol_c, "CCC")])
+    sets = await service.discover_backup_sets(db_session)
+
+    media = sorted([s for s in sets if s["group"] == "Media"], key=lambda s: s["set_id"])
+    assert [s["set_id"] for s in media] == ["101", "102"]
+    assert [s["set_id"] for s in media if s["is_latest"]] == ["102"]
+    docs = [s for s in sets if s["group"] == "Docs"]
+    assert docs and docs[0]["is_latest"] is True
+
+
+@pytest.mark.asyncio
+async def test_discover_backup_sets_marks_every_latest_tie(db_session, tmp_path):
+    """Equal timestamps (e.g. after replication) are all marked latest."""
+    vol_a = tmp_path / "a"; vol_a.mkdir()
+    vol_b = tmp_path / "b"; vol_b.mkdir()
+    _write_volume(vol_a, media_uuid="AAA", set_id=101, group="Media",
+                  updated_at="2026-02-08T00:00:00+00:00")
+    _write_volume(vol_b, media_uuid="BBB", set_id=102, group="Media",
+                  updated_at="2026-02-08T00:00:00+00:00")
+
+    service = _scan_service(tmp_path, [(vol_a, "AAA"), (vol_b, "BBB")])
+    sets = await service.discover_backup_sets(db_session)
+
+    assert sorted(s["set_id"] for s in sets if s["is_latest"]) == ["101", "102"]
+
+
+@pytest.mark.asyncio
+async def test_discover_backup_sets_unstamped_volume_is_never_latest(db_session, tmp_path):
+    vol_a = tmp_path / "a"; vol_a.mkdir()
+    _write_volume(vol_a, media_uuid="AAA", updated_at="2026-02-08T00:00:00+00:00")
+
+    service = _scan_service(tmp_path, [(vol_a, "AAA")])
+    sets = await service.discover_backup_sets(db_session)
+
+    assert len(sets) == 1
+    assert sets[0]["group"] is None
+    assert sets[0]["is_latest"] is False
 
 
 @pytest.mark.asyncio

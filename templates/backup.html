@@ -8,7 +8,7 @@
     <p class="text-muted">A <strong>backup group</strong> is a fixed list of ZFS datasets. It is written to
         <strong>sets</strong> — a ring of backup disks that are used in turn, so each disk in a set is a spare for
         the others. The first run on a set captures a full snapshot of every dataset plus the current configuration;
-        later runs send only what changed. Full and incremental runs are gzip snapshot-streams.</p>
+        later runs send only what changed. Full and incremental runs are compact ZFS snapshot-streams.</p>
 
     <!-- Backup Disks -->
     <div class="card">
@@ -148,6 +148,20 @@
                 <input type="checkbox" id="group-enabled" checked>
                 <span>Enabled</span>
             </label>
+
+            <label for="group-copies" class="form-label" style="display:block;margin:12px 0 4px;">
+                Copies (backup sets updated each run)</label>
+            <input id="group-copies" class="form-control" type="number" min="1" value="1">
+            <p class="text-muted" style="margin-top:4px;">Each run writes the same backup to this many
+                consecutive sets, so every disk in the ring holds an up-to-date copy. 1 = the normal rotating ring.</p>
+
+            <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
+                <input type="checkbox" id="group-recycle">
+                <span>Recycle full disks</span>
+            </label>
+            <p class="text-muted" style="margin-top:4px;">When a disk's turn comes around and it is full,
+                it is wiped and reformatted so the ring starts a fresh chain, instead of blocking for a
+                replacement disk. <strong>This permanently erases everything stored on that disk.</strong></p>
         </div>
         <div class="modal-actions">
             <button class="btn btn-primary" id="group-modal-ok">Save</button>
@@ -639,7 +653,9 @@ function groupView(group) {
             <strong>${group.name}</strong>
             ${group.needs_disk ? '<span class="status-faulted">needs a disk</span>' : ''}
             ${group.enabled ? '' : '<span class="status-unknown">disabled</span>'}
-            <span class="text-muted">${group.dataset_count} dataset${group.dataset_count === 1 ? '' : 's'} · ${group.set_count} set${group.set_count === 1 ? '' : 's'}</span>
+            <span class="text-muted">${group.dataset_count} dataset${group.dataset_count === 1 ? '' : 's'} · ${group.set_count} set${group.set_count === 1 ? '' : 's'}
+                ${(group.copies || 1) > 1 ? ` · <strong>${group.copies} copies</strong>` : ''}
+                ${group.recycle_full_disks ? ' · <strong>recycle full disks</strong>' : ''}</span>
             <span class="text-muted" title="Full / incremental cron">${cron}</span>
             <span style="flex:1"></span>
             <button class="btn btn-primary btn-sm" title="Back up every dataset in this group now"
@@ -791,6 +807,8 @@ async function openGroupModal(groupId) {
     document.getElementById('group-full-cron').value = group ? (group.full_cron || '') : '';
     document.getElementById('group-incr-cron').value = group ? (group.incremental_cron || '') : '';
     document.getElementById('group-enabled').checked = group ? group.enabled : true;
+    document.getElementById('group-copies').value = group ? (group.copies || 1) : 1;
+    document.getElementById('group-recycle').checked = group ? !!group.recycle_full_disks : false;
     renderGroupDatasets(selected, backupDatasets.length ? null : 'Loading datasets...');
     document.getElementById('group-modal').style.display = 'flex';
 
@@ -819,6 +837,8 @@ document.getElementById('group-modal-ok').addEventListener('click', async functi
         full_cron: document.getElementById('group-full-cron').value.trim() || null,
         incremental_cron: document.getElementById('group-incr-cron').value.trim() || null,
         enabled: document.getElementById('group-enabled').checked,
+        copies: parseInt(document.getElementById('group-copies').value, 10) || 1,
+        recycle_full_disks: document.getElementById('group-recycle').checked,
     };
     try {
         if (editingGroupId) {
@@ -826,6 +846,7 @@ document.getElementById('group-modal-ok').addEventListener('click', async functi
             await api.updateBackupGroup(editingGroupId, {
                 name: payload.name, full_cron: payload.full_cron,
                 incremental_cron: payload.incremental_cron, enabled: payload.enabled,
+                copies: payload.copies, recycle_full_disks: payload.recycle_full_disks,
             });
             const current = backupGroups.find(g => g.id === editingGroupId);
             for (const name of current.datasets.filter(d => !datasets.includes(d))) {

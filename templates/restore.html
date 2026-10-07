@@ -334,7 +334,8 @@ function renderBackupSets() {
             <tbody>
                 ${backupSets.map(s => `
                     <tr>
-                        <td><strong>${escapeHtml(s.label || 'Set ' + s.set_id)}</strong><br>
+                        <td><strong>${escapeHtml(s.label || 'Set ' + s.set_id)}</strong>
+                            ${s.is_latest ? '<span class="badge badge-active">latest</span>' : ''}<br>
                             <small class="text-muted">${escapeHtml(s.set_id)}</small></td>
                         <td>${s.volume_count || 1}${s.volume_count > 1 ? '<br><small class="text-muted">all needed</small>' : ''}</td>
                         <td>${(s.pool_names || []).map(escapeHtml).join(', ') || '—'}</td>

@@ -9,7 +9,7 @@ Hot tip: everything you need was created during normal operation.
 
 - **Configuration bundles** — stored on every backup volume (database + host
   config + pool/partition exports).
-- **Data backups** — gzip'd, checksummed ZFS streams on your external backup
+- **Data backups** — compact, checksummed ZFS streams on your external backup
   disks, described by a self-describing manifest.
 - **The pools' disks themselves** — if the pool was created from multiple
   disks that survived (e.g. mirror/RAIDZ), the pool can be imported with all

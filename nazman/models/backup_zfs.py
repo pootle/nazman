@@ -31,6 +31,8 @@ class BackupGroup(Base):
     enabled = Column(Boolean, default=True)
     active_set_id = Column(Integer, nullable=True)  # current set in the cycle
     needs_disk = Column(Boolean, default=False)  # last trigger found no usable disk
+    copies = Column(Integer, default=1)  # sets updated with each session (redundancy)
+    recycle_full_disks = Column(Boolean, default=False)  # wipe a full disk so its chain restarts
     last_session_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

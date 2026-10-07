@@ -42,6 +42,36 @@ def test_migrate_backup_tables_preserves_declared_disk(tmp_path):
     assert "ix_backup_disks_fs_uuid" in indexes
 
 
+def test_migrate_backup_tables_adds_group_rotation_columns(tmp_path):
+    """A pre-install backup_groups table gains copies + recycle_full_disks."""
+    engine = _engine(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE backup_groups ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "name VARCHAR NOT NULL,"
+            "full_cron VARCHAR, incremental_cron VARCHAR,"
+            "enabled BOOLEAN DEFAULT 1, active_set_id INTEGER,"
+            "needs_disk BOOLEAN DEFAULT 0,"
+            "last_session_at DATETIME, created_at DATETIME, updated_at DATETIME)"
+        ))
+        conn.execute(text("INSERT INTO backup_groups (name) VALUES ('Weekly')"))
+
+    engine2 = _engine(tmp_path)
+    with engine2.connect() as conn:
+        migrate_backup_tables(engine2, conn)
+        cols = {c["name"] for c in inspect(engine2).get_columns("backup_groups")}
+        row = conn.execute(
+            text("SELECT name, copies, recycle_full_disks FROM backup_groups")
+        ).fetchone()
+
+    assert {"copies", "recycle_full_disks"} <= cols
+    assert row is not None
+    assert row.name == "Weekly"
+    assert row.copies == 1
+    assert row.recycle_full_disks == 0
+
+
 def test_migrate_backup_tables_adds_phase_to_backup_runs(tmp_path):
     engine = _engine(tmp_path)
     with engine.begin() as conn:

@@ -55,9 +55,15 @@ def _is_under(child: Path, parent: Path) -> bool:
 class ZfsBackupManager:
     """Backup ZFS datasets to a declared, formatted disk.
 
-    Backups are ZFS snapshot streams written to files (gzip -6 compressed):
-      full:  zfs send -R <ds>@backup-<ts> | gzip -6 | tee full-<ts>.zfs.gz | sha256sum
-      incr:  zfs send -R -i <ds>@backup-<prev> <ds>@backup-<ts> | gzip -6 | tee incr-<ts>.zfs.gz | sha256sum
+    Backups are ZFS snapshot streams written to files (compact stream format):
+      full:  zfs send -c -R <ds>@backup-<ts> | tee full-<ts>.zfs.gz | sha256sum
+      incr:  zfs send -c -R -i <ds>@backup-<prev> <ds>@backup-<ts> | tee incr-<ts>.zfs.gz | sha256sum
+
+    ``zfs send -c`` ships each block in whatever form the pool stored it, so
+    data ZFS already compressed (compression=zstd/lz4) travels compressed with
+    no extra pass and no backup-time CPU.  Files keep the legacy ``*.zfs.gz``
+    suffix so paths, manifests and restore tooling stay unchanged; restore
+    detects legacy gzip files by their magic bytes.
 
     This manager owns one dataset's write: mount the disk, resolve the
     incremental anchor, snapshot, check space, send, prune and record the
@@ -997,6 +1003,37 @@ class ZfsBackupManager:
         db.delete(rec)
         db.commit()
 
+    async def recycle_disk(self, db: Session, backup_disk_id: int) -> Dict[str, Any]:
+        """Wipe and reformat a backup disk so its chain restarts.
+
+        Used when a full disk's turn comes around and the group's
+        ``recycle_full_disks`` setting is on: the volume is reformatted with a
+        new filesystem UUID and its stream records are deleted, so the owning
+        set writes a fresh full next time.  The disk keeps its identity
+        (``disks.by_id``), its partition slot, and its place in the set.
+        """
+        rec = db.query(BackupDisk).filter(BackupDisk.id == backup_disk_id).first()
+        if not rec:
+            raise ValidationError("Backup disk not found")
+        dev = self._dev_path(rec)
+        if not dev or not os.path.exists(dev):
+            raise BackupError(
+                f"Backup disk '{rec.label or rec.fs_uuid}' is not connected"
+            )
+        if not await self._unmount_rec(rec):
+            raise BackupError("Could not unmount the backup disk before recycling")
+        await self._run_destructive(["wipefs", "-a", dev], 120, "wipe the backup disk")
+        await self._run_destructive(["mkfs.ext4", "-F", dev], 600, "format the backup disk")
+        fs_uuid = await self._fs_uuid(dev)
+        if not fs_uuid:
+            raise BackupError("Could not read filesystem UUID after recycling")
+        mount_base = await self.get_mount_base()
+        rec.fs_uuid = fs_uuid
+        rec.mount_point = str(mount_base / fs_uuid)
+        db.query(BackupRun).filter(BackupRun.backup_disk_id == rec.id).delete()
+        db.commit()
+        return await self.serialize_now(rec)
+
     @staticmethod
     def _set_of(db: Session, rec: BackupDisk) -> Optional[BackupSet]:
         if not rec.backup_set_id:
@@ -1152,10 +1189,10 @@ class ZfsBackupManager:
             dest_dir.mkdir(parents=True, exist_ok=True)
             if backup_type == "full":
                 file_name = f"full-{self._snap_ts(snap)}.zfs.gz"
-                send_cmd = ["zfs", "send", "-R", snap]
+                send_cmd = ["zfs", "send", "-c", "-R", snap]
             else:
                 file_name = f"incr-{self._snap_ts(snap)}.zfs.gz"
-                send_cmd = ["zfs", "send", "-R", "-i", base_snapshot, snap]
+                send_cmd = ["zfs", "send", "-c", "-R", "-i", base_snapshot, snap]
             stream_file = str(dest_dir / file_name)
 
             if backup_type == "full":
@@ -1185,9 +1222,8 @@ class ZfsBackupManager:
             run.stream_file = stream_file
             db.commit()
 
-            gzip_level = int(self.settings.backup_gzip_level)
             pipeline_task = asyncio.create_task(run_pipeline(
-                [send_cmd, ["gzip", f"-{gzip_level}"], ["tee", stream_file], ["sha256sum"]],
+                [send_cmd, ["tee", stream_file], ["sha256sum"]],
                 timeout=86400, check=False, op="write", category="zfs",
             ))
             # Monitor the stream file while the pipeline writes.
@@ -1461,6 +1497,12 @@ class ZfsBackupManager:
                 **self._set_identity(db, run),
             }
             bm.upsert_dataset_backup(manifest, dataset, run_entry)
+            if run.group_id:
+                grp = db.query(BackupGroup).filter(
+                    BackupGroup.id == run.group_id,
+                ).first()
+                if grp:
+                    manifest["group"] = grp.name
             bm.save_manifest(rec.mount_point, manifest)
             if run.stream_file:
                 bm.write_sidecar(run.stream_file, {
@@ -1582,11 +1624,13 @@ class ZfsBackupManager:
     async def receive_stream(
         self, stream_file: str, target_dataset: str, force: bool = False
     ) -> Dict[str, Any]:
-        """Replay a gzip-compressed ZFS send stream into ``target_dataset``.
+        """Replay a ZFS send stream into ``target_dataset``.
 
-        Owner-agnostic: the caller is responsible for mounting the media and
-        cleaning up idle state, so this also serves restores on a fresh install
-        where no ``BackupDisk`` row exists.
+        Modern streams are ``zfs send -c`` compact streams; legacy files are
+        gzip'd.  The format is detected from the file's magic bytes so both
+        restore cleanly.  Owner-agnostic: the caller is responsible for mounting
+        the media and cleaning up idle state, so this also serves restores on a
+        fresh install where no ``BackupDisk`` row exists.
         """
         validate_dataset_name(target_dataset)
         fp = Path(stream_file)
@@ -1598,8 +1642,18 @@ class ZfsBackupManager:
             receive_cmd.append("-F")
         receive_cmd.append(target_dataset)
 
+        try:
+            with open(fp, "rb") as fh:
+                head = fh.read(2)
+        except OSError as exc:
+            raise BackupError(f"Cannot read stream: {exc}") from exc
+
+        if head == b"\x1f\x8b":
+            source: List[str] = ["gunzip", "-c", str(fp)]
+        else:
+            source = ["cat", str(fp)]
         _, stderr, rc = await run_pipeline(
-            [["gunzip", "-c", str(fp)], receive_cmd],
+            [source, receive_cmd],
             timeout=86400, check=False, op="write", category="zfs",
         )
         if rc != 0:

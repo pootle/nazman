@@ -106,7 +106,7 @@ class BackupGroupService:
     async def create_group(
         self, db: Session, name: str, dataset_names: Optional[List[str]] = None,
         full_cron: Optional[str] = None, incremental_cron: Optional[str] = None,
-        enabled: bool = True,
+        enabled: bool = True, copies: int = 1, recycle_full_disks: bool = False,
     ) -> BackupGroup:
         """Create a backup group and its dataset list.
 
@@ -121,10 +121,13 @@ class BackupGroupService:
         if db.query(BackupGroup).filter(BackupGroup.name == name).first():
             raise ValidationError(f"A backup group named '{name}' already exists")
         self._check_crons(full_cron, incremental_cron)
+        if copies < 1:
+            raise ValidationError("copies must be at least 1")
 
         group = BackupGroup(
             name=name, full_cron=full_cron,
             incremental_cron=incremental_cron, enabled=enabled,
+            copies=copies, recycle_full_disks=recycle_full_disks,
         )
         db.add(group)
         db.commit()
@@ -138,7 +141,8 @@ class BackupGroupService:
     async def update_group(
         self, db: Session, group_id: int, name: Optional[str] = None,
         full_cron: Optional[str] = None, incremental_cron: Optional[str] = None,
-        enabled: Optional[bool] = None,
+        enabled: Optional[bool] = None, copies: Optional[int] = None,
+        recycle_full_disks: Optional[bool] = None,
     ) -> BackupGroup:
         group = self.get_group(db, group_id)
         if name is not None:
@@ -162,6 +166,12 @@ class BackupGroupService:
             group.incremental_cron = incremental_cron or None
         if enabled is not None:
             group.enabled = enabled
+        if copies is not None:
+            if copies < 1:
+                raise ValidationError("copies must be at least 1")
+            group.copies = copies
+        if recycle_full_disks is not None:
+            group.recycle_full_disks = recycle_full_disks
         db.commit()
         await self.sync_scheduled_tasks(db)
         return group
@@ -475,6 +485,8 @@ class BackupGroupService:
             "incremental_cron": group.incremental_cron,
             "enabled": bool(group.enabled),
             "needs_disk": bool(group.needs_disk),
+            "copies": group.copies or 1,
+            "recycle_full_disks": bool(group.recycle_full_disks),
             "active_set_id": group.active_set_id,
             "last_session_at": group.last_session_at,
             "datasets": datasets,
@@ -623,8 +635,8 @@ class BackupGroupService:
     async def _expected_bytes(self, db: Session, run: BackupRun) -> Optional[int]:
         """Compressed-size comparator for a running run's progress bar.
 
-        Prefer the last successful stream of the same dataset and type (already
-        gzip-compressed, so the units match ``size_bytes``).  With no history of
+        Prefer the last successful stream of the same dataset and type (its
+        on-disk stream size matches ``size_bytes``).  With no history of
         that type, scale the capacity estimate by this dataset's observed
         compression ratio.  For a dataset that has never backed up, fall back to
         its live ZFS ``used`` bytes (what a full send mines from).  Returns None
@@ -681,6 +693,40 @@ class BackupGroupService:
         if lock is None:
             lock = self._group_locks[group_id] = asyncio.Lock()
         return lock
+
+    # ── Startup recovery ────────────────────────────────────────────────
+    async def recover_orphaned_backups(self, db: Session) -> None:
+        """Fail backups a previous process left in 'running' state.
+
+        A crash or reboot kills any in-flight session and run, but their rows
+        survive in the database; without this the UI would show a backup that
+        can never finish.  Runs once at app startup, when nothing else can be
+        genuinely running.  Snapshot left by an interrupted send is destroyed,
+        matching the normal failure path.  Terminal rows ('success', 'partial',
+        'failed', 'needs_disk') are never touched.
+        """
+        stale_runs = db.query(BackupRun).filter(BackupRun.status == SESSION_RUNNING).all()
+        if stale_runs:
+            logger.warning("recovering %d orphaned backup run(s)", len(stale_runs))
+            for run in stale_runs:
+                if run.snapshot and self.zfs_backup is not None:
+                    await self.zfs_backup._discard_snapshot(run.snapshot)
+                run.status = SESSION_FAILED
+                run.phase = None
+                run.error = "Interrupted by a restart; the backup did not complete."
+                run.completed_at = datetime.now(timezone.utc)
+            db.commit()
+
+        stale_sessions = db.query(BackupSession).filter(
+            BackupSession.status == SESSION_RUNNING).all()
+        if stale_sessions:
+            logger.warning("recovering %d orphaned backup session(s)", len(stale_sessions))
+            for session in stale_sessions:
+                session.status = SESSION_FAILED
+                session.phase = None
+                session.error = "Interrupted by a restart; the backup did not complete."
+                session.completed_at = datetime.now(timezone.utc)
+            db.commit()
 
     # ── Cron reconciliation ─────────────────────────────────────────────
     async def sync_scheduled_tasks(self, db: Session) -> None:
@@ -795,31 +841,99 @@ class BackupGroupService:
             )
 
         bset = self._active_set(group, sets)
+        target_sets = self._target_sets(group, sets, bset)
         session.backup_set_id = bset.id
         session.phase = "resolving"
         db.commit()
 
+        notes: List[str] = []
+        if len(target_sets) > 1:
+            notes.append(
+                "Backup written to each of these sets: "
+                + ", ".join(self._set_name(s) for s in target_sets)
+            )
+
+        done = skipped = failed = 0
+        total_bytes = 0
+        last_rec: Optional[BackupDisk] = None
+        last_recs: List[BackupDisk] = []
+        for cur in target_sets:
+            out = await self._write_one_set(db, session, group, cur, datasets, notes)
+            done += out["done"]
+            skipped += out["skipped"]
+            failed += out["failed"]
+            total_bytes += out["total_bytes"]
+            if out["last_rec"] is not None:
+                last_rec = out["last_rec"]
+                last_recs.append(last_rec)
+            if out["stopped"]:
+                group.needs_disk = True
+                db.commit()
+                await self._notify_no_disk(group, cur, dataset=out.get("dataset"))
+                return await self._finish(
+                    db, session, SESSION_NEEDS_DISK,
+                    error=out["error"], notes=notes,
+                    done=done, skipped=skipped, failed=failed,
+                    bytes_written=total_bytes, stopped=True,
+                )
+
+        if failed and (done or skipped):
+            status = SESSION_PARTIAL
+        elif failed:
+            status = SESSION_FAILED
+        else:
+            status = SESSION_SUCCESS
+
+        # A successful session rotates the group by the number of sets written
+        # so the next trigger starts after them, wrapping at the end of the cycle.
+        rotated_to = None
+        if status in (SESSION_SUCCESS, SESSION_PARTIAL):
+            now = datetime.now(timezone.utc)
+            for cur in target_sets:
+                cur.last_used_at = now
+            rotated_to = self._rotate(group, sets, bset, steps=len(target_sets))
+            group.needs_disk = False
+            group.last_session_at = now
+            db.commit()
+            for rec in last_recs:
+                await self._capture_config(db, rec)
+
+        result = await self._finish(
+            db, session, status, notes=notes, done=done, skipped=skipped,
+            failed=failed, bytes_written=total_bytes,
+        )
+        await self._notify_finished(group, bset, last_rec, result, rotated_to)
+        return result
+
+    async def _write_one_set(
+        self, db: Session, session: BackupSession, group: BackupGroup,
+        bset: BackupSet, datasets: List[str], notes: List[str],
+    ) -> Dict[str, Any]:
+        """Write every dataset of the group to one set's active disk.
+
+        Returns per-set counters and ``stopped``/``error`` when this set had to
+        block the whole session (its disk unusable, or no disk with room for a
+        dataset and recycling not possible).
+        """
         # The first write to a set starts its chain, so it is always a full of
         # every dataset in the group plus the configuration bundle.
         first_visit = bset.last_used_at is None
         trigger = "full" if first_visit else session.trigger
         rec = await self._active_disk(db, bset)
         if rec is None:
-            group.needs_disk = True
-            db.commit()
-            await self._notify_no_disk(group, bset)
-            return await self._finish(
-                db, session, SESSION_NEEDS_DISK,
-                error=(
+            return {
+                "done": 0, "skipped": 0, "failed": 0, "total_bytes": 0,
+                "stopped": True, "dataset": None, "last_rec": None,
+                "error": (
                     f"No usable disk in backup set {self._set_name(bset)}. "
                     "Add a disk to the set, advance to another set, or plug one in."
                 ),
-            )
+            }
 
-        notes: List[str] = []
         if first_visit and session.trigger == "incremental":
             notes.append(
-                "Backup set not used before, so the first backup of every dataset is a full"
+                f"{self._set_name(bset)}: not used before, so the first backup of "
+                "every dataset is a full"
             )
 
         session.backup_disk_id = rec.id
@@ -829,7 +943,6 @@ class BackupGroupService:
         last_rec = rec
         done = skipped = failed = 0
         total_bytes = 0
-        stopped = False
         for dataset in datasets:
             if self.zfs_backup is not None and not await self.zfs_backup._dataset_exists(dataset):
                 failed += 1
@@ -842,41 +955,50 @@ class BackupGroupService:
 
             session.phase = "sending"
             db.commit()
-            run = self._new_run(db, session, dataset, trigger, rec)
+            run = self._new_run(db, session, dataset, trigger, rec, backup_set_id=bset.id)
             result = await self.zfs_backup.backup_dataset(db, rec, run)
             status = result.get("status")
 
             if status == "needs_space":
                 moved = await self._advance_for_space(db, bset, rec, dataset, result)
+                recycled = False
+                if moved is None and group.recycle_full_disks \
+                        and not self._disk_written_this_session(db, session, rec):
+                    recycled_result = await self._recycle_for_space(
+                        db, rec, run, notes,
+                    )
+                    if recycled_result is not None:
+                        moved = rec
+                        result = recycled_result
+                        status = result.get("status")
+                        recycled = True
                 if moved is None:
-                    group.needs_disk = True
-                    db.commit()
-                    await self._notify_no_disk(group, bset, dataset=result)
-                    await self._finish(
-                        db, session, SESSION_NEEDS_DISK,
-                        error=(
+                    return {
+                        "done": done, "skipped": skipped, "failed": failed + 1,
+                        "total_bytes": total_bytes, "stopped": True, "dataset": dataset,
+                        "last_rec": last_rec,
+                        "error": (
                             f"Backup set {self._set_name(bset)} has no disk with room for "
                             f"{dataset}. Add a disk to the set or move the group to another set."
                         ),
-                        notes=notes, done=done, skipped=skipped, failed=failed + 1,
-                        bytes_written=total_bytes, stopped=True,
+                    }
+                if not recycled:
+                    rec, last_rec = moved, moved
+                    session.backup_disk_id = rec.id
+                    notes.append(
+                        f"Advanced to disk '{rec.label or rec.fs_uuid}' for {dataset}: "
+                        "the previous disk was full"
                     )
-                    stopped = True
-                    break
-                rec, last_rec = moved, moved
-                session.backup_disk_id = rec.id
-                notes.append(
-                    f"Advanced to disk '{rec.label or rec.fs_uuid}' for {dataset}: "
-                    "the previous disk was full"
-                )
-                # Same run, same snapshot: only the target disk changes.
-                run.backup_disk_id = rec.id
-                run.status = "running"
-                run.error = None
-                run.phase = "pending"
-                db.commit()
-                result = await self.zfs_backup.backup_dataset(db, rec, run)
-                status = result.get("status")
+                    # Same run, same snapshot: only the target disk changes.
+                    run.backup_disk_id = rec.id
+                    run.status = "running"
+                    run.error = None
+                    run.phase = "pending"
+                    db.commit()
+                    result = await self.zfs_backup.backup_dataset(db, rec, run)
+                    status = result.get("status")
+                else:
+                    last_rec = rec
 
             if status == "success":
                 done += 1
@@ -892,33 +1014,69 @@ class BackupGroupService:
                 failed += 1
             self._update_progress(db, session, done, skipped, failed, total_bytes)
 
-        if stopped:
-            return {"session_id": session.id, "status": SESSION_NEEDS_DISK}
+        return {
+            "done": done, "skipped": skipped, "failed": failed,
+            "total_bytes": total_bytes, "stopped": False, "dataset": None,
+            "last_rec": last_rec,
+        }
 
-        if failed and (done or skipped):
-            status = SESSION_PARTIAL
-        elif failed:
-            status = SESSION_FAILED
-        else:
-            status = SESSION_SUCCESS
+    async def _recycle_for_space(
+        self, db: Session, rec: BackupDisk, run: BackupRun, notes: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Wipe a full disk in place and re-run the pending dataset against it.
 
-        # A successful session rotates the group so the next trigger starts on
-        # the following set, wrapping at the end of the cycle.
-        rotated_to = None
-        if status in (SESSION_SUCCESS, SESSION_PARTIAL):
-            bset.last_used_at = datetime.now(timezone.utc)
-            rotated_to = self._rotate(group, sets, bset)
-            group.needs_disk = False
-            group.last_session_at = datetime.now(timezone.utc)
-            db.commit()
-            await self._capture_config(db, last_rec)
-
-        result = await self._finish(
-            db, session, status, notes=notes, done=done, skipped=skipped,
-            failed=failed, bytes_written=total_bytes,
+        Returns the new ``backup_dataset`` result, or None when recycling could
+        not proceed (offline disk, format error, still no room).  The disk keeps
+        its slot in the set; all of its prior stream records are deleted, so the
+        rewritten dataset starts a fresh full chain.
+        """
+        try:
+            if self.zfs_backup is not None:
+                await self.zfs_backup.recycle_disk(db, rec.id)
+        except Exception as e:
+            logger.warning("recycle of backup disk %s failed: %s", rec.id, e)
+            return None
+        notes.append(
+            f"Disk '{rec.label or rec.fs_uuid}' was full and has been recycled "
+            "(wiped and reformatted); its chain restarts as fulls"
         )
-        await self._notify_finished(group, bset, last_rec, result, rotated_to)
-        return result
+        run.backup_disk_id = rec.id
+        run.status = "running"
+        run.error = None
+        run.phase = "pending"
+        db.commit()
+        new_result = await self.zfs_backup.backup_dataset(db, rec, run)
+        if new_result.get("status") == "needs_space":
+            return None
+        return new_result
+
+    @staticmethod
+    def _disk_written_this_session(
+        db: Session, session: BackupSession, rec: BackupDisk,
+    ) -> bool:
+        """True when this session already stored a stream on ``rec``.
+
+        Recycling destroys everything already on the disk, so it is only allowed
+        before the session has written to it - otherwise the freshly written
+        datasets would be wiped mid-session.
+        """
+        return db.query(BackupRun).filter(
+            BackupRun.session_id == session.id,
+            BackupRun.backup_disk_id == rec.id,
+            BackupRun.status == "success",
+        ).count() > 0
+
+    def _target_sets(
+        self, group: BackupGroup, sets: List[BackupSet], active: BackupSet,
+    ) -> List[BackupSet]:
+        """The ``copies`` consecutive sets (from ``active``) this session targets."""
+        copies = max(1, min(group.copies or 1, len(sets)))
+        order = [s for s in sets]
+        try:
+            start = order.index(active)
+        except ValueError:
+            start = 0
+        return [order[(start + i) % len(order)] for i in range(copies)]
 
     # -- session helpers --------------------------------------------------
     def _active_set(self, group: BackupGroup, sets: List[BackupSet]) -> BackupSet:
@@ -928,12 +1086,16 @@ class BackupGroupService:
         group.active_set_id = sets[0].id
         return sets[0]
 
-    def _rotate(self, group: BackupGroup, sets: List[BackupSet], current: BackupSet) -> Optional[int]:
-        """Move the group to the set after ``current``, wrapping the cycle."""
+    def _rotate(
+        self, group: BackupGroup, sets: List[BackupSet], current: BackupSet,
+        steps: int = 1,
+    ) -> Optional[int]:
+        """Move the group ``steps`` sets past ``current``, wrapping the cycle."""
         order = [s.id for s in sets]
         if current.id not in order:
             return None
-        nxt = order[(order.index(current.id) + 1) % len(order)]
+        steps = (steps or 1) % len(order)
+        nxt = order[(order.index(current.id) + steps) % len(order)]
         group.active_set_id = nxt
         return nxt
 
@@ -1002,10 +1164,11 @@ class BackupGroupService:
     def _new_run(
         self, db: Session, session: BackupSession, dataset: str,
         backup_type: str, rec: BackupDisk,
+        backup_set_id: Optional[int] = None,
     ) -> BackupRun:
         run = BackupRun(
             session_id=session.id, group_id=session.group_id,
-            backup_set_id=session.backup_set_id, dataset_name=dataset,
+            backup_set_id=backup_set_id or session.backup_set_id, dataset_name=dataset,
             backup_disk_id=rec.id, backup_type=backup_type,
             status="running", phase="pending",
         )

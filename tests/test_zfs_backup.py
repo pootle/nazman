@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import json
 import os
@@ -186,6 +187,7 @@ async def test_group_full_session_writes_successful_runs(db_session, tmp_path, m
     assert run_entry["sha256"] == run.sha256
     assert run_entry["set_id"] == sets[0].id
     assert run_entry["group_id"] == group.id
+    assert manifest["group"] == "Weekly"
 
 
 def _cmd_vol(cmd, disks):
@@ -1395,6 +1397,66 @@ async def test_api_restore_run_ok(client, db_session, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recover_orphaned_backups_fails_stale_running_rows(db_session, tmp_path):
+    """Startup recovery fails rows a dead process left 'running'."""
+    group, sets, disks = _mk_group(db_session, tmp_path, disk_count=1)
+
+    stale_session = BackupSession(
+        group_id=group.id, backup_set_id=sets[0].id, backup_disk_id=disks[0].id,
+        trigger="full", status="running", phase="sending")
+    db_session.add(stale_session)
+    db_session.flush()
+    run = BackupRun(
+        session_id=stale_session.id, group_id=group.id,
+        backup_set_id=sets[0].id, backup_disk_id=disks[0].id,
+        dataset_name="tank/media", backup_type="full",
+        status="running", phase="sending", snapshot="tank/media@backup-orphan")
+    db_session.add(run)
+    # Terminal and non-runnable rows must never be touched.
+    ok_session = BackupSession(
+        group_id=group.id, backup_set_id=sets[0].id, backup_disk_id=disks[0].id,
+        trigger="incremental", status="success", phase=None)
+    wait_session = BackupSession(
+        group_id=group.id, backup_set_id=sets[0].id, backup_disk_id=disks[0].id,
+        trigger="full", status="needs_disk", phase=None)
+    db_session.add_all([ok_session, wait_session])
+    db_session.commit()
+
+    with patch.object(ZfsBackupManager, "_discard_snapshot", new=AsyncMock()) as discard:
+        await backup_groups.recover_orphaned_backups(db_session)
+
+    stale = db_session.get(BackupSession, stale_session.id)
+    assert stale.status == "failed"
+    assert stale.phase is None
+    assert "restart" in stale.error
+    assert stale.completed_at is not None
+    run_row = db_session.get(BackupRun, run.id)
+    assert run_row.status == "failed"
+    assert run_row.phase is None
+    assert run_row.completed_at is not None
+    discard.assert_awaited_once_with("tank/media@backup-orphan")
+    assert db_session.get(BackupSession, ok_session.id).status == "success"
+    assert db_session.get(BackupSession, wait_session.id).status == "needs_disk"
+
+
+@pytest.mark.asyncio
+async def test_recover_orphaned_backups_is_noop_when_nothing_running(db_session, tmp_path):
+    """No running rows means no writes, no snapshot destroy calls."""
+    group, sets, disks = _mk_group(db_session, tmp_path, disk_count=1)
+    session = BackupSession(
+        group_id=group.id, backup_set_id=sets[0].id, backup_disk_id=disks[0].id,
+        trigger="full", status="failed", phase=None)
+    db_session.add(session)
+    db_session.commit()
+
+    with patch.object(ZfsBackupManager, "_discard_snapshot", new=AsyncMock()) as discard:
+        await backup_groups.recover_orphaned_backups(db_session)
+
+    assert db_session.get(BackupSession, session.id).status == "failed"
+    assert discard.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_sync_scheduled_tasks_creates_group_backup_tasks(db_session, tmp_path):
     """A group with both crons gets one ZFS_BACKUP job per cron."""
     from nazman.models.scheduler import ScheduledTask, TaskType
@@ -1634,10 +1696,37 @@ async def test_restore_dataset_mounts_owner_and_restores_idle(db_session, tmp_pa
 
     fp = tmp_path / "data" / "tank" / "full-20260901-000000.zfs.gz"
     os.makedirs(fp.parent, exist_ok=True)
-    fp.write_text("STREAMSIM")
+    fp.write_bytes(gzip.compress(b"STREAMSIM"))
 
     async def fake_pipeline(stages, **kwargs):
         assert stages[0][:2] == ["gunzip", "-c"]
+        assert stages[1][:2] == ["zfs", "receive"]
+        return ("", "", 0)
+
+    with patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipeline), \
+         patch.object(ZfsBackupManager, "mount_backup_disk", new=AsyncMock()) as mnt, \
+         patch.object(zfs_backup_manager, "_restore_idle_state", new=AsyncMock()) as idle:
+        res = await zfs_backup_manager.restore_dataset(db_session, str(fp), "tank/media")
+
+    assert res["dataset"] == "tank/media"
+    assert mnt.await_count == 1
+    assert idle.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_restore_dataset_replays_raw_compact_stream(db_session, tmp_path):
+    bd = BackupDisk(disk_id=998, mount_point=str(tmp_path), fs_uuid="DDD",
+                    unmount_after_backup=True)
+    db_session.add(bd)
+    db_session.commit()
+
+    fp = tmp_path / "data" / "tank" / "full-20260901-010000.zfs.gz"
+    # Newer streams are zfs send -c compact streams: raw zfs data, not gzip.
+    os.makedirs(fp.parent, exist_ok=True)
+    fp.write_bytes(b"not-gzip zfs send stream data")
+
+    async def fake_pipeline(stages, **kwargs):
+        assert stages[0][:2] == ["cat", str(fp)]
         assert stages[1][:2] == ["zfs", "receive"]
         return ("", "", 0)
 
@@ -2198,8 +2287,225 @@ async def test_group_incremental_uses_prior_set_anchor(db_session, tmp_path, mon
     assert run.base_snapshot == anchor
     assert len(sends) == 1
     send = sends[0]
-    assert send[:3] == ["zfs", "send", "-R"]
+    assert send[:4] == ["zfs", "send", "-c", "-R"]
     # -i must reference the pre-existing anchor, not the freshly created one.
     base_arg = send[send.index("-i") + 1]
     assert base_arg == anchor
     assert send[-1] != anchor
+
+
+@pytest.mark.asyncio
+async def test_group_copies_writes_every_dataset_to_several_sets_and_rotates_by_copies(
+    db_session, tmp_path, monkeypatch,
+):
+    group, sets, disks = _mk_group(db_session, tmp_path, disk_count=3, positions=3)
+    group.copies = 2
+    db_session.commit()
+    monkeypatch.setattr(Path, "is_mount", lambda self: True)
+
+    fake_zfs, fake_pipe = _stream_fakes()
+    with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_zfs), \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_zfs), \
+         patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipe), \
+         patch("nazman.managers.zfs_backup_manager.run_command", new=AsyncMock()), \
+         patch("os.path.exists", return_value=True), \
+         patch.object(ZfsBackupManager, "_fs_uuid", new=AsyncMock(return_value="AAA")), \
+         patch.object(ZfsBackupManager, "_dataset_exists", new=AsyncMock(return_value=True)), \
+         patch.object(ZfsBackupManager, "_record_manifest", new=AsyncMock()):
+        session = await backup_groups.start_session(db_session, group.id, "full")
+        result = await backup_groups.run_session(db_session, session.id)
+
+    assert result["status"] == "success"
+    runs = db_session.query(BackupRun).order_by(BackupRun.id).all()
+    assert sorted({r.backup_set_id for r in runs}) == sorted([sets[0].id, sets[1].id])
+    # Each targeted set keeps its own disk, so the copies do not share media.
+    assert {r.backup_disk_id for r in runs} == {disks[0].id, disks[1].id}
+    assert db_session.get(BackupGroup, group.id).active_set_id == sets[2].id
+    assert db_session.get(BackupSet, sets[0].id).last_used_at is not None
+    assert db_session.get(BackupSet, sets[1].id).last_used_at is not None
+    assert db_session.get(BackupSet, sets[2].id).last_used_at is None
+
+
+@pytest.mark.asyncio
+async def test_group_copies_are_capped_at_set_count(db_session, tmp_path, monkeypatch):
+    group, sets, disks = _mk_group(db_session, tmp_path, disk_count=2, positions=2)
+    group.copies = 5
+    db_session.commit()
+    monkeypatch.setattr(Path, "is_mount", lambda self: True)
+
+    fake_zfs, fake_pipe = _stream_fakes()
+    with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_zfs), \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_zfs), \
+         patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipe), \
+         patch("nazman.managers.zfs_backup_manager.run_command", new=AsyncMock()), \
+         patch("os.path.exists", return_value=True), \
+         patch.object(ZfsBackupManager, "_fs_uuid", new=AsyncMock(return_value="AAA")), \
+         patch.object(ZfsBackupManager, "_dataset_exists", new=AsyncMock(return_value=True)), \
+         patch.object(ZfsBackupManager, "_record_manifest", new=AsyncMock()):
+        session = await backup_groups.start_session(db_session, group.id, "full")
+        result = await backup_groups.run_session(db_session, session.id)
+
+    assert result["status"] == "success"
+    runs = db_session.query(BackupRun).order_by(BackupRun.id).all()
+    assert {r.backup_set_id for r in runs} == {sets[0].id, sets[1].id}
+    # copies == len(sets): every set is written, so nothing rotates.
+    assert db_session.get(BackupGroup, group.id).active_set_id == sets[0].id
+
+
+@pytest.mark.asyncio
+async def test_group_recycles_full_disk_when_enabled(db_session, tmp_path, monkeypatch):
+    group, sets, disks = _mk_group(db_session, tmp_path, disk_count=1)
+    group.recycle_full_disks = True
+    db_session.commit()
+    monkeypatch.setattr(Path, "is_mount", lambda self: True)
+
+    class FakeStatvfs:
+        f_frsize = 1
+        tries = 0
+
+        def __init__(self):
+            self.f_bavail = 0
+
+        def __call__(self, path):
+            FakeStatvfs.tries += 1
+            if FakeStatvfs.tries == 1:
+                self.f_bavail = 0  # the full disk blocks the first attempt...
+            else:
+                self.f_bavail = 10 << 30  # ...but room is available once recycled
+            return self
+
+    async def fake_run_zfs(*args, **kwargs):
+        cmd = list(args)
+        if cmd and cmd[0] == "list":
+            if "-t" in cmd and "snapshot" in cmd:
+                return ("", "", 0)
+            return ("tank/media", "", 0)
+        return ("", "", 0)
+
+    async def fake_pipeline(stages, stdout_path=None, **kwargs):
+        return _fake_write(stages, stdout_path)
+
+    recycled = []
+    async def fake_recycle(self, db, backup_disk_id):
+        recycled.append(backup_disk_id)
+        return {"id": backup_disk_id}
+
+    with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_run_zfs), \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
+         patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipeline), \
+         patch("nazman.managers.zfs_backup_manager.run_command", new=AsyncMock()), \
+         patch("nazman.managers.zfs_backup_manager.os.statvfs", new=FakeStatvfs()), \
+         patch("os.path.exists", return_value=True), \
+         patch.object(ZfsBackupManager, "_fs_uuid", new=AsyncMock(return_value="AAA")), \
+         patch.object(ZfsBackupManager, "_dataset_exists", new=AsyncMock(return_value=True)), \
+         patch.object(ZfsBackupManager, "mount_backup_disk", new=AsyncMock()), \
+         patch.object(ZfsBackupManager, "estimate_needed", new=AsyncMock(return_value=1 << 20)), \
+         patch.object(ZfsBackupManager, "recycle_disk", new=fake_recycle), \
+         patch.object(ZfsBackupManager, "_record_manifest", new=AsyncMock()):
+        session = await backup_groups.start_session(db_session, group.id, "full")
+        result = await backup_groups.run_session(db_session, session.id)
+
+    assert result["status"] == "success"
+    assert recycled == [disks[0].id]
+    assert db_session.get(BackupGroup, group.id).needs_disk is False
+    session_row = db_session.get(BackupSession, session.id)
+    assert "recycled" in (session_row.notes or "")
+    run = db_session.query(BackupRun).order_by(BackupRun.id.desc()).first()
+    assert run.status == "success"
+    assert run.backup_disk_id == disks[0].id
+
+
+@pytest.mark.asyncio
+async def test_group_will_not_recycle_a_disk_written_this_session(
+    db_session, tmp_path, monkeypatch,
+):
+    """Recycling must not destroy data written moments ago by the same session."""
+    group, sets, disks = _mk_group(
+        db_session, tmp_path, disk_count=1, datasets=("tank/media", "tank/docs"),
+    )
+    group.recycle_full_disks = True
+    db_session.commit()
+    monkeypatch.setattr(Path, "is_mount", lambda self: True)
+
+    async def fake_run_zfs(*args, **kwargs):
+        cmd = list(args)
+        if cmd and cmd[0] == "list":
+            if "-t" in cmd and "snapshot" in cmd:
+                return ("", "", 0)
+            return ("tank/media", "", 0)
+        return ("", "", 0)
+
+    async def fake_pipeline(stages, stdout_path=None, **kwargs):
+        return _fake_write(stages, stdout_path)
+
+    real = ZfsBackupManager.backup_dataset
+    recycled = []
+
+    async def fake_recycle(self, db, backup_disk_id):
+        recycled.append(backup_disk_id)
+        return {"id": backup_disk_id}
+
+    async def spy(self, db, rec, run):
+        if run.dataset_name == "tank/docs":
+            return {"status": "needs_space", "needed_bytes": 1 << 20}
+        return await real(self, db, rec, run)
+
+    with patch("nazman.managers.zfs_backup_manager.run_zfs", side_effect=fake_run_zfs), \
+            patch("nazman.utils.zfs_query.run_zfs", side_effect=fake_run_zfs), \
+         patch("nazman.managers.zfs_backup_manager.run_pipeline", side_effect=fake_pipeline), \
+         patch("nazman.managers.zfs_backup_manager.run_command", new=AsyncMock()), \
+         patch("os.path.exists", return_value=True), \
+         patch.object(ZfsBackupManager, "_fs_uuid", new=AsyncMock(return_value="AAA")), \
+         patch.object(ZfsBackupManager, "_dataset_exists", new=AsyncMock(return_value=True)), \
+         patch.object(ZfsBackupManager, "mount_backup_disk", new=AsyncMock()), \
+         patch.object(ZfsBackupManager, "estimate_needed", new=AsyncMock(return_value=1 << 20)), \
+         patch.object(ZfsBackupManager, "recycle_disk", new=fake_recycle), \
+         patch.object(ZfsBackupManager, "backup_dataset", new=spy), \
+         patch.object(BackupGroupService, "_notify", new=AsyncMock()):
+        session = await backup_groups.start_session(db_session, group.id, "full")
+        result = await backup_groups.run_session(db_session, session.id)
+
+    assert result["status"] == "needs_disk"
+    assert recycled == []
+    session_row = db_session.get(BackupSession, session.id)
+    assert not (session_row.notes or "").startswith("Disk '")
+    # The dataset that did fit is not thrown away by a mid-session wipe.
+    wrote = db_session.query(BackupRun).filter_by(dataset_name="tank/media").first()
+    assert wrote is not None and wrote.status == "success"
+    assert wrote.backup_disk_id == disks[0].id
+
+
+@pytest.mark.asyncio
+async def test_recycle_disk_wipes_reformats_and_clears_runs(db_session, tmp_path, monkeypatch):
+    group, sets, disks = _mk_group(db_session, tmp_path, disk_count=1)
+    monkeypatch.setattr(zfs_backup_manager.settings, "backup_mount_base", str(tmp_path))
+    run = BackupRun(
+        session_id=1, group_id=group.id, backup_set_id=sets[0].id,
+        dataset_name="tank/media", backup_disk_id=disks[0].id,
+        backup_type="full", status="success", snapshot="tank/media@backup-1",
+    )
+    db_session.add(run)
+    db_session.commit()
+
+    cmds = []
+
+    async def fake_run_command(cmd, **kwargs):
+        cmds.append(cmd)
+        return ("", "", 0)
+
+    with patch("nazman.managers.zfs_backup_manager.run_command", side_effect=fake_run_command), \
+         patch.object(zfs_backup_manager, "_dev_path",
+                      return_value="/dev/disk/by-id/ata-X-part1"), \
+         patch.object(zfs_backup_manager, "_unmount_rec", new=AsyncMock(return_value=True)), \
+         patch.object(zfs_backup_manager, "_fs_uuid", new=AsyncMock(return_value="NEWFS")), \
+         patch("os.path.exists", return_value=True):
+        rec = await zfs_backup_manager.recycle_disk(db_session, disks[0].id)
+
+    assert ("wipefs", "-a", "/dev/disk/by-id/ata-X-part1") in [tuple(c) for c in cmds]
+    assert ("mkfs.ext4", "-F", "/dev/disk/by-id/ata-X-part1") in [tuple(c) for c in cmds]
+    row = db_session.get(BackupDisk, disks[0].id)
+    assert row.fs_uuid == "NEWFS"
+    assert row.mount_point == str(tmp_path / "NEWFS")
+    assert db_session.query(BackupRun).filter_by(backup_disk_id=disks[0].id).count() == 0
+    assert db_session.get(BackupDisk, disks[0].id).backup_set_id == sets[0].id
+    assert rec["fs_uuid"] == "NEWFS"

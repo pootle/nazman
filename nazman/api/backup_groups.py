@@ -32,6 +32,8 @@ class CreateGroupRequest(BaseModel):
     full_cron: Optional[str] = None
     incremental_cron: Optional[str] = None
     enabled: bool = True
+    copies: int = Field(default=1, ge=1)
+    recycle_full_disks: bool = False
 
 
 class UpdateGroupRequest(BaseModel):
@@ -39,6 +41,8 @@ class UpdateGroupRequest(BaseModel):
     full_cron: Optional[str] = None
     incremental_cron: Optional[str] = None
     enabled: Optional[bool] = None
+    copies: Optional[int] = Field(default=None, ge=1)
+    recycle_full_disks: Optional[bool] = None
 
 
 class CreateSetRequest(BaseModel):
@@ -85,7 +89,8 @@ async def create_group(
         group = await svc.create_group(
             db, body.name, body.datasets,
             full_cron=body.full_cron, incremental_cron=body.incremental_cron,
-            enabled=body.enabled,
+            enabled=body.enabled, copies=body.copies,
+            recycle_full_disks=body.recycle_full_disks,
         )
         return await svc.describe_group(db, group.id)
     except Exception as e:
@@ -115,6 +120,7 @@ async def update_group(
         await svc.update_group(
             db, group_id, name=body.name, full_cron=body.full_cron,
             incremental_cron=body.incremental_cron, enabled=body.enabled,
+            copies=body.copies, recycle_full_disks=body.recycle_full_disks,
         )
         return await svc.describe_group(db, group_id)
     except Exception as e:

@@ -200,4 +200,25 @@ or an offline disk is blocking it — plug in a disk, or add a set with room.
 You can force the move early with **Disk full — next** on a set, which is the
 same as clicking **Use** on the following disk.
 
+### Copies (redundancy)
+
+A group's **Copies** setting (default 1 = the normal rotating ring) writes each
+backup to that many consecutive sets instead of one. With two sets it keeps two
+full copies; with the setting equal to the number of sets, every disk receives
+every backup. Each targeted set keeps its own independent chain (the snapshot is
+sent once per disk), so it costs that many times as much CPU and disk to stream.
+
+### Recycling full disks
+
+With **Recycle full disks** enabled, a full disk's turn does not block the group:
+NAZMan wipes and reformats the disk, then restarts its chain with a fresh full
+backup. This frees you from rotating the media, but it **permanently erases
+everything stored on that disk** — the current backup and the entire older
+chain. Leave that disk unplugged if you still need it as a restore source.
+Disable the setting and the group blocks with **needs a disk** instead, as
+described above.
+
+The **Restore** page's backup-sets menu marks the disk(s) holding the newest
+backup of each group with a **latest** badge.
+
 Next: [Restore & Rebuild](restore)

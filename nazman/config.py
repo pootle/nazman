@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     
     # Backup
     backup_mount_base: str = "/mnt/backup"  # parent dir under which backup disks are mounted
-    backup_gzip_level: int = 1
     backup_full_margin: float = 1.2  # capacity safety margin multiplier for full backups
     backup_config_retention: int = 5  # config bundles kept per backup volume
     
