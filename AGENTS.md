@@ -15,6 +15,24 @@ HTML/CSS/JS served via Jinja2, storage is SQLite (WAL mode).
 
 Work on `dev`; only merge production changes into `main`.
 
+### Releasing to main
+
+`main` must stay lean (no `tests/`, `Makefile`, `dev-env.sh`, `dev-live.sh`,
+`.github/`, `.opencode/`, `opencode.json`, `.env.example`, `pytest.ini`,
+`AGENTS.md`). To release:
+
+1. Merge `main` into `dev` first so the branches converge. If conflicts arise,
+   resolve to `dev`'s side — dev is normally a strict superset (auth, install
+   tooling and Pi fixes already live there).
+2. `git checkout main && git merge --no-ff dev` to release.
+3. Prune the dev tooling from `main`: `git rm -r --ignore-unmatch tests
+   Makefile dev-env.sh dev-live.sh .github .opencode opencode.json .env.example
+   pytest.ini AGENTS.md`, commit the prune, push.
+
+Keep `deploy.txt` and `requirements.txt` identical across branches to avoid
+future merge noise (the prune relies on `deploy.sh` deleting files listed in
+the manifest that are absent from the tree).
+
 ## Commands
 
 ```bash
