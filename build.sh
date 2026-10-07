@@ -65,18 +65,31 @@ echo ""
 install_nfs="n"
 install_smb="n"
 
-if [[ -t 0 ]]; then
-    echo "NFS exports are served by the nfs-kernel-server package."
-    read -r -p "Install NFS server (nfs-kernel-server)? [y/N]: " _n
-    [[ "$_n" =~ ^[Yy]$ ]] && install_nfs="y"
+# A package once installed is skipped on re-runs: nothing to prompt for.
+pkg_installed() {
+    dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii'
+}
 
-    echo "SMB shares are served by the samba package."
-    read -r -p "Install Samba (samba)? [y/N]: " _s
-    [[ "$_s" =~ ^[Yy]$ ]] && install_smb="y"
+if pkg_installed nfs-kernel-server; then
+    echo "NFS server (nfs-kernel-server) is already installed."
 else
-    echo "Non-interactive shell: skipping install prompts. You can install later with:"
-    echo "  sudo apt-get install -y nfs-kernel-server   (NFS)"
-    echo "  sudo apt-get install -y samba               (SMB)"
+    if [[ -t 0 ]]; then
+        read -r -p "Install NFS server (nfs-kernel-server)? [y/N]: " _n
+        [[ "$_n" =~ ^[Yy]$ ]] && install_nfs="y"
+    else
+        echo "NFS server not installed; skipping (install later with: sudo apt-get install -y nfs-kernel-server)."
+    fi
+fi
+
+if pkg_installed samba; then
+    echo "Samba is already installed."
+else
+    if [[ -t 0 ]]; then
+        read -r -p "Install Samba (samba)? [y/N]: " _s
+        [[ "$_s" =~ ^[Yy]$ ]] && install_smb="y"
+    else
+        echo "Samba not installed; skipping (install later with: sudo apt-get install -y samba)."
+    fi
 fi
 
 if [[ "$install_nfs" == "y" || "$install_smb" == "y" ]]; then
