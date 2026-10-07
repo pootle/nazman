@@ -242,9 +242,12 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Systemd hardening
+# Systemd hardening. ProtectSystem=full (not strict): pool management mounts
+# datasets at arbitrary paths under / (e.g. /fast), and strict makes / read-only
+# so zpool create cannot create those mount points. /usr /boot /etc stay
+# read-only; config dirs are re-opened below.
 NoNewPrivileges=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
