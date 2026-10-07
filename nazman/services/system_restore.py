@@ -529,7 +529,7 @@ class SystemRestoreService:
         """Recreate a pool from an operator-confirmed vdev/device mapping."""
         if self.zfs is None:
             raise BackupError("ZFS manager unavailable")
-        existing = await self.zfs.list_pool_names(db)
+        existing = self.zfs.list_pool_names(db)
         if pool_name in existing:
             raise ValidationError(f"Pool '{pool_name}' already exists")
         for vdev in vdevs:
@@ -554,7 +554,7 @@ class SystemRestoreService:
         manifest = await self._manifest_for(db, set_id)
         volumes = manifest.get("_volumes") or []
         connected = {v["volume_id"] for v in volumes}
-        pools = await self.zfs.list_pool_names(db) if self.zfs is not None else []
+        pools = self.zfs.list_pool_names(db) if self.zfs is not None else []
         plan = []
         for ds in manifest.get("datasets", []):
             backups = ds.get("backups") or []

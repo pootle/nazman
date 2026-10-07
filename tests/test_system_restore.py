@@ -193,7 +193,7 @@ async def test_attached_disks_excludes_media_and_pool_members(db_session, monkey
 @pytest.mark.asyncio
 async def test_restore_plan_defaults_enabled_with_matching_pool(db_session):
     zfs = MagicMock()
-    zfs.list_pool_names = AsyncMock(return_value=["tank"])
+    zfs.list_pool_names = MagicMock(return_value=["tank"])
     service = SystemRestoreService(zfs=zfs)
     service._manifest_for = AsyncMock(return_value={
         "datasets": [{
@@ -323,7 +323,7 @@ async def test_restore_datasets_media_filter_skips_other_media(db_session, tmp_p
 @pytest.mark.asyncio
 async def test_create_pool_from_backup_rejects_existing(db_session):
     zfs = MagicMock()
-    zfs.list_pool_names = AsyncMock(return_value=["tank"])
+    zfs.list_pool_names = MagicMock(return_value=["tank"])
     service = SystemRestoreService(zfs=zfs)
     with pytest.raises(ValidationError):
         await service.create_pool_from_backup(
@@ -335,7 +335,7 @@ async def test_create_pool_from_backup_rejects_existing(db_session):
 @pytest.mark.asyncio
 async def test_create_pool_from_backup_calls_zfs(db_session):
     zfs = MagicMock()
-    zfs.list_pool_names = AsyncMock(return_value=[])
+    zfs.list_pool_names = MagicMock(return_value=[])
     zfs.create_pool = AsyncMock(return_value={"name": "tank"})
     service = SystemRestoreService(zfs=zfs)
     vdevs = [{"role": "data", "topology": "stripe", "devices": [{"disk_id": 1, "slot_uuid": None}]}]
@@ -585,7 +585,7 @@ async def test_restore_datasets_reports_a_stream_whose_volume_is_absent(db_sessi
 @pytest.mark.asyncio
 async def test_restore_plan_flags_a_chain_that_spans_volumes(db_session):
     service = SystemRestoreService(zfs=MagicMock())
-    service.zfs.list_pool_names = AsyncMock(return_value=["tank"])
+    service.zfs.list_pool_names = MagicMock(return_value=["tank"])
     service._manifest_for = AsyncMock(return_value={
         "datasets": [{
             "name": "tank/media", "pool": "tank",
