@@ -44,6 +44,7 @@ nazman/utils/devices.py
 nazman/utils/zfs_query.py
 nazman/utils/backup_manifest.py
 nazman/utils/provisioning.py
+nazman/utils/paths.py
 nazman/utils/telegram.py
 nazman/api/__init__.py
 nazman/api/auth.py

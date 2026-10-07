@@ -297,10 +297,11 @@ async function wipeAndPartitionSelected() {
     const label = names.length === 1 ? names[0] : `${names.length} disks (${names.join(', ')})`;
     if (!confirm(`Wipe and create ${partitions.length} partition(s) on ${label}?`)) return;
 
+    const diskIds = [...selectedDiskIds];
+    hidePartitionModal();
     try {
-        const results = await api.batchPartitionDisks({ disk_ids: selectedDiskIds, partitions });
+        const results = await api.batchPartitionDisks({ disk_ids: diskIds, partitions });
         const failed = results.filter(r => !r.success);
-        hidePartitionModal();
         await loadDisksPage();
         if (failed.length === 0) {
             showAlert(`Partitioned ${names.length} disk(s)`, 'success');
@@ -320,10 +321,11 @@ async function wipeOnlySelected() {
     const label = names.length === 1 ? names[0] : `${names.length} disks (${names.join(', ')})`;
     if (!confirm(`Wipe all partition tables on ${label}? This removes all partitions.`)) return;
 
+    const diskIds = [...selectedDiskIds];
+    hidePartitionModal();
     try {
-        const results = await api.batchWipeDisks({ disk_ids: selectedDiskIds, partitions: [] });
+        const results = await api.batchWipeDisks({ disk_ids: diskIds, partitions: [] });
         const failed = results.filter(r => !r.success);
-        hidePartitionModal();
         await loadDisksPage();
         if (failed.length === 0) {
             showAlert(`Wiped ${names.length} disk(s)`, 'success');

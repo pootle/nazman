@@ -20,6 +20,7 @@ from ..utils.devices import (
 )
 from ..utils import zfs_query
 from ..utils import backup_manifest as bm
+from ..utils.paths import ensure_dir
 from ..models.disk import Disk
 from ..models.backup_zfs import (
     BackupDisk, BackupGroup, BackupRun, BackupSet,
@@ -89,9 +90,7 @@ class ZfsBackupManager:
 
     # ── Backup disk declaration / formatting ─────────────────────────────
     async def get_mount_base(self) -> Path:
-        base = Path(self.settings.backup_mount_base)
-        base.mkdir(parents=True, exist_ok=True)
-        return base
+        return ensure_dir(Path(self.settings.backup_mount_base))
 
     def _dev_path(self, rec: BackupDisk) -> Optional[str]:
         """Derive the partition's by-id path from the physical disk identity.
@@ -398,8 +397,7 @@ class ZfsBackupManager:
             raise BackupError("Could not read filesystem UUID after formatting")
 
         mount_base = await self.get_mount_base()
-        mount_point = str(mount_base / fs_uuid)
-        Path(mount_point).mkdir(parents=True, exist_ok=True)
+        mount_point = str(ensure_dir(mount_base / fs_uuid))
         await run_command(["mount", device_path, mount_point], timeout=60, check=False, op="write", category="disk")
         prev = self._declare_mark(t0, prev, disk_id, "mount")
 
@@ -948,7 +946,7 @@ class ZfsBackupManager:
                 "Filesystem changed: the disk present is not the declared backup "
                 "filesystem (UUID differs). Re-scan or re-declare."
             )
-        Path(rec.mount_point).mkdir(parents=True, exist_ok=True)
+        ensure_dir(rec.mount_point)
         _, _, rc = await run_command(
             ["mount", self._dev_path(rec), rec.mount_point], timeout=60, check=False, op="write", category="disk"
         )

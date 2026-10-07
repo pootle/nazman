@@ -26,6 +26,7 @@ from ..utils.devices import (
 )
 from ..utils.exceptions import BackupError, ValidationError
 from ..utils.sizes import parse_size_to_bytes
+from ..utils.paths import ensure_dir
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +144,7 @@ class SystemRestoreService:
             return 0
 
     def _scratch_root(self) -> Path:
-        base = Path(self.settings_backup_mount_base()) / "restore"
-        base.mkdir(parents=True, exist_ok=True)
+        base = ensure_dir(Path(self.settings_backup_mount_base()) / "restore")
         return base
 
     def settings_backup_mount_base(self) -> str:
@@ -158,7 +158,7 @@ class SystemRestoreService:
         try:
             if Path(mountpoint).is_mount():
                 return mountpoint
-            mountpoint.mkdir(parents=True, exist_ok=True)
+            ensure_dir(mountpoint)
             _, _, rc = await run_command(
                 ["mount", "-o", "ro", candidate["device"], str(mountpoint)],
                 timeout=60, check=False, op="write", category="disk",
@@ -739,9 +739,8 @@ class SystemRestoreService:
                 continue
 
             from ..config import get_settings
-            mount_base = Path(get_settings().backup_mount_base)
-            mount_point = mount_base / candidate["fs_uuid"]
-            mount_point.mkdir(parents=True, exist_ok=True)
+            mount_base = Path(get_settings().backup_mount_base) / candidate["fs_uuid"]
+            mount_point = ensure_dir(mount_base)
             await run_command(
                 ["mount", candidate["device"], str(mount_point)],
                 timeout=60, check=False, op="write", category="disk",
