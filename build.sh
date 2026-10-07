@@ -127,7 +127,7 @@ if [[ "$install_smb" == "y" ]]; then
 fi
 
 echo "2/7 Creating directories..."
-mkdir -p "$DEST" /var/lib/nazman /var/log/nazman /etc/nazman
+mkdir -p "$DEST" /var/lib/nazman /var/log/nazman /etc/nazman /mnt/backup
 
 echo "3/7 Copying application files to $DEST..."
 # When build.sh runs from within $DEST itself (as install.sh does after cloning
@@ -199,6 +199,7 @@ fi
 # JWT secret; neither should be world-readable.
 chmod 600 /etc/nazman/nazman.conf
 chmod 700 /var/lib/nazman
+chmod 700 /mnt/backup
 [[ -f /etc/nazman/auth.secret ]] && chmod 600 /etc/nazman/auth.secret
 
 echo "6/7 Creating shared anonymous user/group (nfsanon, 65533) for NFS & SMB..."
@@ -239,7 +240,7 @@ ProtectControlGroups=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-ReadWritePaths=/var/lib/nazman /var/log/nazman /etc/nazman
+ReadWritePaths=/var/lib/nazman /var/log/nazman /etc/nazman /mnt/backup
 ReadOnlyPaths=/etc/zfs /etc/exports /etc/samba/smb.conf
 
 [Install]
