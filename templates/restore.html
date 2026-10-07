@@ -451,8 +451,12 @@ function renderPoolPlan(poolName, plan) {
                 + (p.slot_uuid ? ` · ${p.slot_uuid.substring(0, 8)}…` : '');
             return `<option value="${d.disk_id}:${p.slot_uuid}" ${selectedKey === `${d.disk_id}:${p.slot_uuid}` ? 'selected' : ''}>${escapeHtml(pLabel)}</option>`;
         }).join('');
-        return `<optgroup label="${escapeHtml(d.device_path || d.by_id || d.serial)}">
-            <option value="${d.disk_id}" ${selectedKey == d.disk_id ? 'selected' : ''}>${escapeHtml(whole)}</option>
+        const label = (d.device_path || d.by_id || d.serial)
+            + (d.in_pool ? ' (partitions in a pool)' : '');
+        const wholeOpt = d.in_pool ? '' :
+            `<option value="${d.disk_id}" ${selectedKey == d.disk_id ? 'selected' : ''}>${escapeHtml(whole)}</option>`;
+        return `<optgroup label="${escapeHtml(label)}">
+            ${wholeOpt}
             ${parts}
         </optgroup>`;
     }).join('');
@@ -565,6 +569,16 @@ async function preparePartitions(poolName) {
     }
 }
 
+async function replanPendingPools() {
+    const pools = (selectedSet.manifest && selectedSet.manifest.pools) || [];
+    for (const p of pools) {
+        const div = document.getElementById('pool-plan-' + poolIndex[p.name]);
+        if (!div || div.classList.contains('wizard-done') || div.classList.contains('wizard-skipped')) continue;
+        div.innerHTML = createLoading();
+        await loadPoolPlan(p.name);
+    }
+}
+
 async function createPool(poolName) {
     const { vdevs, missing } = buildPoolVdevs(poolName);
     if (missing) { showAlert('Assign a disk to every vdev slot first', 'error'); return; }
@@ -575,6 +589,7 @@ async function createPool(poolName) {
         const div = document.getElementById('pool-plan-' + poolIndex[poolName]);
         div.classList.add('wizard-done');
         document.getElementById('step-4').style.display = '';
+        await replanPendingPools();
         await loadDatasetPlan();
     } catch (e) {
         showAlert('Pool create failed: ' + e.message, 'error');

@@ -76,6 +76,14 @@ class SystemRestoreService:
                     return True
         return False
 
+    @staticmethod
+    def _whole_disk_in_pool(pool_members: Dict[str, str], *identities: Optional[str]) -> bool:
+        """True only if the whole disk (not one of its partitions) is a pool member."""
+        bases = {i.rsplit("/", 1)[-1] for i in identities if i}
+        if not bases:
+            return False
+        return any(key.rsplit("/", 1)[-1] in bases for key in pool_members)
+
     async def list_candidates(self, db: Session) -> List[Dict[str, Any]]:
         """Mountable, non-OS, non-pool devices that may hold a backup volume."""
         devices = await self._block_devices()
@@ -394,12 +402,13 @@ class SystemRestoreService:
 
     # ── Pool recreation ─────────────────────────────────────────────────
     async def _attached_disks(self, db: Session, excluded: set = ()) -> List[Dict[str, Any]]:
-        """Attached, assignable whole disks with their labeled partitions.
+        """Attached, assignable disks with their free labeled partitions.
 
         ``excluded`` holds device identities (by-id paths or base names) that
         must never be offered, e.g. the backup media of the set being restored.
-        Disks already claimed by an imported pool are dropped too, mirroring
-        :meth:`list_candidates`.
+        A disk claimed whole by an imported pool is dropped; when only some of
+        its partitions are pool members the disk stays, minus those
+        partitions, so the remaining ones can still be assigned to a pool.
         """
         if self.disk is not None:
             await self.disk.sync_disks_to_database(db)
@@ -415,20 +424,31 @@ class SystemRestoreService:
             if d.is_os_disk:
                 continue
             live_path = get_device_path(d)
-            if self._in_pool(media, live_path, d.by_id) or self._in_pool(pool_members, live_path, d.by_id):
+            if self._in_pool(media, live_path, d.by_id):
+                continue
+            if self._whole_disk_in_pool(pool_members, live_path, d.by_id):
                 continue
             partitions = []
+            member_slots = set()
             if live_path:
                 base_name = live_path.removeprefix("/dev/")
                 for p in (await read_slot_uuids([live_path])).get(live_path, {}).get("partitions", []):
-                    if not p.get("slot_uuid"):
+                    slot = p.get("slot_uuid")
+                    if not slot:
+                        continue
+                    number = self._partition_number(p["name"], base_name)
+                    part_by_id = partition_by_id(d.by_id, number) if d.by_id else None
+                    if self._in_pool(pool_members, part_by_id, f"/dev/{p['name']}"):
+                        member_slots.add(slot)
                         continue
                     partitions.append({
-                        "number": self._partition_number(p["name"], base_name),
-                        "slot_uuid": p["slot_uuid"],
-                        "device_path": partition_by_id(d.by_id, self._partition_number(p["name"], base_name)) if d.by_id else None,
+                        "number": number,
+                        "slot_uuid": slot,
+                        "device_path": part_by_id,
                         "size_bytes": p.get("size_bytes", 0),
                     })
+            if member_slots and not partitions:
+                continue
             attached.append({
                 "disk_id": d.id,
                 "by_id": d.by_id,
@@ -439,6 +459,8 @@ class SystemRestoreService:
                 "present": bool(live_path),
                 "is_os_disk": d.is_os_disk,
                 "partitions": partitions,
+                "in_pool": bool(member_slots),
+                "member_slot_uuids": sorted(member_slots),
             })
         return attached
 
@@ -475,7 +497,8 @@ class SystemRestoreService:
             for spec in vdev.get("devices", []):
                 match = self._match_disk(spec, attached, used)
                 if match:
-                    used.add(match["disk_id"])
+                    slot = spec.get("slot_uuid")
+                    used.add(f"{match['disk_id']}:{slot}" if slot else str(match["disk_id"]))
                 matched_partition = None
                 if match and spec.get("slot_uuid"):
                     matched_partition = next(
@@ -503,7 +526,10 @@ class SystemRestoreService:
             "pool": pool_name,
             "ashift": pool.get("ashift"),
             "vdevs": vdevs,
-            "available_disks": [d for d in attached if d["disk_id"] not in used],
+            "available_disks": [
+                d for d in attached
+                if str(d["disk_id"]) not in {u.split(":")[0] for u in used}
+            ],
             "attached_disks": attached,
         }
 
@@ -511,15 +537,32 @@ class SystemRestoreService:
     def _match_disk(spec: Dict[str, Any], attached: List[Dict[str, Any]], used: set) -> Optional[Dict[str, Any]]:
         by_id = spec.get("by_id")
         serial = spec.get("serial")
+        slot = spec.get("slot_uuid")
+
+        def key(d: Dict[str, Any]) -> str:
+            return f"{d['disk_id']}:{slot}" if slot else str(d["disk_id"])
+
+        def taken(d: Dict[str, Any]) -> bool:
+            dk = str(d["disk_id"])
+            if key(d) in used:
+                return True
+            if slot:
+                return dk in used
+            return any(u == dk or u.startswith(f"{dk}:") for u in used)
+
+        def usable(d: Dict[str, Any]) -> bool:
+            if d.get("in_pool"):
+                if not slot or slot in (d.get("member_slot_uuids") or []):
+                    return False
+                if not any(p.get("slot_uuid") == slot for p in d.get("partitions", [])):
+                    return False
+            return not taken(d)
+
         for d in attached:
-            if d["disk_id"] in used:
-                continue
-            if by_id and d.get("by_id") == by_id:
+            if usable(d) and by_id and d.get("by_id") == by_id:
                 return d
         for d in attached:
-            if d["disk_id"] in used:
-                continue
-            if serial and d.get("serial") == serial:
+            if usable(d) and serial and d.get("serial") == serial:
                 return d
         return None
 

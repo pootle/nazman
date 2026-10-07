@@ -191,6 +191,112 @@ async def test_attached_disks_excludes_media_and_pool_members(db_session, monkey
 
 
 @pytest.mark.asyncio
+async def test_attached_disks_keeps_free_partitions_of_partially_pooled_disk(db_session, monkeypatch):
+    import nazman.services.system_restore as sr
+    from nazman.models.disk import Disk
+
+    d_part = Disk(by_id="/dev/disk/by-id/ata-PART", serial="SP", size_bytes=100, disk_type="hdd", is_os_disk=False)
+    d_whole = Disk(by_id="/dev/disk/by-id/ata-WHOLE", serial="SW", size_bytes=100, disk_type="hdd", is_os_disk=False)
+    db_session.add_all([d_part, d_whole])
+    db_session.commit()
+
+    zfs = MagicMock()
+    zfs.get_pool_members = AsyncMock(return_value={
+        "/dev/disk/by-id/ata-PART-part2": "fast",
+        "/dev/disk/by-id/ata-WHOLE": "slow",
+    })
+    service = SystemRestoreService(zfs=zfs)
+    monkeypatch.setattr(sr, "get_device_path", lambda d: "/dev/sda")
+    monkeypatch.setattr(sr, "read_slot_uuids", AsyncMock(return_value={
+        "/dev/sda": {"partitions": [
+            {"name": "sda1", "partlabel": "nazman:SLOT1", "slot_uuid": "SLOT1", "size_bytes": 50},
+            {"name": "sda2", "partlabel": "nazman:SLOT2", "slot_uuid": "SLOT2", "size_bytes": 60},
+            {"name": "sda3", "partlabel": "nazman:SLOT3", "slot_uuid": "SLOT3", "size_bytes": 70},
+        ]},
+    }))
+
+    attached = await service._attached_disks(db_session, set())
+    assert [d["disk_id"] for d in attached] == [d_part.id]
+    assert attached[0]["in_pool"] is True
+    assert attached[0]["member_slot_uuids"] == ["SLOT2"]
+    assert [p["slot_uuid"] for p in attached[0]["partitions"]] == ["SLOT1", "SLOT3"]
+
+
+@pytest.mark.asyncio
+async def test_plan_pool_mapping_uses_free_partitions_of_pooled_disk(db_session):
+    service = SystemRestoreService()
+    manifest = {
+        "pools": [{
+            "name": "fast", "ashift": 12,
+            "vdevs": [{
+                "role": "data", "topology": "mirror", "ashift": 12,
+                "devices": [
+                    {"by_id": "/dev/disk/by-id/ata-PART", "serial": "SP", "size_bytes": 100,
+                     "slot_uuid": "SLOT2", "partition_number": 2},
+                    {"by_id": "/dev/disk/by-id/ata-PART", "serial": "SP", "size_bytes": 100,
+                     "slot_uuid": "SLOT1", "partition_number": 1},
+                    {"by_id": "/dev/disk/by-id/ata-PART", "serial": "SP", "size_bytes": 100,
+                     "slot_uuid": "SLOT3", "partition_number": 3},
+                    {"by_id": "/dev/disk/by-id/ata-PART", "serial": "SP", "size_bytes": 100},
+                ],
+            }],
+        }],
+    }
+    service._manifest_for = AsyncMock(return_value=manifest)
+    service._attached_disks = AsyncMock(return_value=[
+        {"disk_id": 1, "by_id": "/dev/disk/by-id/ata-PART", "serial": "SP", "size_bytes": 100,
+         "model": "P", "device_path": "/dev/sda", "present": True, "is_os_disk": False,
+         "in_pool": True, "member_slot_uuids": ["SLOT2"],
+         "partitions": [
+             {"number": 1, "slot_uuid": "SLOT1",
+              "device_path": "/dev/disk/by-id/ata-PART-part1", "size_bytes": 50},
+             {"number": 3, "slot_uuid": "SLOT3",
+              "device_path": "/dev/disk/by-id/ata-PART-part3", "size_bytes": 50},
+         ]},
+    ])
+
+    plan = await service.plan_pool_mapping(db_session, "AAA", "fast")
+    devices = plan["vdevs"][0]["devices"]
+    assert devices[0]["matched_disk_id"] is None
+    assert devices[1]["matched_partition"]["slot_uuid"] == "SLOT1"
+    assert devices[2]["matched_partition"]["slot_uuid"] == "SLOT3"
+    assert devices[3]["matched_disk_id"] is None
+    assert plan["available_disks"] == []
+
+
+@pytest.mark.asyncio
+async def test_plan_pool_mapping_blocks_whole_disk_after_partition_used(db_session):
+    service = SystemRestoreService()
+    manifest = {
+        "pools": [{
+            "name": "fast", "ashift": 12,
+            "vdevs": [{
+                "role": "data", "topology": "mirror", "ashift": 12,
+                "devices": [
+                    {"by_id": "/dev/disk/by-id/ata-OTHER", "serial": "SO", "size_bytes": 100,
+                     "slot_uuid": "SLOT9", "partition_number": 1},
+                    {"by_id": "/dev/disk/by-id/ata-OTHER", "serial": "SO", "size_bytes": 100},
+                ],
+            }],
+        }],
+    }
+    service._manifest_for = AsyncMock(return_value=manifest)
+    service._attached_disks = AsyncMock(return_value=[
+        {"disk_id": 7, "by_id": "/dev/disk/by-id/ata-OTHER", "serial": "SO", "size_bytes": 100,
+         "model": "O", "device_path": "/dev/sda", "present": True, "is_os_disk": False,
+         "in_pool": False, "member_slot_uuids": [],
+         "partitions": [{"number": 1, "slot_uuid": "SLOT9",
+                         "device_path": "/dev/disk/by-id/ata-OTHER-part1", "size_bytes": 50}]},
+    ])
+
+    plan = await service.plan_pool_mapping(db_session, "AAA", "fast")
+    devices = plan["vdevs"][0]["devices"]
+    assert devices[0]["matched_partition"]["slot_uuid"] == "SLOT9"
+    assert devices[1]["matched_disk_id"] is None
+    assert plan["available_disks"] == []
+
+
+@pytest.mark.asyncio
 async def test_restore_plan_defaults_enabled_with_matching_pool(db_session):
     zfs = MagicMock()
     zfs.list_pool_names = MagicMock(return_value=["tank"])
