@@ -28,3 +28,23 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+  drift:
+    # main is a release label: its tree must always equal dev's. This job runs
+    # on every main push and fails if they differ, so the branches cannot fall
+    # out of sync.
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch dev
+        run: git fetch --depth=1 origin dev
+
+      - name: Fail if main differs from dev
+        run: |
+          if ! git diff --exit-code --stat FETCH_HEAD HEAD; then
+            echo "::error::main tree differs from dev; merge dev into main to release"
+            exit 1
+          fi
+          echo "main and dev trees are identical."

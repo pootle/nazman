@@ -101,39 +101,5 @@ docs/recover-system.md
 docs/install-update.md
 docs/troubleshooting.md
 
-# Tests
-tests/__init__.py
-tests/conftest.py
-tests/test_api_auth.py
-tests/test_api_disks.py
-tests/test_api_pools.py
-tests/test_api_datasets.py
-tests/test_api_nfs.py
-tests/test_api_snapshots.py
-tests/test_api_backup.py
-tests/test_api_system.py
-tests/test_commands.py
-tests/test_validation.py
-tests/test_zfs_manager.py
-tests/test_disk_by_id.py
-tests/test_destruction.py
-tests/test_scheduler.py
-tests/test_metrics_manager.py
-tests/test_metrics_store.py
-tests/test_api_metrics.py
-tests/test_smb_manager.py
-tests/test_api_smb.py
-tests/test_command_log.py
-tests/test_zfs_backup.py
-tests/test_backup_manifest.py
-tests/test_backup_manager.py
-tests/test_system_restore.py
-tests/test_guide.py
-tests/test_sizes.py
-tests/test_database_migration.py
-tests/test_auth_coverage.py
-tests/test_api_vdevs.py
-tests/test_alerts.py
-
 # Config & deps
 requirements.txt

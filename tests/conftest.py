@@ -9,9 +9,14 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from nazman.config import Settings, get_settings
+
+module_conf = tempfile.mkdtemp(prefix="nazman-test-")
+open(os.path.join(module_conf, "nazman.conf"), "a", encoding="utf-8").close()
+Settings.model_config = {**Settings.model_config, "env_file": os.path.join(module_conf, "nazman.conf")}
+
 from nazman.database import Base, get_db, get_db_context
 from nazman.main import app
-from nazman.config import Settings, get_settings
 from nazman.auth import get_current_user
 from nazman import wiring
 

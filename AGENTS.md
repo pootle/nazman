@@ -10,28 +10,25 @@ HTML/CSS/JS served via Jinja2, storage is SQLite (WAL mode).
 
 ## Branches
 
-- `main`: production artifact. App code + deployment scripts only, no tests.
-- `dev`: primary development branch. Adds tests, dev-env.sh, Makefile, CI.
+- `dev`: the only branch code is written on. Every change — including install
+  and build tooling — lands here first and is tested here.
+- `main`: a release label. It is never edited; its tree always equals `dev`'s.
+  Pushing to `main` directly is not part of the normal flow (a CI drift check
+  fails any `main` push whose tree differs from `dev`).
 
-Work on `dev`; only merge production changes into `main`.
+Work on `dev`; releases are a forward merge of `dev` into `main`.
 
 ### Releasing to main
 
-`main` must stay lean (no `tests/`, `Makefile`, `dev-env.sh`, `dev-live.sh`,
-`.github/`, `.opencode/`, `opencode.json`, `.env.example`, `pytest.ini`,
-`AGENTS.md`). To release:
+`main`'s tree must always equal `dev`'s tree. To release:
 
-1. Merge `main` into `dev` first so the branches converge. If conflicts arise,
-   resolve to `dev`'s side — dev is normally a strict superset (auth, install
-   tooling and Pi fixes already live there).
-2. `git checkout main && git merge --no-ff dev` to release.
-3. Prune the dev tooling from `main`: `git rm -r --ignore-unmatch tests
-   Makefile dev-env.sh dev-live.sh .github .opencode opencode.json .env.example
-   pytest.ini AGENTS.md`, commit the prune, push.
+1. Verify `dev`: `./venv/bin/python -m pytest tests/ -q` (CI checks this too).
+2. `git checkout main && git merge --no-ff dev && git push origin main`.
+3. Return to `dev`.
 
-Keep `deploy.txt` and `requirements.txt` identical across branches to avoid
-future merge noise (the prune relies on `deploy.sh` deleting files listed in
-the manifest that are absent from the tree).
+The deployed server stays lean without branch surgery: `build.sh`/`deploy.sh`
+copy only the files listed in `deploy.txt`, so tests and dev tooling that live
+in the repo are never shipped to `/opt/nazman`.
 
 ## Commands
 
