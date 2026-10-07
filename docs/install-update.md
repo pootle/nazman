@@ -60,6 +60,10 @@ sudo ./deploy.sh
 `deploy.txt` manifest) and restarts the service. It reports what it applied and
 skips files that are already identical.
 
+> **Tip:** if `git pull` refuses with *local changes*, or `deploy.sh` reports
+> files that will not apply, use option A — `install.sh` re-syncs
+> `/opt/nazman` to the branch and discards any drift.
+
 > **Note:** `deploy.sh` does not install Python packages. If
 > `requirements.txt` changed, reinstall dependencies first:
 >

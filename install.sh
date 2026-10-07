@@ -50,10 +50,15 @@ fi
 
 echo "Fetching NAZMan ($BRANCH) into $DEST..."
 if [[ -d "$DEST/.git" ]]; then
-    # Existing clone: update it.
-    git -C "$DEST" fetch --all --quiet
-    git -C "$DEST" checkout --quiet "$BRANCH"
-    git -C "$DEST" pull --quiet origin "$BRANCH"
+    # Existing clone: re-sync to the branch tip. A production install may have
+    # drifted (files copied in by deploy.sh, stale from a partial update, or an
+    # earlier failed pull), so force the checkout to match exactly rather than
+    # merging. Runtime state lives outside $DEST (/etc/nazman, /var/lib/nazman)
+    # and venv/ is gitignored, so nothing of value is discarded.
+    echo "Existing clone found; re-syncing $DEST to $BRANCH (local changes discarded)."
+    git -C "$DEST" fetch --quiet origin
+    git -C "$DEST" reset --hard --quiet "origin/$BRANCH"
+    git -C "$DEST" clean -fd --quiet
 else
     git clone --quiet --branch "$BRANCH" --single-branch "$REPO_URL" "$DEST"
 fi
