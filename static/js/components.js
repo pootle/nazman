@@ -13,36 +13,13 @@ function escapeHtml(text) {
     return text.toString().replace(/[&<>"']/g, m => map[m]);
 }
 
-// Fly-in alert (toast) history. Every message is kept in localStorage so
-// transient alerts (which auto-dismiss after a few seconds) can be reviewed
-// later from the Messages modal in the header.
-const MESSAGE_LOG_KEY = 'nazman_messages';
-const MESSAGE_LOG_MAX = 200;
-
-let messageHistory = loadMessageHistory();
-
-function loadMessageHistory() {
-    try {
-        const parsed = JSON.parse(localStorage.getItem(MESSAGE_LOG_KEY) || '[]');
-        return Array.isArray(parsed) ? parsed.slice(0, MESSAGE_LOG_MAX) : [];
-    } catch (e) {
-        return [];
-    }
-}
-
-function saveMessageHistory() {
-    try {
-        localStorage.setItem(MESSAGE_LOG_KEY, JSON.stringify(messageHistory.slice(0, MESSAGE_LOG_MAX)));
-    } catch (e) {
-        // Storage unavailable/full; the in-memory log still works for this page.
-    }
-}
+// Notification journal. Every fly-in toast is mirrored to the server-side
+// circular journal so missed messages can be reviewed later from the Messages
+// modal in the header. The server is the source of truth; toasts are still
+// shown instantly and fall back to toast-only when the journal is unreachable.
 
 // Alert function
 function showAlert(message, type = 'success', duration = 3000) {
-    messageHistory.unshift({ ts: new Date().toISOString(), type, message: String(message) });
-    saveMessageHistory();
-
     const alert = document.createElement('div');
     alert.className = `alert alert-${type}`;
     alert.textContent = message;
@@ -51,32 +28,88 @@ function showAlert(message, type = 'success', duration = 3000) {
     setTimeout(() => {
         alert.remove();
     }, duration);
+
+    if (typeof api !== 'undefined' && api.postNotification) {
+        const level = ['success', 'warning', 'error', 'info'].includes(type) ? type : 'info';
+        api.postNotification({ message: String(message), level, source: 'ui' })
+            .then(() => refreshNotificationBadge())
+            .catch(() => {});
+    }
 }
 
-function renderMessageHistory() {
+function notificationMeta(n) {
+    const when = formatDate(n.ts);
+    const parts = [];
+    if (n.source) parts.push(n.source);
+    if (n.duration_ms != null) parts.push(formatDuration(n.duration_ms));
+    if (n.bytes) parts.push(formatBytes(n.bytes));
+    const meta = parts.length ? `<span class="message-meta">${escapeHtml(parts.join(' · '))}</span>` : '';
+    const title = n.title ? `<span class="message-title">${escapeHtml(n.title)}</span>` : '';
+    return `<div class="message-entry message-${n.level}">
+            <span class="message-ts">${escapeHtml(when)}</span>
+            <span class="message-text">${title}${escapeHtml(n.message)}${meta}</span>
+        </div>`;
+}
+
+async function renderMessageHistory() {
     const list = document.getElementById('message-history-list');
     if (!list) return;
-    if (messageHistory.length === 0) {
+    list.innerHTML = createLoading();
+    let data;
+    try {
+        data = await api.getNotifications(100);
+    } catch (e) {
+        list.innerHTML = createErrorState('Failed to load messages: ' + e.message);
+        return;
+    }
+    const entries = data.entries || [];
+    if (entries.length === 0) {
         list.innerHTML = '<p class="text-muted">No messages yet.</p>';
         return;
     }
-    list.innerHTML = messageHistory.map(m =>
-        `<div class="message-entry message-${m.type}">
-            <span class="message-ts">${formatDate(m.ts)}</span>
-            <span class="message-text">${escapeHtml(m.message)}</span>
-        </div>`
-    ).join('');
+    list.innerHTML = entries.map(notificationMeta).join('');
 }
 
-function openMessageHistory() {
-    renderMessageHistory();
+async function refreshNotificationBadge() {
+    const badge = document.getElementById('messages-badge');
+    if (!badge || typeof api === 'undefined') return;
+    try {
+        const data = await api.getNotifications(1);
+        const unread = data.unread || 0;
+        badge.textContent = unread > 99 ? '99+' : String(unread);
+        badge.style.display = unread > 0 ? '' : 'none';
+    } catch (e) {
+        // Badge is best-effort; leave it as-is.
+    }
+}
+
+async function openMessageHistory() {
     showModal('message-history-modal');
+    await renderMessageHistory();
+    try {
+        await api.markNotificationsRead();
+    } catch (e) { /* ignore */ }
+    refreshNotificationBadge();
 }
 
-function clearMessageHistory() {
-    messageHistory = [];
-    saveMessageHistory();
+async function clearMessageHistory() {
+    try {
+        await api.clearNotifications();
+    } catch (e) { /* ignore */ }
     renderMessageHistory();
+    refreshNotificationBadge();
+}
+
+// Format a millisecond duration as human-readable (e.g. 1h 2m 3s).
+function formatDuration(ms) {
+    if (ms == null) return '';
+    const total = Math.round(ms / 1000);
+    if (total < 60) return `${total}s`;
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    if (mins < 60) return `${mins}m ${secs}s`;
+    const hours = Math.floor(mins / 60);
+    return `${hours}h ${mins % 60}m`;
 }
 
 // Format bytes to human readable
@@ -285,4 +318,9 @@ document.addEventListener('DOMContentLoaded', function () {
     if (messagesBtn) messagesBtn.addEventListener('click', openMessageHistory);
     const clearBtn = document.getElementById('messages-clear-btn');
     if (clearBtn) clearBtn.addEventListener('click', clearMessageHistory);
+    const tasksNav = document.getElementById('active-tasks-nav');
+    if (tasksNav) tasksNav.addEventListener('click', (e) => {
+        e.preventDefault();
+        openActiveTasks();
+    });
 });

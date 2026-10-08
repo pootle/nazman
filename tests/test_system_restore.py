@@ -1,5 +1,6 @@
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -818,6 +819,55 @@ def test_restore_progress_pct_caps_running_at_99():
 def test_restore_progress_pct_is_100_when_done():
     service = SystemRestoreService()
     assert service._progress_pct(_progress_job(status="done", datasets_done=4)) == 100
+
+
+def test_log_restore_finished_journals_duration_and_bytes():
+    service = SystemRestoreService()
+    started = datetime.now(timezone.utc)
+    job = {
+        "status": "done", "started_at": started,
+        "datasets_done": 2, "datasets_total": 2, "datasets_failed": 0,
+        "bytes_total": 4096, "error": None,
+    }
+    with patch("nazman.services.system_restore.notification_store") as store:
+        service._log_restore_finished(job)
+    kw = store.add.call_args.kwargs
+    assert kw["level"] == "success"
+    assert kw["source"] == "restore"
+    assert kw["bytes"] == 4096
+    assert kw["duration_ms"] is not None
+    assert "2/2 datasets" in kw["message"]
+
+
+def test_log_restore_finished_marks_failure():
+    service = SystemRestoreService()
+    job = {
+        "status": "failed", "started_at": datetime.now(timezone.utc),
+        "datasets_done": 1, "datasets_total": 2, "datasets_failed": 1,
+        "bytes_total": 0, "error": "disk vanished",
+    }
+    with patch("nazman.services.system_restore.notification_store") as store:
+        service._log_restore_finished(job)
+    kw = store.add.call_args.kwargs
+    assert kw["level"] == "error"
+    assert "disk vanished" in kw["message"]
+    assert kw["bytes"] is None
+
+
+def test_restore_active_jobs_reflects_running_state():
+    service = SystemRestoreService()
+    assert service.active_jobs() == []
+    service._restore_job = {
+        "set_id": "AAA", "status": "running", "datasets_total": 4,
+        "datasets_done": 1, "datasets_failed": 0, "started_at": None,
+        "error": None, "results": [], "current": None,
+    }
+    jobs = service.active_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["kind"] == "restore"
+    assert jobs[0]["id"] == "AAA"
+    service._restore_job["status"] = "done"
+    assert service.active_jobs() == []
 
 
 def test_restore_job_view_is_idle_without_a_job():

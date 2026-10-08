@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     command_log_size: int = 25
     command_log_path: str = "/var/lib/nazman/command_log.db"
     command_log_retention_days: int = 30
+
+    # Notification journal (circular)
+    notification_log_path: str = "/var/lib/nazman/notifications.db"
+    notification_log_size: int = 500
+    notification_log_retention_days: int = 90
     
     # Logging
     logging_level: str = "INFO"
@@ -169,5 +174,9 @@ def ensure_directories():
         # Metrics log directory
         metrics_dir = Path(settings.metrics_log_path).parent
         metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        # Notification journal directory
+        notif_dir = Path(settings.notification_log_path).parent
+        notif_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         pass

@@ -12,6 +12,8 @@ from .system import router as system_router, health_router
 from .metrics import router as metrics_router
 from .auth import router as auth_router
 from .alerts import router as alerts_router
+from .notifications import router as notifications_router
+from .tasks import router as tasks_router
 
 __all__ = [
     "disks_router",
@@ -29,4 +31,6 @@ __all__ = [
     "metrics_router",
     "auth_router",
     "alerts_router",
+    "notifications_router",
+    "tasks_router",
 ]

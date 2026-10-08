@@ -500,6 +500,31 @@ class NasManAPI {
         return this.request('GET', `/api/alerts/history?limit=${limit}`);
     }
 
+    // Notifications journal
+    async getNotifications(limit = 100, sinceId = null, unreadOnly = false) {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (sinceId != null) params.set('since_id', String(sinceId));
+        if (unreadOnly) params.set('unread_only', 'true');
+        return this.request('GET', `/api/notifications?${params.toString()}`);
+    }
+
+    async postNotification(data) {
+        return this.request('POST', '/api/notifications', data);
+    }
+
+    async markNotificationsRead(ids = null) {
+        return this.request('POST', '/api/notifications/read', { ids });
+    }
+
+    async clearNotifications() {
+        return this.request('DELETE', '/api/notifications');
+    }
+
+    // Long-running tasks
+    async getActiveTasks() {
+        return this.request('GET', '/api/tasks/active');
+    }
+
     // Authentication
     async login(password) {
         const response = await fetch(`${this.baseUrl}/api/auth/login`, {

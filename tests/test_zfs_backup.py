@@ -2511,3 +2511,47 @@ async def test_recycle_disk_wipes_reformats_and_clears_runs(db_session, tmp_path
     assert db_session.query(BackupRun).filter_by(backup_disk_id=disks[0].id).count() == 0
     assert db_session.get(BackupDisk, disks[0].id).backup_set_id == sets[0].id
     assert rec["fs_uuid"] == "NEWFS"
+
+
+def test_log_backup_finished_journals_duration_and_bytes():
+    session = MagicMock()
+    session.group.name = "nightly"
+    session.group_id = 1
+    session.started_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    session.completed_at = datetime(2026, 1, 1, 0, 1, 30, tzinfo=timezone.utc)
+    session.datasets_done = 3
+    session.datasets_total = 3
+    session.datasets_failed = 0
+    session.bytes_written = 123456
+
+    with patch("nazman.services.backup_group_service.notification_store") as store:
+        BackupGroupService._log_backup_finished(session, "success")
+
+    kw = store.add.call_args.kwargs
+    assert kw["level"] == "success"
+    assert kw["source"] == "backup"
+    assert kw["duration_ms"] == 90000
+    assert kw["bytes"] == 123456
+    assert "nightly" in kw["message"]
+    assert "3/3 datasets" in kw["message"]
+
+
+def test_log_backup_finished_marks_failure():
+    session = MagicMock()
+    session.group.name = "nightly"
+    session.group_id = 1
+    session.started_at = None
+    session.completed_at = None
+    session.datasets_done = 0
+    session.datasets_total = 2
+    session.datasets_failed = 2
+    session.bytes_written = 0
+
+    with patch("nazman.services.backup_group_service.notification_store") as store:
+        BackupGroupService._log_backup_finished(session, "failed")
+
+    kw = store.add.call_args.kwargs
+    assert kw["level"] == "error"
+    assert kw["duration_ms"] is None
+    assert kw["bytes"] is None
+    assert "2 failed" in kw["message"]

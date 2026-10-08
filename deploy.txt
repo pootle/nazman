@@ -30,15 +30,18 @@ nazman/services/backup_group_service.py
 nazman/services/destruction.py
 nazman/services/disk_view.py
 nazman/services/system_restore.py
+nazman/services/task_status.py
 
 nazman/utils/__init__.py
 nazman/utils/sizes.py
+nazman/utils/timing.py
 nazman/utils/commands.py
 nazman/utils/validation.py
 nazman/utils/exceptions.py
 nazman/utils/command_log.py
 nazman/utils/command_tags.py
 nazman/utils/command_log_store.py
+nazman/utils/notification_store.py
 nazman/utils/guide.py
 nazman/utils/devices.py
 nazman/utils/zfs_query.py
@@ -61,6 +64,8 @@ nazman/api/system.py
 nazman/api/metrics.py
 nazman/api/smb.py
 nazman/api/alerts.py
+nazman/api/notifications.py
+nazman/api/tasks.py
 
 # Frontend
 static/js/api.js

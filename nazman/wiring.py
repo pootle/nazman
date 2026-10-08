@@ -28,6 +28,7 @@ from .services.backup_group_service import BackupGroupService
 from .services.destruction import DestructionService
 from .services.disk_view import DiskViewService
 from .services.system_restore import SystemRestoreService
+from .services.task_status import TaskStatusService
 from .utils.exceptions import NAZManError
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class Container:
     disk_view: DiskViewService
     system_restore: SystemRestoreService
     backup_groups: BackupGroupService
+    task_status: TaskStatusService
 
 
 def build_container() -> Container:
@@ -76,6 +78,9 @@ def build_container() -> Container:
     backup_groups = BackupGroupService(
         zfs_backup=zfs_backup, backup=backup, scheduler=scheduler, alerter=alerts,
     )
+    task_status = TaskStatusService(
+        backup_groups=backup_groups, system_restore=system_restore, scheduler=scheduler,
+    )
 
     _register_backup_jobs(scheduler, backup_groups)
 
@@ -95,6 +100,7 @@ def build_container() -> Container:
         disk_view=disk_view,
         system_restore=system_restore,
         backup_groups=backup_groups,
+        task_status=task_status,
     )
 
 
@@ -191,3 +197,7 @@ def get_system_restore_service() -> SystemRestoreService:
 
 def get_backup_group_service() -> BackupGroupService:
     return get_container().backup_groups
+
+
+def get_task_status_service() -> TaskStatusService:
+    return get_container().task_status

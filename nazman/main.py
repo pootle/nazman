@@ -17,6 +17,7 @@ from .api import (
     backup_router, zfs_backup_router,
     system_restore_router,
     system_router, health_router, metrics_router, auth_router, alerts_router,
+    notifications_router, tasks_router,
 )
 
 # Get application settings
@@ -53,6 +54,11 @@ async def lifespan(app: FastAPI):
     command_log_store.connect()
     command_log_store.prune()
 
+    # Initialise + prune the notification journal.
+    from .utils.notification_store import notification_store
+    notification_store.connect()
+    notification_store.prune()
+
     yield
 
     await container.scheduler.stop()
@@ -62,6 +68,9 @@ async def lifespan(app: FastAPI):
 
     from .utils.command_log_store import command_log_store
     command_log_store.close()
+
+    from .utils.notification_store import notification_store
+    notification_store.close()
 
     # Ephemeral kernel-name knowledge does not survive restarts.
     from .utils.devices import clear_device_map
@@ -115,6 +124,8 @@ app.include_router(system_restore_router)
 app.include_router(metrics_router)
 app.include_router(auth_router)
 app.include_router(alerts_router)
+app.include_router(notifications_router)
+app.include_router(tasks_router)
 
 
 # Web UI routes

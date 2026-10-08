@@ -28,7 +28,9 @@ from ..utils.devices import (
     os_disk_names,
 )
 from ..utils.exceptions import BackupError, ConflictError, ValidationError
+from ..utils.notification_store import notification_store
 from ..utils.sizes import parse_size_to_bytes
+from ..utils.timing import elapsed_ms as _elapsed_ms
 from ..utils.paths import ensure_dir
 
 logger = logging.getLogger(__name__)
@@ -732,6 +734,7 @@ class SystemRestoreService:
             "datasets_total": len(chosen),
             "datasets_done": 0,
             "datasets_failed": 0,
+            "bytes_total": 0,
             "started_at": datetime.now(timezone.utc),
             "error": None,
             "results": [],
@@ -764,6 +767,52 @@ class SystemRestoreService:
         finally:
             if job is not None:
                 job["current"] = None
+                self._log_restore_finished(job)
+
+    def _log_restore_finished(self, job: Dict[str, Any]) -> None:
+        """Record a completed restore in the notification journal."""
+        try:
+            started = job.get("started_at")
+            duration_ms = _elapsed_ms(started, datetime.now(timezone.utc))
+            done = job.get("datasets_done", 0)
+            failed = job.get("datasets_failed", 0)
+            total = job.get("datasets_total", 0)
+            if job.get("status") == "done":
+                level, verb = "success", "finished"
+            else:
+                level, verb = "error", "failed"
+            title = f"Restore {verb}"
+            message = f"Restored {done}/{total} datasets"
+            if failed:
+                message += f" ({failed} failed)"
+            if job.get("bytes_total"):
+                message += f", {job['bytes_total']} bytes"
+            if job.get("error"):
+                message += f" - {job['error']}"
+            notification_store.add(
+                level=level, title=title, message=message, source="restore",
+                duration_ms=duration_ms,
+                bytes=int(job.get("bytes_total") or 0) or None,
+            )
+        except Exception:
+            logger.warning("could not record restore notification", exc_info=True)
+
+    def active_jobs(self) -> List[Dict[str, Any]]:
+        """Running restores as task-status entries (usually zero or one)."""
+        job = self._restore_job
+        if job is None or job.get("status") != "running":
+            return []
+        return [{
+            "kind": "restore",
+            "id": job.get("set_id"),
+            "label": f"Restore set {job.get('set_id')}",
+            "progress_pct": self._progress_pct(job),
+            "started_at": job.get("started_at"),
+            "detail": (
+                f"{job.get('datasets_done', 0)}/{job.get('datasets_total', 0)} datasets"
+            ),
+            "link": "/restore",
+        }]
 
     def restore_job_view(self, set_id: Optional[str] = None) -> Dict[str, Any]:
         """Current restore progress, or an ``idle`` view when nothing matches."""
@@ -891,6 +940,8 @@ class SystemRestoreService:
                 entry["streams"].append(result)
                 exists = True
                 if job is not None and job.get("current") is not None:
+                    consumed = job["current"].get("bytes_done") or 0
+                    job["bytes_total"] = (job.get("bytes_total") or 0) + consumed
                     job["current"]["streams_done"] = index
                     job["current"]["bytes_done"] = 0
             entry["status"] = "success"
