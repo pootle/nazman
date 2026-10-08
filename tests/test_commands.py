@@ -125,6 +125,22 @@ async def test_run_pipeline_reads_stdin_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_streams_bytes_read_from_stdin(tmp_path):
+    src = tmp_path / "stream.bin"
+    src.write_bytes(b"x" * 4096)
+    seen = []
+    with open(src, "rb") as fh:
+        stdout, stderr, rc = await run_pipeline(
+            [["cat"], ["wc", "-c"]], stdin_file=fh,
+            on_bytes_read=seen.append, timeout=10,
+        )
+        assert not fh.closed
+    assert rc == 0
+    assert seen and seen[-1] == 4096
+    assert stdout.strip() == "4096"
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_reports_first_failing_stage():
     stdout, stderr, rc = await run_pipeline(
         [["sh", "-c", "echo x; exit 3"], ["cat"]], timeout=10, check=False

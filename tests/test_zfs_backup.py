@@ -1699,7 +1699,8 @@ async def test_restore_dataset_mounts_owner_and_restores_idle(db_session, tmp_pa
     fp.write_bytes(gzip.compress(b"STREAMSIM"))
 
     async def fake_pipeline(stages, **kwargs):
-        assert stages[0][:2] == ["gunzip", "-c"]
+        assert stages[0] == ["gunzip", "-c"]
+        assert kwargs["stdin_file"].name == str(fp)
         assert stages[1][:2] == ["zfs", "receive"]
         return ("", "", 0)
 
@@ -1726,7 +1727,8 @@ async def test_restore_dataset_replays_raw_compact_stream(db_session, tmp_path):
     fp.write_bytes(b"not-gzip zfs send stream data")
 
     async def fake_pipeline(stages, **kwargs):
-        assert stages[0][:2] == ["cat", str(fp)]
+        assert stages[0] == ["cat"]
+        assert kwargs["stdin_file"].name == str(fp)
         assert stages[1][:2] == ["zfs", "receive"]
         return ("", "", 0)
 

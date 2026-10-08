@@ -5,7 +5,7 @@ import pytest
 
 from nazman.services.system_restore import SystemRestoreService
 from nazman.utils import backup_manifest as bm
-from nazman.utils.exceptions import BackupError, ValidationError
+from nazman.utils.exceptions import BackupError, ConflictError, ValidationError
 from nazman.wiring import get_system_restore_service
 from tests.conftest import override_manager
 
@@ -478,13 +478,54 @@ async def test_api_list_backup_sets(client):
 @pytest.mark.asyncio
 async def test_api_restore_datasets_maps_error_to_400(client):
     with override_manager(get_system_restore_service) as mock:
-        mock.restore_datasets = AsyncMock(side_effect=BackupError("boom"))
+        mock.start_restore = AsyncMock(side_effect=BackupError("boom"))
         response = client.post(
             "/api/system-restore/sets/AAA/datasets/restore",
             json={"selections": []},
         )
     assert response.status_code == 400
     assert "boom" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_api_restore_start_returns_progress_view(client):
+    with override_manager(get_system_restore_service) as mock:
+        mock.start_restore = AsyncMock(return_value={
+            "set_id": "AAA", "status": "running", "datasets_total": 2,
+            "datasets_done": 0, "datasets_failed": 0, "progress_pct": 0,
+            "current": None, "results": [], "error": None, "started_at": None,
+        })
+        response = client.post(
+            "/api/system-restore/sets/AAA/datasets/restore",
+            json={"selections": [{"source_dataset": "tank/media", "target_pool": "tank"}]},
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert response.json()["datasets_total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_api_restore_conflict_returns_409(client):
+    with override_manager(get_system_restore_service) as mock:
+        mock.start_restore = AsyncMock(side_effect=ConflictError("already running"))
+        response = client.post(
+            "/api/system-restore/sets/AAA/datasets/restore",
+            json={"selections": []},
+        )
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_api_restore_progress_returns_view(client):
+    with override_manager(get_system_restore_service) as mock:
+        mock.restore_job_view = MagicMock(return_value={
+            "set_id": "AAA", "status": "running", "progress_pct": 42,
+        })
+        response = client.get("/api/system-restore/sets/AAA/restore/progress")
+    assert response.status_code == 200
+    assert response.json()["progress_pct"] == 42
+    mock.restore_job_view.assert_called_once_with("AAA")
 
 
 @pytest.mark.asyncio
@@ -742,3 +783,132 @@ async def test_merge_manifests_unions_datasets_runs_pools_and_configs():
     assert [r["stream_file"] for r in merged["datasets"][0]["backups"]] == ["s1", "s2"]
     assert [p["name"] for p in merged["pools"]] == ["tank"]
     assert [c["id"] for c in merged["config_backups"]] == ["c1", "c2"]
+
+
+def _progress_job(**overrides):
+    job = {
+        "set_id": "AAA", "status": "running", "datasets_total": 4,
+        "datasets_done": 0, "datasets_failed": 0,
+        "started_at": None, "error": None, "results": [], "current": None,
+    }
+    job.update(overrides)
+    return job
+
+
+def test_restore_progress_pct_counts_the_current_stream():
+    service = SystemRestoreService()
+    job = _progress_job(
+        datasets_done=1,
+        current={"streams_total": 2, "streams_done": 0,
+                 "bytes_expected": 100, "bytes_done": 50},
+    )
+    assert service._progress_pct(job) == 31
+
+
+def test_restore_progress_pct_caps_running_at_99():
+    service = SystemRestoreService()
+    job = _progress_job(
+        datasets_total=1, datasets_done=0,
+        current={"streams_total": 1, "streams_done": 0,
+                 "bytes_expected": 100, "bytes_done": 100},
+    )
+    assert service._progress_pct(job) == 99
+
+
+def test_restore_progress_pct_is_100_when_done():
+    service = SystemRestoreService()
+    assert service._progress_pct(_progress_job(status="done", datasets_done=4)) == 100
+
+
+def test_restore_job_view_is_idle_without_a_job():
+    service = SystemRestoreService()
+    assert service.restore_job_view("AAA") == {"set_id": "AAA", "status": "idle"}
+    assert service.restore_job_view() == {"set_id": None, "status": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_start_restore_conflicts_while_running(db_session):
+    service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
+    service._restore_job = _progress_job(status="running")
+    with pytest.raises(ConflictError):
+        await service.start_restore(db_session, "AAA", [])
+
+
+@pytest.mark.asyncio
+async def test_start_restore_rejects_empty_selection(db_session):
+    service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{"name": "tank/media", "pool": "tank", "backups": [
+            {"type": "full", "stream_file": "s", "created_at": "2026-01-01T00:00:00",
+             "media_fs_uuid": "AAA"},
+        ]}],
+    })
+    with pytest.raises(ValidationError):
+        await service.start_restore(db_session, "AAA", [
+            {"source_dataset": "tank/media", "target_pool": "tank", "enabled": False},
+        ])
+
+
+@pytest.mark.asyncio
+async def test_start_restore_runs_worker_and_publishes_progress(db_session, tmp_path):
+    media_dir = tmp_path / "data/tank/media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "full-1.zfs.gz").write_bytes(b"x")
+
+    service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{"name": "tank/media", "pool": "tank", "backups": [
+            {"type": "full", "stream_file": "data/tank/media/full-1.zfs.gz",
+             "created_at": "2026-01-01T00:00:00", "media_fs_uuid": "AAA",
+             "size_bytes": 4096},
+        ]}],
+    })
+    service.zfs.dataset_exists = AsyncMock(return_value=False)
+    service._mount_volumes = AsyncMock(return_value=[(_candidate("AAA"), tmp_path)])
+    service._unmount = AsyncMock()
+    snapshots = []
+
+    async def fake_receive(stream, target, force=False, on_bytes_read=None):
+        if on_bytes_read is not None:
+            on_bytes_read(4096)
+        snapshots.append(dict(service.restore_job_view("AAA")["current"]))
+        return {"ok": True}
+
+    service.zfs_backup.receive_stream = fake_receive
+
+    started = await service.start_restore(db_session, "AAA", [
+        {"source_dataset": "tank/media", "target_pool": "newtank", "enabled": True},
+    ])
+    assert started["status"] == "running"
+    assert started["datasets_total"] == 1
+    assert started["current"] is None
+
+    await service._restore_task
+
+    assert snapshots and snapshots[0]["bytes_done"] == 4096
+    assert snapshots[0]["source"] == "tank/media"
+    done = service.restore_job_view("AAA")
+    assert done["status"] == "done"
+    assert done["progress_pct"] == 100
+    assert done["results"][0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_start_restore_marks_job_failed_when_mounting_fails(db_session):
+    service = SystemRestoreService(zfs=MagicMock(), zfs_backup=MagicMock())
+    service._manifest_for = AsyncMock(return_value={
+        "datasets": [{"name": "tank/media", "pool": "tank", "backups": [
+            {"type": "full", "stream_file": "s", "created_at": "2026-01-01T00:00:00",
+             "media_fs_uuid": "AAA"},
+        ]}],
+    })
+    service._mount_volumes = AsyncMock(side_effect=BackupError("no media"))
+
+    await service.start_restore(db_session, "AAA", [
+        {"source_dataset": "tank/media", "target_pool": "tank", "enabled": True},
+    ])
+    await service._restore_task
+
+    view = service.restore_job_view("AAA")
+    assert view["status"] == "failed"
+    assert "no media" in view["error"]

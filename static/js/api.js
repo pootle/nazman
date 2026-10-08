@@ -45,7 +45,9 @@ class NasManAPI {
 
         if (!response.ok) {
             const error = await response.json().catch(() => ({ detail: 'Request failed' }));
-            throw new Error(error.detail || 'Request failed');
+            const err = new Error(error.detail || 'Request failed');
+            err.status = response.status;
+            throw err;
         }
 
         return response.json();
@@ -463,6 +465,10 @@ class NasManAPI {
         const payload = { selections };
         if (mediaFsUuid) payload.media_fs_uuid = mediaFsUuid;
         return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/datasets/restore`, payload);
+    }
+
+    async getRestoreProgress(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/restore/progress`);
     }
 
     async restoreSetConfig(setId, configId) {

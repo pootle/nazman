@@ -4,7 +4,7 @@ import signal
 import subprocess
 import shlex
 import time
-from typing import List, Optional, Tuple
+from typing import Callable, IO, List, Optional, Tuple
 from .exceptions import CommandError, CommandTimeoutError
 from .command_log import command_log
 
@@ -159,12 +159,18 @@ async def run_pipeline(
     category: str | None = None,
     stdin_path: Optional[str] = None,
     stdout_path: Optional[str] = None,
+    stdin_file: Optional[IO[bytes]] = None,
+    on_bytes_read: Optional[Callable[[int], None]] = None,
 ) -> Tuple[str, str, int]:
     """Run a pipeline of argv commands (e.g. ``zfs send -c ... | tee | sha256sum``) without a shell.
 
     Each stage is exec'd directly with its argv list; stdout of one stage is
     connected to stdin of the next via an OS pipe.  Optionally the first stage
-    reads from ``stdin_path`` and the last stage writes to ``stdout_path``.
+    reads from ``stdin_path`` (or an already-open ``stdin_file``, which is not
+    closed here) and the last stage writes to ``stdout_path``.
+    ``on_bytes_read``, when given with a stdin source, is called every couple
+    of seconds with the shared file offset of the input — the child consumes
+    the same open file description, so this is the bytes consumed so far.
     Every stage runs in its own session so a timeout kills the whole group
     rather than orphaning children.  The returned exit code is the first
     non-zero code in pipeline order (like ``set -o pipefail``).
@@ -172,7 +178,10 @@ async def run_pipeline(
     if not stages or any(not stage for stage in stages):
         raise ValueError("run_pipeline requires at least one non-empty stage")
 
-    display_cmd = _pipeline_display(stages, stdin_path, stdout_path)
+    stdin_name = stdin_path
+    if stdin_name is None and stdin_file is not None:
+        stdin_name = getattr(stdin_file, "name", None)
+    display_cmd = _pipeline_display(stages, stdin_name, stdout_path)
     start = time.monotonic()
     procs: List[asyncio.subprocess.Process] = []
     open_files = []
@@ -180,7 +189,9 @@ async def run_pipeline(
 
     try:
         first_stdin = None
-        if stdin_path is not None:
+        if stdin_file is not None:
+            first_stdin = stdin_file
+        elif stdin_path is not None:
             first_stdin = open(stdin_path, "rb")
             open_files.append(first_stdin)
         last_stdout = asyncio.subprocess.PIPE
@@ -217,10 +228,31 @@ async def run_pipeline(
                 parent_fds.remove(write_end)
             prev_read = next_read
 
-        results = await asyncio.wait_for(
-            asyncio.gather(*(p.communicate() for p in procs)),
-            timeout=timeout,
+        gather_task = asyncio.ensure_future(
+            asyncio.gather(*(p.communicate() for p in procs))
         )
+        deadline = time.monotonic() + timeout
+        if on_bytes_read is not None and first_stdin is not None:
+            while not gather_task.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, _ = await asyncio.wait({gather_task}, timeout=min(2.0, remaining))
+                if done:
+                    break
+                try:
+                    on_bytes_read(os.lseek(first_stdin.fileno(), 0, os.SEEK_CUR))
+                except OSError:
+                    pass
+        results = await asyncio.wait_for(
+            gather_task, timeout=max(0.0, deadline - time.monotonic()),
+        )
+        if on_bytes_read is not None and first_stdin is not None:
+            # A final report so short pipelines still yield the total consumed.
+            try:
+                on_bytes_read(os.lseek(first_stdin.fileno(), 0, os.SEEK_CUR))
+            except OSError:
+                pass
         duration_ms = int((time.monotonic() - start) * 1000)
 
         stdout_str = ""

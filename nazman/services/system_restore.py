@@ -10,10 +10,12 @@ managers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -25,7 +27,7 @@ from ..utils.devices import (
     get_device_path, partition_by_id, read_slot_uuids, resolve_by_id,
     os_disk_names,
 )
-from ..utils.exceptions import BackupError, ValidationError
+from ..utils.exceptions import BackupError, ConflictError, ValidationError
 from ..utils.sizes import parse_size_to_bytes
 from ..utils.paths import ensure_dir
 
@@ -44,6 +46,8 @@ class SystemRestoreService:
         self.zfs_backup = zfs_backup
         self.backup = backup
         self.scheduler = scheduler
+        self._restore_job: Optional[Dict[str, Any]] = None
+        self._restore_task = None
 
     # ── Volume discovery ────────────────────────────────────────────────
     async def _block_devices(self) -> List[Dict[str, Any]]:
@@ -674,24 +678,11 @@ class SystemRestoreService:
         await self._unmount_all(mounted[1:])
         return candidate, mountpoint
 
-    async def restore_datasets(
-        self, db: Session, set_id: str, selections: List[Dict[str, Any]],
-        media_fs_uuid: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Replay each selected dataset's latest chain into its target pool.
-
-        ``selections`` entries are ``{source_dataset, target_pool, enabled}``.
-        Every volume of the set is mounted, because a set's chain is spread
-        across its disks in the order they filled up; each stream is read from
-        whichever volume the writer put it on.  When ``media_fs_uuid`` is given
-        only datasets whose chain lives entirely on that volume are restored
-        (used to prompt disk-by-disk).
-        """
-        if self.zfs_backup is None:
-            raise BackupError("ZFS backup manager unavailable")
-        manifest = await self._manifest_for(db, set_id)
-        manifest.pop("_volumes", None)
-
+    def _chosen_datasets(
+        self, manifest: Dict[str, Any], selections: List[Dict[str, Any]],
+        media_fs_uuid: Optional[str],
+    ) -> List[tuple]:
+        """(source, target, chain) triples selected for restore, parents first."""
         by_name = {d.get("name"): d for d in manifest.get("datasets", [])}
         chosen = []
         for sel in selections:
@@ -712,30 +703,171 @@ class SystemRestoreService:
                 # Restricting to one volume: only what fits entirely on it.
                 continue
             chosen.append((source, target, chain))
-
         # Parents before children, so a dataset's parent pool/dataset exists
         # before the child is received into it.
         chosen.sort(key=lambda item: item[0].count("/"))
+        return chosen
+
+    async def start_restore(
+        self, db: Session, set_id: str, selections: List[Dict[str, Any]],
+        media_fs_uuid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Start a restore in the background and return its progress view.
+
+        A large restore must outlive the HTTP request, so the work runs in a
+        task while the wizard polls :meth:`restore_job_view`.
+        """
+        if self._restore_job is not None and self._restore_job["status"] == "running":
+            raise ConflictError("A restore is already running")
+        if self.zfs_backup is None:
+            raise BackupError("ZFS backup manager unavailable")
+        manifest = await self._manifest_for(db, set_id)
+        manifest.pop("_volumes", None)
+        chosen = self._chosen_datasets(manifest, selections, media_fs_uuid)
+        if not chosen:
+            raise ValidationError("No datasets selected for restore")
+        self._restore_job = {
+            "set_id": set_id,
+            "status": "running",
+            "datasets_total": len(chosen),
+            "datasets_done": 0,
+            "datasets_failed": 0,
+            "started_at": datetime.now(timezone.utc),
+            "error": None,
+            "results": [],
+            "current": None,
+        }
+        self._restore_task = asyncio.create_task(
+            self._restore_worker(set_id, selections, media_fs_uuid)
+        )
+        return self.restore_job_view(set_id)
+
+    async def _restore_worker(
+        self, set_id: str, selections: List[Dict[str, Any]],
+        media_fs_uuid: Optional[str],
+    ) -> None:
+        job = self._restore_job
+        try:
+            from ..database import get_db_context
+            with get_db_context() as db:
+                result = await self.restore_datasets(
+                    db, set_id, selections, media_fs_uuid=media_fs_uuid,
+                )
+            if job is not None:
+                job["results"] = result.get("results", [])
+                job["status"] = "done"
+        except Exception as e:
+            logger.error("restore of set %s failed: %s", set_id, e, exc_info=True)
+            if job is not None:
+                job["status"] = "failed"
+                job["error"] = str(e)
+        finally:
+            if job is not None:
+                job["current"] = None
+
+    def restore_job_view(self, set_id: Optional[str] = None) -> Dict[str, Any]:
+        """Current restore progress, or an ``idle`` view when nothing matches."""
+        job = self._restore_job
+        if job is None or (set_id is not None and job["set_id"] != set_id):
+            return {"set_id": set_id, "status": "idle"}
+        return {
+            "set_id": job["set_id"],
+            "status": job["status"],
+            "datasets_total": job["datasets_total"],
+            "datasets_done": job["datasets_done"],
+            "datasets_failed": job["datasets_failed"],
+            "started_at": job["started_at"],
+            "error": job["error"],
+            "results": job["results"],
+            "current": job["current"],
+            "progress_pct": self._progress_pct(job),
+        }
+
+    @staticmethod
+    def _progress_pct(job: Dict[str, Any]) -> int:
+        """Coarse percentage: finished datasets plus the fraction of the current one.
+
+        Like the backup session bar: capped at 99 while running so it only
+        reads 100 once the job is done.
+        """
+        if job["status"] == "done":
+            return 100
+        total = job["datasets_total"]
+        if not total:
+            return 0
+        fraction = 0.0
+        current = job.get("current")
+        if current:
+            streams_total = current.get("streams_total") or 0
+            if streams_total:
+                stream_fraction = float(current.get("streams_done") or 0)
+                expected = current.get("bytes_expected")
+                if expected:
+                    stream_fraction += min(1.0, (current.get("bytes_done") or 0) / expected)
+                fraction = min(1.0, stream_fraction / streams_total)
+        pct = int(100 * min(1.0, (job["datasets_done"] + fraction) / total))
+        return min(99, pct) if job["status"] == "running" else min(100, pct)
+
+    async def restore_datasets(
+        self, db: Session, set_id: str, selections: List[Dict[str, Any]],
+        media_fs_uuid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Replay each selected dataset's latest chain into its target pool.
+
+        ``selections`` entries are ``{source_dataset, target_pool, enabled}``.
+        Every volume of the set is mounted, because a set's chain is spread
+        across its disks in the order they filled up; each stream is read from
+        whichever volume the writer put it on.  When ``media_fs_uuid`` is given
+        only datasets whose chain lives entirely on that volume are restored
+        (used to prompt disk-by-disk).  When called for a running job the
+        progress view is updated as it goes.
+        """
+        if self.zfs_backup is None:
+            raise BackupError("ZFS backup manager unavailable")
+        manifest = await self._manifest_for(db, set_id)
+        manifest.pop("_volumes", None)
+        chosen = self._chosen_datasets(manifest, selections, media_fs_uuid)
+
+        job = self._restore_job
+        if job is not None and job["set_id"] != set_id:
+            job = None
+        if job is not None:
+            job["datasets_total"] = len(chosen)
 
         mounted = await self._mount_volumes(db, set_id)
         results = []
         try:
             for source, target, chain in chosen:
+                if job is not None:
+                    job["current"] = {
+                        "source": source, "target": target,
+                        "stream_index": 0, "streams_total": len(chain),
+                        "streams_done": 0, "bytes_done": 0,
+                        "bytes_expected": None, "pct": None,
+                    }
                 results.append(
-                    await self._restore_one(source, target, chain, mounted)
+                    await self._restore_one(source, target, chain, mounted, job=job)
                 )
+                if job is not None:
+                    job["results"] = results
+                    job["datasets_done"] += 1
+                    if results[-1].get("status") != "success":
+                        job["datasets_failed"] += 1
+                    job["current"] = None
         finally:
+            if job is not None:
+                job["current"] = None
             await self._unmount_all(mounted)
         return {"set_id": set_id, "results": results}
 
     async def _restore_one(
         self, source: str, target: str, chain: List[Dict[str, Any]],
-        mounted: List[tuple],
+        mounted: List[tuple], job: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         exists = await self.zfs.dataset_exists(target) if self.zfs is not None else False
         entry: Dict[str, Any] = {"source": source, "target": target, "streams": []}
         try:
-            for b in chain:
+            for index, b in enumerate(chain, start=1):
                 stream = self._locate_stream(b, mounted)
                 if stream is None:
                     missing = b.get("media_fs_uuid") or "its backup volume"
@@ -745,16 +877,44 @@ class SystemRestoreService:
                         f"(expected on {missing})"
                     )
                     return entry
+                if job is not None and job.get("current") is not None:
+                    current = job["current"]
+                    current["stream_index"] = index
+                    current["streams_done"] = index - 1
+                    current["bytes_done"] = 0
+                    current["bytes_expected"] = b.get("size_bytes")
+                    current["pct"] = 0 if b.get("size_bytes") else None
                 result = await self.zfs_backup.receive_stream(
                     str(stream), target, force=exists or b.get("type") == "incremental",
+                    on_bytes_read=self._stream_progress(job),
                 )
                 entry["streams"].append(result)
                 exists = True
+                if job is not None and job.get("current") is not None:
+                    job["current"]["streams_done"] = index
+                    job["current"]["bytes_done"] = 0
             entry["status"] = "success"
         except Exception as e:
             entry["status"] = "failed"
             entry["error"] = str(e)
         return entry
+
+    @staticmethod
+    def _stream_progress(job: Optional[Dict[str, Any]]) -> Optional[Callable[[int], None]]:
+        """Callback publishing bytes received for the current stream, if any."""
+        if job is None:
+            return None
+
+        def report(consumed: int) -> None:
+            current = job.get("current")
+            if current is None:
+                return
+            current["bytes_done"] = consumed
+            expected = current.get("bytes_expected")
+            if expected:
+                current["pct"] = min(99, int(100 * consumed / expected))
+
+        return report
 
     @staticmethod
     def _locate_stream(run: Dict[str, Any], mounted: List[tuple]) -> Optional[Path]:

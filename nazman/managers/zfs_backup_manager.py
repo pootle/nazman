@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 import asyncio
@@ -1620,7 +1620,8 @@ class ZfsBackupManager:
             await self._restore_idle_state(owner)
 
     async def receive_stream(
-        self, stream_file: str, target_dataset: str, force: bool = False
+        self, stream_file: str, target_dataset: str, force: bool = False,
+        on_bytes_read: Optional[Callable[[int], None]] = None,
     ) -> Dict[str, Any]:
         """Replay a ZFS send stream into ``target_dataset``.
 
@@ -1628,7 +1629,8 @@ class ZfsBackupManager:
         gzip'd.  The format is detected from the file's magic bytes so both
         restore cleanly.  Owner-agnostic: the caller is responsible for mounting
         the media and cleaning up idle state, so this also serves restores on a
-        fresh install where no ``BackupDisk`` row exists.
+        fresh install where no ``BackupDisk`` row exists.  ``on_bytes_read`` is
+        polled with the input file's consumed byte count while the receive runs.
         """
         validate_dataset_name(target_dataset)
         fp = Path(stream_file)
@@ -1646,14 +1648,15 @@ class ZfsBackupManager:
         except OSError as exc:
             raise BackupError(f"Cannot read stream: {exc}") from exc
 
-        if head == b"\x1f\x8b":
-            source: List[str] = ["gunzip", "-c", str(fp)]
-        else:
-            source = ["cat", str(fp)]
-        _, stderr, rc = await run_pipeline(
-            [source, receive_cmd],
-            timeout=86400, check=False, op="write", category="zfs",
-        )
+        with open(fp, "rb") as fh:
+            if head == b"\x1f\x8b":
+                source: List[str] = ["gunzip", "-c"]
+            else:
+                source: List[str] = ["cat"]
+            _, stderr, rc = await run_pipeline(
+                [source, receive_cmd], stdin_file=fh, on_bytes_read=on_bytes_read,
+                timeout=86400, check=False, op="write", category="zfs",
+            )
         if rc != 0:
             raise BackupError(f"Restore failed: {stderr}")
         return {"dataset": target_dataset, "source": str(fp), "force": force}
