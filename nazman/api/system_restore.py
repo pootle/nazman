@@ -7,6 +7,7 @@ import logging
 from ..database import get_db
 from ..auth import get_current_user
 from ..services.system_restore import SystemRestoreService
+from ..utils.exceptions import ConflictError
 from ..wiring import get_system_restore_service
 
 logger = logging.getLogger(__name__)
@@ -93,20 +94,35 @@ async def required_media(
 
 
 @router.post("/sets/{set_id}/datasets/restore", response_model=dict)
-async def restore_datasets(
+async def start_restore(
     set_id: str,
     req: RestoreDatasetsRequest,
     db: Session = Depends(get_db),
     service: SystemRestoreService = Depends(get_system_restore_service),
 ):
-    """Replay selected datasets' chains; optionally restrict to one medium."""
+    """Start a background restore of the selected datasets' chains.
+
+    Returns the live progress view; poll ``GET .../restore/progress`` for
+    updates. A second start while one is running yields 409.
+    """
     try:
-        return await service.restore_datasets(
+        return await service.start_restore(
             db, set_id, req.selections, media_fs_uuid=req.media_fs_uuid,
         )
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error("restore_datasets failed for set %s: %s", set_id, e, exc_info=True)
+        logger.error("start_restore failed for set %s: %s", set_id, e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/sets/{set_id}/restore/progress", response_model=dict)
+async def restore_progress(
+    set_id: str,
+    service: SystemRestoreService = Depends(get_system_restore_service),
+):
+    """Live progress of the (single) running or last restore for this set."""
+    return service.restore_job_view(set_id)
 
 
 @router.post("/sets/{set_id}/config/restore", response_model=dict)

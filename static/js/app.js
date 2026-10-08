@@ -27,6 +27,9 @@ async function initializeApp() {
     // Check authentication
     await checkAuthentication();
     
+    // Start the global activity + notification pollers.
+    initGlobalPollers();
+
     // Load initial data
     console.log('NAZMan initialized');
 }
@@ -40,6 +43,102 @@ async function checkAuthentication() {
     if (!api._hasToken()) {
         await api._requireAuth().catch(() => {});
     }
+}
+
+// ── Global activity + notification pollers ──────────────────────────────
+// Present on every screen: the bell badge reflects unread journal entries and
+// the sidebar indicator shows long-running tasks so a backup or restore can
+// be watched without staying on the page that started it.
+let activeTasksPollTimer = null;
+let lastActiveTaskKeys = new Set();
+
+function initGlobalPollers() {
+    refreshNotificationBadge();
+    pollActiveTasks();
+    setInterval(refreshNotificationBadge, 30000);
+}
+
+async function pollActiveTasks() {
+    if (activeTasksPollTimer) return;
+    activeTasksPollTimer = setTimeout(pollActiveTasks, 4000);
+    let data;
+    try {
+        data = await api.getActiveTasks();
+    } catch (e) {
+        return;
+    }
+    const tasks = data.tasks || [];
+    const keys = new Set(tasks.map(taskKey));
+    // A task that was running and is now gone finished; its completion was
+    // journaled server-side, so refresh the bell to surface it.
+    for (const old of lastActiveTaskKeys) {
+        if (!keys.has(old)) {
+            refreshNotificationBadge();
+            break;
+        }
+    }
+    lastActiveTaskKeys = keys;
+    renderActiveTasksBadge(tasks.length);
+    const modal = document.getElementById('active-tasks-modal');
+    if (modal && modal.style.display !== 'none') {
+        renderActiveTasksModal(tasks);
+    }
+}
+
+function taskKey(t) {
+    return `${t.kind}:${t.id}`;
+}
+
+function renderActiveTasksBadge(count) {
+    const badge = document.getElementById('active-tasks-badge');
+    if (!badge) return;
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.style.display = count > 0 ? '' : 'none';
+    const item = document.getElementById('active-tasks-nav');
+    if (item) item.classList.toggle('has-active', count > 0);
+}
+
+function openActiveTasks() {
+    showModal('active-tasks-modal');
+    renderActiveTasksModalFromServer();
+}
+
+async function renderActiveTasksModalFromServer() {
+    const body = document.getElementById('active-tasks-body');
+    if (body) body.innerHTML = createLoading();
+    try {
+        const data = await api.getActiveTasks();
+        renderActiveTasksModal(data.tasks || []);
+    } catch (e) {
+        if (body) body.innerHTML = createErrorState('Failed to load activity: ' + e.message);
+    }
+}
+
+function renderActiveTasksModal(tasks) {
+    const body = document.getElementById('active-tasks-body');
+    if (!body) return;
+    if (tasks.length === 0) {
+        body.innerHTML = '<p class="text-muted">Nothing is running right now.</p>';
+        return;
+    }
+    body.innerHTML = tasks.map(t => {
+        const pct = t.progress_pct != null ? Math.min(100, Math.max(0, t.progress_pct)) : null;
+        const bar = pct != null
+            ? `<div class="task-progress"><div class="task-progress-fill" style="width:${pct}%"></div></div>`
+            : `<div class="task-progress task-progress-indeterminate"><div class="task-progress-fill"></div></div>`;
+        const detail = t.detail ? `<span class="text-muted">${escapeHtml(t.detail)}</span>` : '';
+        const started = t.started_at ? `<span class="text-muted">started ${formatDate(t.started_at)}</span>` : '';
+        const link = t.link ? `<a class="task-link" href="${escapeHtml(t.link)}">View</a>` : '';
+        return `<div class="task-entry">
+            <div class="task-head">
+                <span class="task-kind">${escapeHtml(t.kind)}</span>
+                <span class="task-label">${escapeHtml(t.label || '')}</span>
+                <span class="task-meta">${detail} ${started}</span>
+                ${link}
+            </div>
+            ${bar}
+        </div>`;
+    }).join('');
 }
 
 function refreshCurrentPage() {

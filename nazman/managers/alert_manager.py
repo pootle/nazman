@@ -266,9 +266,15 @@ class AlertManager:
         delivered: bool,
         error: Optional[str],
     ) -> None:
-        """Persist an alert attempt to ``alert_log`` (best-effort)."""
+        """Persist an alert attempt to ``alert_log`` and the notification journal.
+
+        ``alert_log`` keeps the delivery result; the journal is the single
+        review surface shared with UI toasts, so pool/Telegram alerts are
+        mirrored there too (best-effort in both cases).
+        """
         from ..database import get_db_context
         from ..models.alert import AlertLog
+        from ..utils.notification_store import notification_store
 
         if severity not in _VALID_SEVERITIES:
             severity = "error"
@@ -284,3 +290,12 @@ class AlertManager:
                 ))
         except Exception:
             logger.warning("Failed to record alert in alert_log")
+        try:
+            notification_store.add(
+                level=severity,
+                title=event_key,
+                message=message,
+                source="alert",
+            )
+        except Exception:
+            logger.warning("Failed to record alert in notification journal")

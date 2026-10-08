@@ -45,7 +45,9 @@ class NasManAPI {
 
         if (!response.ok) {
             const error = await response.json().catch(() => ({ detail: 'Request failed' }));
-            throw new Error(error.detail || 'Request failed');
+            const err = new Error(error.detail || 'Request failed');
+            err.status = response.status;
+            throw err;
         }
 
         return response.json();
@@ -465,6 +467,10 @@ class NasManAPI {
         return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/datasets/restore`, payload);
     }
 
+    async getRestoreProgress(setId) {
+        return this.request('GET', `/api/system-restore/sets/${encodeURIComponent(setId)}/restore/progress`);
+    }
+
     async restoreSetConfig(setId, configId) {
         return this.request('POST', `/api/system-restore/sets/${encodeURIComponent(setId)}/config/restore`, { config_id: configId });
     }
@@ -492,6 +498,31 @@ class NasManAPI {
 
     async getAlertHistory(limit = 20) {
         return this.request('GET', `/api/alerts/history?limit=${limit}`);
+    }
+
+    // Notifications journal
+    async getNotifications(limit = 100, sinceId = null, unreadOnly = false) {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (sinceId != null) params.set('since_id', String(sinceId));
+        if (unreadOnly) params.set('unread_only', 'true');
+        return this.request('GET', `/api/notifications?${params.toString()}`);
+    }
+
+    async postNotification(data) {
+        return this.request('POST', '/api/notifications', data);
+    }
+
+    async markNotificationsRead(ids = null) {
+        return this.request('POST', '/api/notifications/read', { ids });
+    }
+
+    async clearNotifications() {
+        return this.request('DELETE', '/api/notifications');
+    }
+
+    // Long-running tasks
+    async getActiveTasks() {
+        return this.request('GET', '/api/tasks/active');
     }
 
     // Authentication

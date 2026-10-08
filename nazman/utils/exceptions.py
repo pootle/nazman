@@ -32,6 +32,15 @@ class ValidationError(NAZManError):
     pass
 
 
+class ConflictError(NAZManError):
+    """Raised when a request conflicts with current state.
+
+    Handlers map this to HTTP 409 (e.g. starting an operation that is already
+    running).
+    """
+    pass
+
+
 class NotFoundError(NAZManError):
     """Raised when a requested entity does not exist.
 

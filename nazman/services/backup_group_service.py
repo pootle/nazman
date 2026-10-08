@@ -26,8 +26,10 @@ from ..models.backup_zfs import (
 )
 from ..models.scheduler import ScheduledTask, TaskType
 from ..utils.exceptions import (
-    BackupDiskNotFoundError, NotFoundError, ValidationError,
+    NAZManError, NotFoundError, ValidationError,
 )
+from ..utils.notification_store import notification_store
+from ..utils.timing import elapsed_ms as _elapsed_ms
 from ..utils.validation import validate_dataset_name, validate_schedule
 
 logger = logging.getLogger(__name__)
@@ -1225,7 +1227,34 @@ class BackupGroupService:
         logger.info(
             "backup session %s (%s) finished: %s", session.id, session.trigger, status,
         )
+        self._log_backup_finished(session, status)
         return {"session_id": session.id, "status": status, "stopped": stopped}
+
+    @staticmethod
+    def _log_backup_finished(session: BackupSession, status: str) -> None:
+        """Journal a finished session with its elapsed time and data volume."""
+        group_name = session.group.name if session.group else f"group {session.group_id}"
+        duration_ms = _elapsed_ms(session.started_at, session.completed_at)
+        level = {
+            SESSION_SUCCESS: "success",
+            SESSION_PARTIAL: "warning",
+            SESSION_NEEDS_DISK: "warning",
+        }.get(status, "error")
+        detail = f"{session.datasets_done or 0}/{session.datasets_total or 0} datasets"
+        if session.datasets_failed:
+            detail += f", {session.datasets_failed} failed"
+        message = f"Backup {group_name} {status.replace('_', ' ')}: {detail}"
+        try:
+            notification_store.add(
+                level=level,
+                title="Backup finished",
+                message=message,
+                source="backup",
+                duration_ms=duration_ms,
+                bytes=session.bytes_written or None,
+            )
+        except Exception:
+            logger.warning("failed to journal backup session %s", session.id, exc_info=True)
 
     async def _capture_config(self, db: Session, rec: Optional[BackupDisk]) -> None:
         """Snapshot the configuration onto the disk the session finished on.

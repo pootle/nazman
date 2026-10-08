@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}NAZMan{% endblock %}</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=7">
+    <link rel="stylesheet" href="/static/css/style.css?v=8">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     {% block head_extra %}{% endblock %}
 </head>
@@ -83,6 +83,13 @@
                     </a>
                 </li>
                 <li class="nav-item">
+                    <a href="#" class="nav-link" id="active-tasks-nav" title="Running tasks">
+                        <i class="fas fa-spinner"></i>
+                        <span>Activity</span>
+                        <span class="nav-badge" id="active-tasks-badge" style="display:none">0</span>
+                    </a>
+                </li>
+                <li class="nav-item">
                     <a href="/settings" class="nav-link {% if request.url.path == '/settings' %}active{% endif %}">
                         <i class="fas fa-cog"></i>
                         <span>Settings</span>
@@ -102,6 +109,7 @@
                 <div class="header-actions">
                     <button class="btn btn-icon" id="messages-btn" title="Message history">
                         <i class="fas fa-bell"></i>
+                        <span class="icon-badge" id="messages-badge" style="display:none">0</span>
                     </button>
                     <button class="btn btn-icon" id="refresh-btn" title="Refresh">
                         <i class="fas fa-sync-alt"></i>
@@ -165,10 +173,24 @@
         </div>
     </div>
 
+    <!-- Running tasks modal -->
+    <div id="active-tasks-modal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 560px">
+            <div class="modal-header">
+                <h3>Running tasks</h3>
+                <button class="close" onclick="hideModal('active-tasks-modal')">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 12px 20px;" id="active-tasks-body"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-primary" onclick="hideModal('active-tasks-modal')">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/js/charts.js?v=3"></script>
-    <script src="/static/js/api.js?v=6"></script>
-    <script src="/static/js/components.js?v=5"></script>
-    <script src="/static/js/app.js?v=5"></script>
+    <script src="/static/js/api.js?v=7"></script>
+    <script src="/static/js/components.js?v=6"></script>
+    <script src="/static/js/app.js?v=6"></script>
     <script src="/static/js/details.js?v=2"></script>
     {% block scripts %}{% endblock %}
 </body>
